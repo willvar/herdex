@@ -1,0 +1,29 @@
+[Unit]
+Description=herdex - codex account pool gateway
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=herdex
+Group=herdex
+EnvironmentFile=-/etc/herdex/env
+ExecStart=/usr/local/bin/herdex --config /etc/herdex/herdex.toml
+Restart=on-failure
+RestartSec=5
+NoNewPrivileges=yes
+ProtectSystem=strict
+ProtectHome=yes
+ReadWritePaths=/var/lib/herdex
+PrivateTmp=yes
+ProtectKernelTunables=yes
+ProtectKernelModules=yes
+ProtectControlGroups=yes
+RestrictSUIDSGID=yes
+LockPersonality=yes
+MemoryDenyWriteExecute=yes
+SystemCallArchitectures=native
+CapabilityBoundingSet=
+
+[Install]
+WantedBy=multi-user.target
