@@ -1,0 +1,25 @@
+listen = "192.168.168.254:8317"
+state-root = "/var/lib/herdex"
+
+[manage]
+# env 插值：值为 { env = "NAME" } 内联表或 "env: NAME"/"{env:NAME}" 标量
+key = { env = "HERDEX_MANAGE_KEY" }
+
+[oauth]
+issuer = "https://auth.openai.com"
+client-id = "app_EMoamEEZ73f0CkXaXp7hrann"
+
+[upstream]
+base-url = "https://chatgpt.com/backend-api/codex"
+
+# 伪装壳：仅对非 codex 客户端生效；真 codex 客户端透传自身身份
+[header-defaults]
+user-agent = "codex_cli_rs/0.153.4"
+originator = "codex_cli_rs"
+beta-features = "multi_agent"
+
+# request_log retention in days (default 730 = 2 years, 0 = keep forever)
+retention-days = 730
+
+[log]
+level = "info"
