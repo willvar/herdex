@@ -101,6 +101,11 @@ async fn responses(
         }
     };
 
+    let session_key = headers
+        .get("Session-Id")
+        .and_then(|v| v.to_str().ok())
+        .unwrap_or("")
+        .to_string();
     let candidates = match app.pool.candidates(&model) {
         Ok(c) => c,
         Err(e) => return (StatusCode::INTERNAL_SERVER_ERROR, e).into_response(),
@@ -112,15 +117,19 @@ async fn responses(
         )
             .into_response();
     }
+    // session affinity: pin the session to its last account (if fresh) while
+    // keeping the rest as failover order
+    let mut candidates = candidates;
+    if let Some(pin) = app.pool.pinned(&session_key, &model) {
+        if let Some(i) = candidates.iter().position(|c| c.id == pin) {
+            if i != 0 {
+                candidates.swap(0, i);
+            }
+        }
+    }
     // never-blackout: every eligible candidate gets exactly one attempt;
     // cooled accounts are re-tried only after the pool is exhausted once
     let attempts = candidates.len();
-
-    let session_key = headers
-        .get("Session-Id")
-        .and_then(|v| v.to_str().ok())
-        .unwrap_or("")
-        .to_string();
 
     let mut last_status: u16 = 0;
     let mut last_err = String::new();
