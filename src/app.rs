@@ -153,6 +153,8 @@ impl App {
                     secondary_pct: report.main.secondary.used_pct.unwrap_or(0.0),
                     primary_reset_at: report.main.primary.reset_at.unwrap_or(0),
                     secondary_reset_at: report.main.secondary.reset_at.unwrap_or(0),
+                    primary_window_secs: report.main.primary.window_seconds.unwrap_or(0),
+                    secondary_window_secs: report.main.secondary.window_seconds.unwrap_or(0),
                     observed_at: now,
                 },
             );
@@ -166,6 +168,8 @@ impl App {
                     secondary_pct: a.limit.secondary.used_pct.unwrap_or(0.0),
                     primary_reset_at: a.limit.primary.reset_at.unwrap_or(0),
                     secondary_reset_at: a.limit.secondary.reset_at.unwrap_or(0),
+                    primary_window_secs: a.limit.primary.window_seconds.unwrap_or(0),
+                    secondary_window_secs: a.limit.secondary.window_seconds.unwrap_or(0),
                     observed_at: now,
                 },
             );

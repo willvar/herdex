@@ -21,6 +21,10 @@ pub struct Quota {
     pub secondary_pct: f64,
     pub primary_reset_at: i64,
     pub secondary_reset_at: i64,
+    /// window lengths in seconds, for labeling (18000=5h, 604800=weekly);
+    /// upstream generalizes these — never assume 5h/weekly by position
+    pub primary_window_secs: i64,
+    pub secondary_window_secs: i64,
     pub observed_at: i64,
 }
 
