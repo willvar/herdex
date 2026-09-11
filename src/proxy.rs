@@ -230,6 +230,8 @@ async fn attempt_once(
     let sec = header_pct(res.headers(), "x-codex-bengalfox-secondary-used-percent");
     let pri_reset = reset_epoch(res.headers(), "x-codex-bengalfox-primary-reset-at", "x-codex-bengalfox-primary-reset-after-seconds");
     let sec_reset = reset_epoch(res.headers(), "x-codex-bengalfox-secondary-reset-at", "x-codex-bengalfox-secondary-reset-after-seconds");
+    let pri_secs = header_minutes(res.headers(), "x-codex-bengalfox-primary-window-minutes");
+    let sec_secs = header_minutes(res.headers(), "x-codex-bengalfox-secondary-window-minutes");
     if pri.is_some() || sec.is_some() || pri_reset.is_some() || sec_reset.is_some() {
         app.pool.observe(
             &acc.id,
@@ -239,6 +241,8 @@ async fn attempt_once(
                 secondary_pct: sec.unwrap_or(0.0),
                 primary_reset_at: pri_reset.unwrap_or(0),
                 secondary_reset_at: sec_reset.unwrap_or(0),
+                primary_window_secs: pri_secs.unwrap_or(0),
+                secondary_window_secs: sec_secs.unwrap_or(0),
                 observed_at: crate::store::now_secs(),
             },
         );
@@ -321,6 +325,11 @@ async fn attempt_once(
 
 fn header_pct(h: &reqwest::header::HeaderMap, name: &str) -> Option<f64> {
     h.get(name)?.to_str().ok()?.trim_end_matches('%').parse().ok()
+}
+
+fn header_minutes(h: &reqwest::header::HeaderMap, name: &str) -> Option<i64> {
+    let m: i64 = h.get(name)?.to_str().ok()?.parse().ok()?;
+    (m > 0).then(|| m * 60)
 }
 
 fn reset_epoch(h: &reqwest::header::HeaderMap, at_key: &str, after_key: &str) -> Option<i64> {

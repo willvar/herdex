@@ -279,10 +279,10 @@ function winCell(w){
   const color = rem < 10 ? 'var(--err)' : rem < 30 ? 'orange' : 'var(--ok)';
   return `<div class="bar"><i style="width:${Math.max(0,Math.min(100,rem))}%;background:${color}"></i></div> <span>${Math.round(rem)}%</span>`;
 }
-function normWin(w, pct, resetEpoch){
-  // unify live report shape {used_pct, reset_at} and cached shape {primary_pct, primary_reset_at}
+function normWin(w, pct, resetEpoch, secs){
+  // unify live report shape {used_pct, reset_at, window_seconds} and cached shape
   if (w) return w;
-  return { used_pct: pct, reset_at: resetEpoch ? resetEpoch*1000 : null };
+  return { used_pct: pct, reset_at: resetEpoch ? resetEpoch*1000 : null, window_seconds: secs||null };
 }
 function renderQuotaRow(a){
   if (!quotaDetailOpen[a.email]) return '';
@@ -296,7 +296,7 @@ function renderQuotaRow(a){
     for (const x of (live.additional||[])) entries.push([x.name, x.limit.primary, x.limit.secondary]);
   } else if (cached) {
     for (const [m,q] of Object.entries(cached))
-      entries.push([m, normWin(null,q.primary_pct,q.primary_reset_at), normWin(null,q.secondary_pct,q.secondary_reset_at)]);
+      entries.push([m, normWin(null,q.primary_pct,q.primary_reset_at,q.primary_window_secs), normWin(null,q.secondary_pct,q.secondary_reset_at,q.secondary_window_secs)]);
   }
   const winLabel = w => {
     if (!w) return '';
