@@ -224,6 +224,35 @@ async fn attempt_once(
     };
     let latency = start.elapsed().as_millis() as i64;
 
+    // full rate-limit header observability: log every limit-related response
+    // header verbatim (read-only; passthrough unaffected)
+    {
+        let mut rl = String::new();
+        for (k, v) in res.headers() {
+            let name = k.as_str();
+            if name.starts_with("x-codex")
+                || name.contains("used-percent")
+                || name.contains("window-minutes")
+                || name.contains("reset-at")
+                || name.contains("reset-after")
+                || name.contains("rate-limit")
+            {
+                if let Ok(vs) = v.to_str() {
+                    rl.push_str(&format!(" {}={}", name, vs));
+                }
+            }
+        }
+        if !rl.is_empty() {
+            log::info!(
+                "rl-headers {} <- {} (status {}):{}",
+                model,
+                acc.email,
+                res.status().as_u16(),
+                rl
+            );
+        }
+    }
+
     // quota observation from upstream response headers
     let pri = header_pct(res.headers(), "x-codex-bengalfox-primary-used-percent");
     let sec = header_pct(res.headers(), "x-codex-bengalfox-secondary-used-percent");
@@ -245,6 +274,20 @@ async fn attempt_once(
                 observed_at: crate::store::now_secs(),
             },
         );
+        // every successful response carries the main window's live usage —
+        // feed it to the probe sequence (dedupe: only % changes stored), which
+        // makes capacity calibration converge orders of magnitude faster.
+        // NOTE: main `x-codex-*` family, not bengalfox (spark window) above.
+        let main_pri = header_pct(res.headers(), "x-codex-primary-used-percent");
+        let main_reset = reset_epoch(
+            res.headers(),
+            "x-codex-primary-reset-at",
+            "x-codex-primary-reset-after-seconds",
+        );
+        if let (Some(p), Some(r)) = (main_pri, main_reset) {
+            let plan = headers_get(res.headers(), "x-codex-plan-type").unwrap_or_default();
+            app.store.add_probe(&acc.id, crate::store::now_secs(), p, r, &plan);
+        }
     }
 
     let status = res.status().as_u16();
@@ -329,6 +372,10 @@ fn header_pct(h: &reqwest::header::HeaderMap, name: &str) -> Option<f64> {
 fn header_minutes(h: &reqwest::header::HeaderMap, name: &str) -> Option<i64> {
     let m: i64 = h.get(name)?.to_str().ok()?.parse().ok()?;
     (m > 0).then(|| m * 60)
+}
+
+fn headers_get(h: &reqwest::header::HeaderMap, name: &str) -> Option<String> {
+    h.get(name)?.to_str().ok().map(|s| s.to_string())
 }
 
 fn reset_epoch(h: &reqwest::header::HeaderMap, at_key: &str, after_key: &str) -> Option<i64> {

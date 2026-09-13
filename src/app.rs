@@ -320,6 +320,11 @@ pub fn spawn_refresh_loop(app: AppHandle) {
                         Ok(_) => {}
                         Err(e) => log::warn!("prune failed: {e}"),
                     }
+                    match app.store.prune_probes(14) {
+                        Ok(n) if n > 0 => log::info!("pruned {n} usage_probes rows (14d)"),
+                        Ok(_) => {}
+                        Err(e) => log::warn!("probe prune failed: {e}"),
+                    }
                     app.last_prune_day.store(today, std::sync::atomic::Ordering::Relaxed);
                 }
             }

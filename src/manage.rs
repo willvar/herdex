@@ -31,6 +31,7 @@ pub fn router() -> axum::Router<AppHandle> {
         )
         .route("/manage/api/settings", axum::routing::put(put_settings))
         .route("/manage/api/usage", axum::routing::get(usage))
+        .route("/manage/api/calibration", axum::routing::get(calibration))
 }
 
 fn auth_check(app: &AppHandle, headers: &HeaderMap) -> Result<(), Response> {
@@ -51,8 +52,12 @@ fn err_json(status: StatusCode, msg: impl Into<String>) -> Response {
 
 async fn usage(
     State(st): State<AppHandle>,
+    headers: HeaderMap,
     axum::extract::Query(q): axum::extract::Query<std::collections::HashMap<String, String>>,
 ) -> Response {
+    if let Err(res) = auth_check(&st, &headers) {
+        return res;
+    }
     let days: i64 = q.get("days").and_then(|v| v.parse().ok()).unwrap_or(7).clamp(1, 90);
     let store = &st.store;
     let r = serde_json::json!({
@@ -60,6 +65,59 @@ async fn usage(
         "by_account": store.usage_by(UsageDim::Account, days).unwrap_or_default(),
         "by_key": store.usage_by(UsageDim::Key, days).unwrap_or_default(),
         "by_model": store.usage_by(UsageDim::Model, days).unwrap_or_default(),
+    });
+    ([(axum::http::header::CONTENT_TYPE, "application/json")], r.to_string()).into_response()
+}
+
+/// Per-account capacity calibration (empirical tokens-per-1%) plus remaining
+/// capacity estimates, for the panel's 容量估算 card.
+async fn calibration(State(app): State<AppHandle>, headers: HeaderMap) -> Response {
+    if let Err(res) = auth_check(&app, &headers) {
+        return res;
+    }
+    let snapshot = app.pool.snapshot();
+    let mut rows: Vec<serde_json::Value> = Vec::new();
+    let mut total_remaining: f64 = 0.0;
+    let mut calibrated = 0usize;
+    for a in app.store.list_accounts().unwrap_or_default() {
+        let pct = snapshot
+            .get(&a.id)
+            .and_then(|m| m.get("default"))
+            .map(|q| q.primary_pct.max(q.secondary_pct));
+        let cal = match app.store.calibration(&a.id) {
+            Ok(Some(v)) => v,
+            _ => crate::store::Calibration::default(),
+        };
+        let tpp = cal.tokens_per_pct;
+        let samples = cal.samples;
+        let is_calibrated = tpp > 0.0;
+        let remaining_tokens = if is_calibrated {
+            pct.map(|p| tpp * (100.0 - p)).unwrap_or(0.0)
+        } else {
+            0.0
+        };
+        if is_calibrated {
+            calibrated += 1;
+            if pct.is_some() {
+                total_remaining += remaining_tokens;
+            }
+        }
+        rows.push(serde_json::json!({
+            "email": a.email, "plan_type": a.plan_type,
+            "tokens_per_pct": if is_calibrated { serde_json::json!(tpp) } else { serde_json::Value::Null },
+            "samples": samples,
+            "per_model": cal.per_model.iter().map(|(m, c, n)| serde_json::json!({
+                "model": m, "tokens_per_pct": c, "intervals": n,
+            })).collect::<Vec<_>>(),
+            "used_pct": pct,
+            "remaining_tokens": if is_calibrated { serde_json::json!(remaining_tokens) } else { serde_json::Value::Null },
+            "calibrated": is_calibrated,
+        }));
+    }
+    let r = serde_json::json!({
+        "accounts": rows,
+        "calibrated_accounts": calibrated,
+        "pool_remaining_tokens": if calibrated > 0 { serde_json::json!(total_remaining) } else { serde_json::Value::Null },
     });
     ([(axum::http::header::CONTENT_TYPE, "application/json")], r.to_string()).into_response()
 }

@@ -105,6 +105,20 @@
     <div class="row"><button onclick="saveSettings()">保存</button><span id="setmsg" class="muted"></span></div>
   </section>
 
+    <h2>容量估算 <span class="muted">(est.，实测校准)</span></h2>
+    <div class="cards">
+      <div class="card"><div class="l">池子剩余总容量</div><div class="v" id="cal-total">–</div></div>
+      <div class="card"><div class="l">已校准账号</div><div class="v" id="cal-count">–</div></div>
+    </div>
+    <table id="cal-table" style="margin-top:10px"><tbody></tbody></table>
+    <div class="muted" style="margin-top:8px;line-height:1.6;font-size:12px">
+      算法：tokens/% = Σ(两次探针间池内 token 消耗) ÷ Σ(wham 百分比下降)。
+      前提是 OpenAI 的 token 计量方式固定；只统计<b>池内</b>消耗的区间（池外消耗、跨窗口重置、%上升的区段自动剔除），
+      样本随使用滚动累积（探针保留 14 天），OpenAI 调整配额时估计会自行收敛到新值。
+      未校准的号显示"—"，不计入总量；不同 plan 的 tokens/% 不同属正常（这就是容量的差异）。
+    </div>
+  </section>
+
   <section>
     <h2>Token 统计</h2>
     <div class="cards">
@@ -197,6 +211,30 @@ async function loadUsage(){
     usageTable('u-model', u.by_model);
   } catch(e) { /* silent */ }
 }
+function fmtTokens(v){
+  if (v==null) return '—';
+  if (v >= 1e9) return (v/1e9).toFixed(2)+'B';
+  if (v >= 1e6) return (v/1e6).toFixed(2)+'M';
+  if (v >= 1e3) return (v/1e3).toFixed(1)+'K';
+  return Math.round(v).toString();
+}
+async function loadCalibration(){
+  try {
+    const c = await api('GET','/calibration');
+    $('cal-total').textContent = fmtTokens(c.pool_remaining_tokens);
+    $('cal-count').textContent = `${c.calibrated_accounts}/${(c.accounts||[]).length}`;
+    $('cal-table').querySelector('tbody').innerHTML = (c.accounts||[]).map(a=>`
+      <tr><td>${a.email}</td><td>${a.plan_type}</td>
+      <td>${a.used_pct!=null?a.used_pct+'%':'—'}</td>
+      <td>${a.tokens_per_pct!=null?fmtTokens(a.tokens_per_pct)+' tok/%':'—'}</td>
+      <td>${a.remaining_tokens!=null?fmtTokens(a.remaining_tokens):'—'}</td>
+      <td class="muted">${a.samples} 样本</td></tr>
+      ${(a.per_model||[]).length?a.per_model.map(m=>`
+      <tr><td class="muted" style="padding-left:2em">└ ${m.model}</td><td></td><td></td>
+      <td class="muted">${fmtTokens(m.tokens_per_pct)} tok/%</td><td></td>
+      <td class="muted">${m.intervals>0?m.intervals+' 区间':'未分离'}</td></tr>`).join(''):''}`).join('') || '<tr><td class="muted">暂无账号</td></tr>';
+  } catch(e) { /* silent */ }
+}
 let st_keys = [];
 async function load(){
   if (!MK) { $('conn').textContent='输入 manage key'; return; }
@@ -230,6 +268,7 @@ async function load(){
       <td>${l.latency_ms}ms</td><td>${l.input_tokens}/${l.cached_tokens}/${l.output_tokens}</td>
       <td class="muted">${esc((l.error||'').slice(0,50))}</td></tr>`).join('');
     loadUsage();
+    loadCalibration();
   } catch(e) { $('conn').innerHTML = '<span class="err">'+esc(e.message)+'</span>'; }
 }
 
