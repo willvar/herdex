@@ -213,6 +213,30 @@ pub async fn fetch(
     parse(body.as_bytes())
 }
 
+/// GET wham/usage for one account, returning the raw upstream body (used to
+/// serve the CLI's own usage poll verbatim).
+pub async fn fetch_raw(
+    hc: &reqwest::Client,
+    root: &str,
+    token: &str,
+    account_id: &str,
+    defaults: &std::collections::HashMap<String, String>,
+) -> Result<String, String> {
+    let url = format!("{}/backend-api/wham/usage", root.trim_end_matches('/'));
+    let res = hc
+        .get(url)
+        .headers(headers(token, account_id, defaults))
+        .send()
+        .await
+        .map_err(|e| format!("usage probe: {e}"))?;
+    let status = res.status();
+    let body = res.text().await.unwrap_or_default();
+    if status != reqwest::StatusCode::OK {
+        return Err(format!("usage endpoint {status}: {}", truncate(&body)));
+    }
+    Ok(body)
+}
+
 /// POST consume: spends one banked reset credit for the account.
 pub async fn consume_reset_credit(
     hc: &reqwest::Client,
