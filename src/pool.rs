@@ -123,9 +123,44 @@ impl Pool {
     /// Returns accounts eligible for `model`, best first. Never returns an
     /// empty list while any enabled eligible account exists.
     pub fn candidates(&self, model: &str) -> Result<Vec<Account>, String> {
+        Ok(self.scored_candidates(model)?.into_iter().map(|s| s.acc).collect())
+    }
+
+    /// Ordered candidates for a request, with session affinity: the session's
+    /// pinned account is moved to the front unless its effective score lags
+    /// the best candidate by more than 20pp (then the pin is left to expire).
+    pub fn select(&self, model: &str, session_key: &str) -> Result<Vec<Account>, String> {
+        let gap = self
+            .shared
+            .st
+            .get_settings()
+            .map(|s| s.pin_yield_gap_pp)
+            .unwrap_or(20);
+        let mut scored = self.scored_candidates(model)?;
+        if !session_key.is_empty() {
+            if let Some(pin) = self.pinned(session_key, model) {
+                if let Some(i) = scored.iter().position(|s| s.acc.id == pin) {
+                    // -1 = sticky-first (pin rides in front, migrate only on
+                    // failure); 0 = water-filling chase (always ride the
+                    // least-used account); >0 = hysteresis band
+                    let keep = if gap < 0 {
+                        true
+                    } else {
+                        scored[i].effective() <= scored[0].effective() + gap as f64
+                    };
+                    if keep && i != 0 {
+                        scored.swap(0, i);
+                    }
+                }
+            }
+        }
+        Ok(scored.into_iter().map(|s| s.acc).collect())
+    }
+
+    fn scored_candidates(&self, model: &str) -> Result<Vec<Scored>, String> {
         let accounts = self.shared.st.list_accounts()?;
         let now = (self.shared.now)();
-        let inner = self.shared.state.lock().unwrap();
+        let inner = self.shared.state.lock().unwrap_or_else(|e| e.into_inner());
 
         let mut active: Vec<Scored> = Vec::new();
         let mut cooled: Vec<Scored> = Vec::new();
@@ -134,19 +169,28 @@ impl Pool {
                 continue;
             }
             let key = (a.id.clone(), model.to_string());
-            // fall back to the account-level "default" observation (from the
-            // zero-cost usage probe) when the model has no specific one
-            let q = inner
-                .quota
-                .get(&key)
-                .or_else(|| inner.quota.get(&(a.id.clone(), "default".to_string())))
-                .copied()
-                .unwrap_or_default();
+            // model-specific observation when present; the account-level
+            // "default" observation (main quota window) always participates —
+            // a 0% model window must not mask an almost-exhausted account pool
+            let qm = inner.quota.get(&key).copied();
+            let qd = inner.quota.get(&(a.id.clone(), "default".to_string())).copied();
+            let primary = match (qm, qd) {
+                (Some(m), Some(d)) => m.primary_pct.max(d.primary_pct),
+                (Some(m), None) => m.primary_pct,
+                (None, Some(d)) => d.primary_pct,
+                (None, None) => 0.0,
+            };
+            let secondary = match (qm, qd) {
+                (Some(m), Some(d)) => m.secondary_pct.max(d.secondary_pct),
+                (Some(m), None) => m.secondary_pct,
+                (None, Some(d)) => d.secondary_pct,
+                (None, None) => 0.0,
+            };
             let f = inner.failures.get(&key).copied().unwrap_or_default();
             let s = Scored {
                 acc: a.clone(),
-                primary: q.primary_pct,
-                secondary: q.secondary_pct,
+                primary,
+                secondary,
                 last_used: inner.last_used.get(&a.id).copied().unwrap_or(0),
                 last_failed: f.last_fail,
             };
@@ -160,7 +204,7 @@ impl Pool {
             active = cooled; // never blackout: fall back to all
         }
         active.sort_by(|a, b| a.score(b));
-        Ok(active.into_iter().map(|s| s.acc).collect())
+        Ok(active)
     }
 
     /// Session affinity: the account a session is sticky to, if the pin is
@@ -223,13 +267,17 @@ struct Scored {
 }
 
 impl Scored {
-    /// Order by: least 5h usage, least weekly usage, LRU, least-recently-failed.
+    /// Effective scarcity: the tighter of primary/secondary window usage.
+    fn effective(&self) -> f64 {
+        self.primary.max(self.secondary)
+    }
+
+    /// Order by: least effective usage, LRU, least-recently-failed.
     fn score(&self, other: &Scored) -> std::cmp::Ordering {
         use std::cmp::Ordering;
-        self.primary
-            .partial_cmp(&other.primary)
+        self.effective()
+            .partial_cmp(&other.effective())
             .unwrap_or(Ordering::Equal)
-            .then(self.secondary.partial_cmp(&other.secondary).unwrap_or(Ordering::Equal))
             .then(self.last_used.cmp(&other.last_used))
             .then(self.last_failed.cmp(&other.last_failed))
     }
@@ -356,5 +404,34 @@ mod tests {
         p.observe("a2", "default", Quota { primary_pct: 5.0, ..Default::default() });
         let got = p.candidates("gpt-5.6-sol").unwrap();
         assert_eq!(got[0].id, "a2");
+    }
+
+    #[test]
+    fn model_obs_does_not_mask_account_pool() {
+        let p = test_pool();
+        let st = st_of(&p);
+        seed(&p, &["a1", "a2"]);
+        // a1: fresh model window (0%) but account pool almost exhausted
+        p.observe("a1", "gpt-6-astra", Quota { primary_pct: 0.0, ..Default::default() });
+        p.observe("a1", "default", Quota { primary_pct: 93.0, ..Default::default() });
+        p.observe("a2", "default", Quota { primary_pct: 11.0, ..Default::default() });
+        let got = p.select("gpt-6-astra", "").unwrap();
+        assert_eq!(got[0].id, "a2", "0% model window must not hide 93% weekly usage");
+    }
+
+    #[test]
+    fn pin_holds_while_close_yields_when_far() {
+        let p = test_pool();
+        let st = st_of(&p);
+        seed(&p, &["a1", "a2", "a3"]);
+        p.pin("sess", "a1", "m");
+        // close: pinned account within 20pp of best -> stays first
+        p.observe("a1", "default", Quota { primary_pct: 30.0, ..Default::default() });
+        p.observe("a2", "default", Quota { primary_pct: 10.0, ..Default::default() });
+        p.observe("a3", "default", Quota { primary_pct: 12.0, ..Default::default() });
+        assert_eq!(p.select("m", "sess").unwrap()[0].id, "a1");
+        // far: pinned account lags best by >20pp -> yields
+        p.observe("a1", "default", Quota { primary_pct: 93.0, ..Default::default() });
+        assert_eq!(p.select("m", "sess").unwrap()[0].id, "a2");
     }
 }
