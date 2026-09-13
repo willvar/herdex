@@ -37,13 +37,21 @@ pub struct ApiKey {
 pub struct Settings {
     #[serde(default = "default_cooldown")]
     pub cooldown_seconds: i64,
+    /// Migration policy for pinned sessions: -1 = sticky-first (pin rides in
+    /// front, migrate only on failure/429); 0 = water-filling chase (always
+    /// ride the least-used account, approaches even distribution); >0 =
+    /// yield when the pin lags the best by more than this many pp
+    #[serde(default = "default_yield_gap")]
+    pub pin_yield_gap_pp: i64,
 }
 
 fn default_cooldown() -> i64 { 300 }
+fn default_yield_gap() -> i64 { 20 }
 impl Default for Settings {
     fn default() -> Self {
         Settings {
             cooldown_seconds: default_cooldown(),
+            pin_yield_gap_pp: default_yield_gap(),
         }
     }
 }
