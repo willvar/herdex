@@ -8,6 +8,7 @@ use crate::usage;
 use serde_json::json;
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
+use axum::Router;
 use std::time::Duration;
 
 pub struct App {
@@ -286,16 +287,16 @@ pub fn build_http_client() -> reqwest::Client {
         .expect("http client")
 }
 
-/// Assembles the complete router (client + manage + panel redirect).
+/// Assembles the complete router (client + manage + panel redirect +
+/// chatgpt-backend fallback proxy).
 /// Extracted so tests can catch route conflicts without starting a server.
 pub fn build_router(app: AppHandle) -> axum::Router {
     // axum defaults to 2MB request bodies, which a single base64 image in a
     // codex request would blow through; local/LAN only, so be generous
     let client = crate::proxy::router()
-        .layer(axum::extract::DefaultBodyLimit::max(64 << 20))
-        .with_state(app.clone());
-    let manage_router = crate::manage::router().with_state(app.clone());
-    axum::Router::new()
+        .layer(axum::extract::DefaultBodyLimit::max(64 << 20));
+    let manage_router = crate::manage::router();
+    Router::new()
         .merge(client)
         .merge(manage_router)
         .route("/manage", axum::routing::get(|| async {
@@ -307,6 +308,8 @@ pub fn build_router(app: AppHandle) -> axum::Router {
                 .body(axum::body::Body::from(crate::panel::PANEL))
                 .unwrap()
         }))
+        .fallback(crate::proxy::codex_backend_fallback)
+        .with_state(app)
 }
 
 /// Background proactive token refresh: every 2 minutes, refresh accounts
