@@ -7,7 +7,7 @@ use crate::pool;
 use crate::store::{Account, LogEntry};
 use axum::body::{Body, Bytes};
 use axum::extract::{State, WebSocketUpgrade};
-use axum::http::{HeaderMap, StatusCode};
+use axum::http::{HeaderMap, Method, StatusCode, Uri};
 use axum::response::{IntoResponse, Response};
 use futures_util::{SinkExt, StreamExt};
 use std::sync::{Arc, Mutex};
@@ -44,6 +44,11 @@ pub fn router() -> axum::Router<AppHandle> {
         .route("/wham/usage", axum::routing::get(codex_usage))
         .route("/v1/user-auth-credential/whoami", axum::routing::get(whoami))
         .route("/user-auth-credential/whoami", axum::routing::get(whoami))
+        // apps MCP: forwarded with pool-account credentials (the same auth
+        // shape /responses uses) because the CLI's own OAuth forwarded from
+        // behind the gateway gets Cloudflare-challenged
+        .route("/api/codex/ps/mcp", axum::routing::any(codex_apps_mcp))
+        .route("/v1/api/codex/ps/mcp", axum::routing::any(codex_apps_mcp))
 }
 
 fn auth_check(app: &App, headers: &HeaderMap) -> Result<String, Response> {
@@ -984,6 +989,144 @@ async fn pipe(app: AppHandle, sock: axum::extract::ws::WebSocket, headers: Heade
 }
 
 use tokio_tungstenite::tungstenite::client::IntoClientRequest;
+
+/// Official upstream path for the apps MCP (see codex_apps_mcp_url_for_base_url:
+/// with the default chatgpt_base_url it is {backend-api}/ps/mcp, not under
+/// /api/codex).
+const APPS_MCP_UPSTREAM: &str = "https://chatgpt.com/backend-api/ps/mcp";
+
+/// Apps MCP proxy: re-authenticates the forwarded streamable-HTTP session with
+/// pool-account credentials — the exact request shape the /responses flow
+/// already uses, so chatgpt.com accepts it instead of challenging.
+async fn codex_apps_mcp(
+    State(app): State<AppHandle>,
+    method: Method,
+    headers: HeaderMap,
+    body: Bytes,
+) -> Response {
+    let snapshot = app.pool.snapshot();
+    let pick = app
+        .store
+        .list_accounts()
+        .unwrap_or_default()
+        .into_iter()
+        .filter(|a| !a.disabled)
+        .min_by(|a, b| {
+            let score = |a: &Account| {
+                snapshot
+                    .get(&a.id)
+                    .and_then(|m| m.get("default"))
+                    .map(|q| q.primary_pct.max(q.secondary_pct))
+                    .unwrap_or(0.0)
+            };
+            score(a)
+                .partial_cmp(&score(b))
+                .unwrap_or(std::cmp::Ordering::Equal)
+        });
+    let Some(acc) = pick else {
+        return (StatusCode::SERVICE_UNAVAILABLE, "no enabled account").into_response();
+    };
+
+    let mut rb = app
+        .http
+        .request(method.clone(), APPS_MCP_UPSTREAM)
+        .bearer_auth(&acc.access_token)
+        .header("Chatgpt-Account-Id", &acc.account_id);
+    for (k, v) in &app.cfg.header_defaults {
+        rb = rb.header(k, v);
+    }
+    for name in ["Accept", "Content-Type", "Mcp-Session-Id", "Mcp-Protocol-Version", "Originator", "User-Agent"] {
+        if let Some(v) = headers.get(name) {
+            rb = rb.header(name, v);
+        }
+    }
+    let res = match rb.body(body.to_vec()).send().await {
+        Ok(r) => r,
+        Err(e) => {
+            return (StatusCode::BAD_GATEWAY, format!("apps mcp proxy: {e}")).into_response();
+        }
+    };
+    let status = res.status();
+    log::info!("apps-mcp-proxy {} -> {}", method, status.as_u16());
+
+    let mut out = Response::builder().status(axum::http::StatusCode::from_u16(status.as_u16()).unwrap_or(StatusCode::BAD_GATEWAY));
+    for (k, v) in res.headers() {
+        if HOP_HEADERS.contains(&k.as_str()) || k == "content-length" {
+            continue;
+        }
+        if let (Ok(name), Ok(val)) = (
+            axum::http::HeaderName::from_bytes(k.as_str().as_bytes()),
+            axum::http::HeaderValue::from_bytes(v.as_bytes()),
+        ) {
+            out = out.header(name, val);
+        }
+    }
+    out.body(Body::from_stream(res.bytes_stream()))
+        .unwrap_or_else(|e| (StatusCode::BAD_GATEWAY, e.to_string()).into_response())
+}
+
+/// Catch-all reverse proxy to the real ChatGPT backend for paths herdex does
+/// not own (accounts/check, credit tools, ...). The CLI's
+/// chatgpt_base_url points here, so anything unhandled is forwarded verbatim
+/// with the caller's own Authorization — restoring the direct-to-chatgpt
+/// behavior those calls had before the redirect.
+pub async fn codex_backend_fallback(
+    State(app): State<AppHandle>,
+    method: axum::http::Method,
+    uri: Uri,
+    headers: HeaderMap,
+    body: Bytes,
+) -> Response {
+    const UPSTREAM_ROOT: &str = "https://chatgpt.com/backend-api";
+    let path_q = uri.path_and_query().map(|p| p.as_str()).unwrap_or(uri.path());
+    // CodexApi path style (chatgpt_base_url without /backend-api) uses
+    // /api/codex/*; the official ChatGPT backend serves the same endpoints
+    // under /backend-api/wham/* — except the apps MCP, which lives directly
+    // under /backend-api/ps/mcp (see codex_apps_mcp_url_for_base_url).
+    let rel = if let Some(rest) = path_q.strip_prefix("/api/codex") {
+        if rest.starts_with("/ps/") {
+            rest.to_string()
+        } else {
+            format!("/wham{}", rest)
+        }
+    } else {
+        path_q.strip_prefix("/backend-api").unwrap_or(path_q).to_string()
+    };
+    let upstream_path = format!("/backend-api{}", rel);
+    let url = format!("{}{}", UPSTREAM_ROOT, rel);
+
+    let mut rb = app.http.request(method.clone(), &url);
+    for (k, v) in &headers {
+        let name = k.as_str();
+        if name == "host" || HOP_HEADERS.contains(&name) || name == "content-length" {
+            continue;
+        }
+        rb = rb.header(name, v.as_bytes());
+    }
+    let res = match rb.body(body.to_vec()).send().await {
+        Ok(r) => r,
+        Err(e) => {
+            return (StatusCode::BAD_GATEWAY, format!("backend proxy: {e}")).into_response();
+        }
+    };
+    let status = res.status();
+    log::info!("backend-proxy {} {} -> {}", method, upstream_path, status.as_u16());
+
+    let mut out = Response::builder().status(axum::http::StatusCode::from_u16(status.as_u16()).unwrap_or(StatusCode::BAD_GATEWAY));
+    for (k, v) in res.headers() {
+        if HOP_HEADERS.contains(&k.as_str()) || k == "content-length" {
+            continue;
+        }
+        if let (Ok(name), Ok(val)) = (
+            axum::http::HeaderName::from_bytes(k.as_str().as_bytes()),
+            axum::http::HeaderValue::from_bytes(v.as_bytes()),
+        ) {
+            out = out.header(name, val);
+        }
+    }
+    out.body(Body::from_stream(res.bytes_stream()))
+        .unwrap_or_else(|e| (StatusCode::BAD_GATEWAY, e.to_string()).into_response())
+}
 
 #[cfg(test)]
 mod tests {
