@@ -88,18 +88,18 @@ impl Pool {
     }
 
     pub fn observe(&self, acc_id: &str, model: &str, q: Quota) {
-        let mut inner = self.shared.state.lock().unwrap();
+        let mut inner = self.shared.state.lock().unwrap_or_else(|e| e.into_inner());
         let mut q = q;
         q.observed_at = (self.shared.now)();
         inner.quota.insert((acc_id.to_string(), model.to_string()), q);
     }
 
     pub fn observation(&self, acc_id: &str, model: &str) -> Option<Quota> {
-        self.shared.state.lock().unwrap().quota.get(&(acc_id.to_string(), model.to_string())).copied()
+        self.shared.state.lock().unwrap_or_else(|e| e.into_inner()).quota.get(&(acc_id.to_string(), model.to_string())).copied()
     }
 
     pub fn mark_used(&self, acc_id: &str) {
-        self.shared.state.lock().unwrap().last_used.insert(acc_id.to_string(), (self.shared.now)());
+        self.shared.state.lock().unwrap_or_else(|e| e.into_inner()).last_used.insert(acc_id.to_string(), (self.shared.now)());
     }
 
     /// Cools the account+model pair for the configured TTL. With zero TTL
@@ -111,7 +111,7 @@ impl Pool {
             .get_settings()
             .map(|s| s.cooldown_seconds)
             .unwrap_or(300);
-        let mut inner = self.shared.state.lock().unwrap();
+        let mut inner = self.shared.state.lock().unwrap_or_else(|e| e.into_inner());
         let now = (self.shared.now)();
         let key = (acc_id.to_string(), model.to_string());
         let mut f = inner.failures.get(&key).copied().unwrap_or_default();
@@ -169,7 +169,7 @@ impl Pool {
         if session_key.is_empty() {
             return None;
         }
-        let mut inner = self.shared.state.lock().unwrap();
+        let mut inner = self.shared.state.lock().unwrap_or_else(|e| e.into_inner());
         let now = (self.shared.now)();
         match inner.affinity.get(session_key) {
             Some(pin) if pin.until > now && pin.model == model => {
@@ -191,7 +191,7 @@ impl Pool {
         if session_key.is_empty() {
             return;
         }
-        let mut inner = self.shared.state.lock().unwrap();
+        let mut inner = self.shared.state.lock().unwrap_or_else(|e| e.into_inner());
         let now = (self.shared.now)();
         inner.affinity.insert(
             session_key.to_string(),
@@ -204,7 +204,7 @@ impl Pool {
 
     /// All quota observations (accountID -> model -> Quota) for the panel.
     pub fn snapshot(&self) -> HashMap<String, HashMap<String, Quota>> {
-        let inner = self.shared.state.lock().unwrap();
+        let inner = self.shared.state.lock().unwrap_or_else(|e| e.into_inner());
         let mut out: HashMap<String, HashMap<String, Quota>> = HashMap::new();
         for ((acc, model), q) in &inner.quota {
             out.entry(acc.clone()).or_default().insert(model.clone(), *q);
