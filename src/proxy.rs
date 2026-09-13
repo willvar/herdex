@@ -702,33 +702,162 @@ fn remove_param(body: &[u8], path: &str) -> Option<Vec<u8>> {
 
 // ---- WebSocket passthrough ----
 
+#[derive(Default)]
+struct WsTurnCtx {
+    model: Option<String>,
+    turn_start: Option<std::time::Instant>,
+}
+
+/// Inspects one upstream WS frame (JSON mirror of the SSE event stream) and
+/// records what the HTTP path gets for free: per-turn usage into request_log,
+/// rate-limit windows into the pool + probe sequence, and in-stream error
+/// frames as warnings (e.g. server_is_overloaded — invisible until now).
+/// Parse failures are silently ignored; sniffing must never disturb the pipe.
+fn sniff_upstream_event(
+    app: &AppHandle,
+    ctx: &Mutex<WsTurnCtx>,
+    acc: &crate::store::Account,
+    api_key: &str,
+    text: &str,
+    started: std::time::Instant,
+) {
+    let Ok(v) = serde_json::from_str::<serde_json::Value>(text) else {
+        return;
+    };
+    let kind = v.get("type").and_then(|t| t.as_str()).unwrap_or("");
+    match kind {
+        "response.completed" => {
+            let usage = v.pointer("/response/usage");
+            let inp = usage
+                .and_then(|u| u.get("input_tokens"))
+                .and_then(|x| x.as_i64())
+                .unwrap_or(0);
+            let cached = usage
+                .and_then(|u| u.get("cached_input_tokens"))
+                .and_then(|x| x.as_i64())
+                .unwrap_or(0);
+            let out = usage
+                .and_then(|u| u.get("output_tokens"))
+                .and_then(|x| x.as_i64())
+                .unwrap_or(0);
+            if inp == 0 && out == 0 {
+                return;
+            }
+            let (model, latency) = {
+                let c = ctx.lock().unwrap();
+                let ms = c
+                    .turn_start
+                    .map(|t| t.elapsed().as_millis() as i64)
+                    .unwrap_or_else(|| started.elapsed().as_millis() as i64);
+                (c.model.clone().unwrap_or_default(), ms)
+            };
+            app.store.add_log(&crate::store::LogEntry {
+                ts: crate::store::now_secs(),
+                account_email: acc.email.clone(),
+                api_key: api_key.to_string(),
+                model: model.clone(),
+                status: 200,
+                latency_ms: latency,
+                input_tokens: inp,
+                cached_tokens: cached,
+                output_tokens: out,
+                error: String::new(),
+            });
+            let _ = ctx.lock().unwrap().turn_start.take();
+        }
+        "codex.rate_limits" => {
+            let pct = v
+                .pointer("/rate_limits/primary/used_percent")
+                .and_then(|x| x.as_f64());
+            let Some(pct) = pct else { return };
+            let reset = v
+                .pointer("/rate_limits/primary/reset_at")
+                .and_then(|x| x.as_i64())
+                .unwrap_or(0);
+            let window_secs = v
+                .pointer("/rate_limits/primary/window_minutes")
+                .and_then(|x| x.as_i64())
+                .unwrap_or(10080)
+                * 60;
+            let plan = v
+                .get("plan_type")
+                .and_then(|p| p.as_str())
+                .unwrap_or("")
+                .to_string();
+            let model = ctx.lock().unwrap().model.clone().unwrap_or_default();
+            app.pool.observe(
+                &acc.id,
+                &model,
+                crate::pool::Quota {
+                    primary_pct: pct,
+                    secondary_pct: 0.0,
+                    primary_reset_at: reset,
+                    secondary_reset_at: 0,
+                    primary_window_secs: window_secs,
+                    secondary_window_secs: 0,
+                    observed_at: crate::store::now_secs(),
+                },
+            );
+            if reset > 0 {
+                app.store
+                    .add_probe(&acc.id, crate::store::now_secs(), pct, reset, &plan);
+            }
+        }
+        "error" => {
+            let code = v
+                .get("code")
+                .or_else(|| v.pointer("/error/code"))
+                .and_then(|c| c.as_str())
+                .unwrap_or("unknown");
+            let msg = v
+                .get("message")
+                .or_else(|| v.pointer("/error/message"))
+                .and_then(|m| m.as_str())
+                .unwrap_or("");
+            log::warn!(
+                "ws-error frame: {} code={} via {}: {}",
+                model_or_default(ctx),
+                acc.email,
+                code,
+                msg
+            );
+        }
+        _ => {}
+    }
+}
+
+fn model_or_default(ctx: &Mutex<WsTurnCtx>) -> String {
+    ctx.lock().unwrap().model.clone().unwrap_or_default()
+}
+
+
 async fn ws_upgrade(
     ws: WebSocketUpgrade,
     State(app): State<AppHandle>,
     headers: HeaderMap,
 ) -> Response {
-    let candidates = app.pool.candidates("").unwrap_or_default();
+    let api_key = match auth_check(&app, &headers) {
+        Ok(k) => k,
+        Err(res) => return res,
+    };
     let session_key = headers
         .get("Session-Id")
         .and_then(|v| v.to_str().ok())
         .unwrap_or("")
         .to_string();
-    let mut candidates = candidates;
-    if let Some(pinned) = app.pool.pinned(&session_key, "") {
-        if let Some(i) = candidates.iter().position(|c| c.id == pinned) {
-            if i != 0 {
-                candidates.swap(0, i);
-            }
-        }
-    }
+    let candidates = app.pool.select("", &session_key).unwrap_or_default();
     let Some(acc) = candidates.into_iter().next() else {
         return (StatusCode::SERVICE_UNAVAILABLE, "no account available for websocket").into_response();
     };
-    ws.on_upgrade(move |sock| async move { pipe(app, sock, headers, acc).await })
+    app.pool.pin(&session_key, &acc.id, "");
+    ws.on_upgrade(move |sock| async move { pipe(app, sock, headers, acc, api_key).await })
 }
 
-async fn pipe(app: AppHandle, sock: axum::extract::ws::WebSocket, headers: HeaderMap, acc: crate::store::Account) {
+async fn pipe(app: AppHandle, sock: axum::extract::ws::WebSocket, headers: HeaderMap, acc: crate::store::Account, api_key: String) {
     use tokio_tungstenite::tungstenite::Message as WsMessage;
+    // bookkeeping shared between the two directions
+    let ctx: Arc<Mutex<WsTurnCtx>> = Arc::new(Mutex::new(WsTurnCtx::default()));
+    let started = std::time::Instant::now();
 
     let mut upstream_url = app.cfg.upstream.base_url.trim_end_matches('/').to_string();
     upstream_url = upstream_url.replacen("https://", "wss://", 1).replacen("http://", "ws://", 1);
@@ -766,10 +895,29 @@ async fn pipe(app: AppHandle, sock: axum::extract::ws::WebSocket, headers: Heade
     };
     let (mut cl_tx, mut cl_rx) = sock.split();
 
-    let c2u = tokio::spawn(async move {
+    log::info!(
+        "ws pipe open <- {} (model {:?})",
+        acc.email,
+        ctx.lock().unwrap().model
+    );
+    let c2u = {
+        let ctx = ctx.clone();
+        tokio::spawn(async move {
         while let Some(Ok(msg)) = cl_rx.next().await {
             let out = match msg {
-                axum::extract::ws::Message::Text(t) => WsMessage::Text(t.to_string()),
+                axum::extract::ws::Message::Text(t) => {
+                    // sniff the turn request for the model name + turn start
+                    if t.contains("\"model\"") {
+                        if let Ok(v) = serde_json::from_str::<serde_json::Value>(&t) {
+                            if let Some(m) = v.get("model").and_then(|m| m.as_str()) {
+                                let mut c = ctx.lock().unwrap();
+                                c.model = Some(m.to_string());
+                                c.turn_start = Some(std::time::Instant::now());
+                            }
+                        }
+                    }
+                    WsMessage::Text(t.to_string())
+                }
                 axum::extract::ws::Message::Binary(b) => WsMessage::Binary(b.to_vec()),
                 axum::extract::ws::Message::Ping(b) => WsMessage::Ping(b.to_vec()),
                 axum::extract::ws::Message::Pong(b) => WsMessage::Pong(b.to_vec()),
@@ -782,31 +930,54 @@ async fn pipe(app: AppHandle, sock: axum::extract::ws::WebSocket, headers: Heade
                 }
             };
             if up_tx.send(out).await.is_err() {
+                log::info!("ws pipe c2u send failed <- {}", ctx.lock().unwrap().model.clone().unwrap_or_default());
                 break;
             }
         }
-    });
-    let u2c = tokio::spawn(async move {
+        })
+    };
+    let u2c = {
+        let ctx = ctx.clone();
+        let app = app.clone();
+        let acc = acc.clone();
+        let api_key = api_key.clone();
+        tokio::spawn(async move {
         while let Some(Ok(msg)) = up_rx.next().await {
             let out = match msg {
-                WsMessage::Text(t) => axum::extract::ws::Message::Text(t.as_str().into()),
+                WsMessage::Text(t) => {
+                    // sniff upstream event frames: usage accounting, rate-limit
+                    // observations, in-stream errors — HTTP path gets these from
+                    // headers/stream tail, WS would otherwise be a total blind spot
+                    if t.starts_with('{') {
+                        sniff_upstream_event(&app, &ctx, &acc, &api_key, &t, started);
+                    }
+                    axum::extract::ws::Message::Text(t.as_str().into())
+                }
                 WsMessage::Binary(b) => axum::extract::ws::Message::Binary(b.into()),
                 WsMessage::Ping(b) => axum::extract::ws::Message::Ping(b.into()),
                 WsMessage::Pong(b) => axum::extract::ws::Message::Pong(b.into()),
-                WsMessage::Close(f) => axum::extract::ws::Message::Close(f.map(|f| {
-                    axum::extract::ws::CloseFrame {
+                WsMessage::Close(f) => {
+                    log::info!(
+                        "ws upstream close <- {} code={} reason={:?}",
+                        ctx.lock().unwrap().model.clone().unwrap_or_default(),
+                        f.as_ref().map(|c| u16::from(c.code)).unwrap_or(0),
+                        f.as_ref().map(|c| c.reason.clone())
+                    );
+                    axum::extract::ws::Message::Close(f.map(|f| axum::extract::ws::CloseFrame {
                         code: u16::from(f.code),
                         reason: f.reason.to_string().as_str().into(),
-                    }
-                })),
+                    }))
+                }
                 _ => continue,
             };
             if cl_tx.send(out).await.is_err() {
+                log::info!("ws pipe u2c send failed <- {}", ctx.lock().unwrap().model.clone().unwrap_or_default());
                 break;
             }
         }
         let _ = cl_tx.close().await;
-    });
+    })
+    };
     let _ = c2u.await;
     let _ = u2c.await;
     app.pool.mark_used(&acc.id);
