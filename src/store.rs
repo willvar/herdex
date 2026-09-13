@@ -145,7 +145,7 @@ impl Store {
     }
 
     fn migrate(&self) -> Result<(), String> {
-        let conn = self.conn.lock().unwrap();
+        let conn = self.conn.lock().unwrap_or_else(|e| e.into_inner());
         conn.execute_batch(SCHEMA).map_err(|e| format!("migrate: {e}"))?;
         // v1: api_keys.label renamed to comment (data-preserving on old DBs)
         let _ = conn.execute("ALTER TABLE api_keys RENAME COLUMN label TO comment", []);
@@ -185,7 +185,7 @@ impl Store {
     }
 
     pub fn update_tokens(&self, id: &str, access: &str, refresh: &str, expires_at: i64) -> Result<(), String> {
-        let conn = self.conn.lock().unwrap();
+        let conn = self.conn.lock().unwrap_or_else(|e| e.into_inner());
         let n = conn
             .execute(
                 "UPDATE accounts SET access_token=?1, refresh_token=?2, expires_at=?3 WHERE id=?4",
@@ -199,7 +199,7 @@ impl Store {
     }
 
     pub fn set_account_disabled(&self, id: &str, disabled: bool) -> Result<(), String> {
-        let conn = self.conn.lock().unwrap();
+        let conn = self.conn.lock().unwrap_or_else(|e| e.into_inner());
         let n = conn
             .execute("UPDATE accounts SET disabled=?1 WHERE id=?2", rusqlite::params![disabled as i64, id])
             .map_err(|e| e.to_string())?;
@@ -210,14 +210,14 @@ impl Store {
     }
 
     pub fn set_account_plan(&self, id: &str, plan: &str) -> Result<(), String> {
-        let conn = self.conn.lock().unwrap();
+        let conn = self.conn.lock().unwrap_or_else(|e| e.into_inner());
         conn.execute("UPDATE accounts SET plan_type=?1 WHERE id=?2", rusqlite::params![plan, id])
             .map_err(|e| e.to_string())?;
         Ok(())
     }
 
     pub fn record_account_error(&self, id: &str, msg: &str) {
-        let conn = self.conn.lock().unwrap();
+        let conn = self.conn.lock().unwrap_or_else(|e| e.into_inner());
         let _ = conn.execute(
             "UPDATE accounts SET last_error=?1, last_error_at=?2 WHERE id=?3",
             rusqlite::params![msg, now_secs(), id],
@@ -225,7 +225,7 @@ impl Store {
     }
 
     pub fn delete_account(&self, id: &str) -> Result<(), String> {
-        let conn = self.conn.lock().unwrap();
+        let conn = self.conn.lock().unwrap_or_else(|e| e.into_inner());
         let n = conn
             .execute("DELETE FROM accounts WHERE id=?1", rusqlite::params![id])
             .map_err(|e| e.to_string())?;
@@ -254,7 +254,7 @@ impl Store {
         "id,email,plan_type,account_id,access_token,refresh_token,expires_at,disabled,last_error,last_error_at";
 
     pub fn get_account(&self, id: &str) -> Result<Account, String> {
-        let conn = self.conn.lock().unwrap();
+        let conn = self.conn.lock().unwrap_or_else(|e| e.into_inner());
         let sql = format!("SELECT {} FROM accounts WHERE id=?1", Self::ACCOUNT_COLS);
         let mut stmt = conn.prepare(&sql).map_err(|e| e.to_string())?;
         let mut rows = stmt.query(rusqlite::params![id]).map_err(|e| e.to_string())?;
@@ -265,7 +265,7 @@ impl Store {
     }
 
     pub fn list_accounts(&self) -> Result<Vec<Account>, String> {
-        let conn = self.conn.lock().unwrap();
+        let conn = self.conn.lock().unwrap_or_else(|e| e.into_inner());
         let sql = format!("SELECT {} FROM accounts ORDER BY created_at", Self::ACCOUNT_COLS);
         let mut stmt = conn.prepare(&sql).map_err(|e| e.to_string())?;
         let mut rows = stmt.query([]).map_err(|e| e.to_string())?;
@@ -277,7 +277,7 @@ impl Store {
     }
 
     pub fn add_api_key(&self, key: &str, comment: &str) -> Result<(), String> {
-        let conn = self.conn.lock().unwrap();
+        let conn = self.conn.lock().unwrap_or_else(|e| e.into_inner());
         conn.execute(
             "INSERT INTO api_keys(key,comment,created_at) VALUES (?1,?2,?3)",
             rusqlite::params![key, comment, now_secs()],
@@ -287,7 +287,7 @@ impl Store {
     }
 
     pub fn delete_api_key(&self, key: &str) -> Result<(), String> {
-        let conn = self.conn.lock().unwrap();
+        let conn = self.conn.lock().unwrap_or_else(|e| e.into_inner());
         let n = conn
             .execute("DELETE FROM api_keys WHERE key=?1", rusqlite::params![key])
             .map_err(|e| e.to_string())?;
@@ -298,7 +298,7 @@ impl Store {
     }
 
     pub fn set_api_key_disabled(&self, key: &str, disabled: bool) -> Result<(), String> {
-        let conn = self.conn.lock().unwrap();
+        let conn = self.conn.lock().unwrap_or_else(|e| e.into_inner());
         let n = conn
             .execute("UPDATE api_keys SET disabled=?1 WHERE key=?2", rusqlite::params![disabled as i64, key])
             .map_err(|e| e.to_string())?;
@@ -309,7 +309,7 @@ impl Store {
     }
 
     pub fn set_api_key_comment(&self, key: &str, comment: &str) -> Result<(), String> {
-        let conn = self.conn.lock().unwrap();
+        let conn = self.conn.lock().unwrap_or_else(|e| e.into_inner());
         let n = conn
             .execute("UPDATE api_keys SET comment=?1 WHERE key=?2", rusqlite::params![comment, key])
             .map_err(|e| e.to_string())?;
@@ -323,7 +323,7 @@ impl Store {
         if old_key == new_key {
             return Ok(());
         }
-        let conn = self.conn.lock().unwrap();
+        let conn = self.conn.lock().unwrap_or_else(|e| e.into_inner());
         let n = conn
             .execute("UPDATE api_keys SET key=?1 WHERE key=?2", rusqlite::params![new_key, old_key])
             .map_err(|e| e.to_string())?;
@@ -334,7 +334,7 @@ impl Store {
     }
 
     pub fn list_api_keys(&self) -> Result<Vec<ApiKey>, String> {
-        let conn = self.conn.lock().unwrap();
+        let conn = self.conn.lock().unwrap_or_else(|e| e.into_inner());
         let mut stmt = conn
             .prepare("SELECT key,comment,created_at,disabled FROM api_keys ORDER BY created_at")
             .map_err(|e| e.to_string())?;
@@ -352,7 +352,7 @@ impl Store {
     }
 
     pub fn api_key_valid(&self, key: &str) -> Result<bool, String> {
-        let conn = self.conn.lock().unwrap();
+        let conn = self.conn.lock().unwrap_or_else(|e| e.into_inner());
         let mut stmt = conn
             .prepare("SELECT COUNT(1) FROM api_keys WHERE key=?1 AND disabled=0")
             .map_err(|e| e.to_string())?;
@@ -368,7 +368,7 @@ impl Store {
         // the Go version never had this problem because database/sql is a
         // connection pool, not a single guarded connection).
         let raw = {
-            let conn = self.conn.lock().unwrap();
+            let conn = self.conn.lock().unwrap_or_else(|e| e.into_inner());
             conn.query_row("SELECT value FROM settings WHERE key='pool'", [], |r| {
                 r.get::<_, String>(0)
             })
@@ -392,7 +392,7 @@ impl Store {
 
     pub fn put_settings(&self, st: &Settings) -> Result<(), String> {
         let raw = serde_json::to_string(st).map_err(|e| e.to_string())?;
-        let conn = self.conn.lock().unwrap();
+        let conn = self.conn.lock().unwrap_or_else(|e| e.into_inner());
         conn.execute(
             "INSERT INTO settings(key,value) VALUES ('pool',?1) ON CONFLICT(key) DO UPDATE SET value=excluded.value",
             rusqlite::params![raw],
@@ -402,7 +402,7 @@ impl Store {
     }
 
     pub fn add_log(&self, e: &LogEntry) {
-        let conn = self.conn.lock().unwrap();
+        let conn = self.conn.lock().unwrap_or_else(|e| e.into_inner());
         let _ = conn.execute(
             "INSERT INTO request_log(ts,account_email,api_key,model,status,latency_ms,input_tokens,cached_tokens,output_tokens,error)
              VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10)",
@@ -417,7 +417,7 @@ impl Store {
     /// request_log column; buckets are VM-local days.
     pub fn usage_daily(&self, days: i64) -> Result<Vec<UsageRow>, String> {
         let since = now_secs() - days * 86400;
-        let conn = self.conn.lock().unwrap();
+        let conn = self.conn.lock().unwrap_or_else(|e| e.into_inner());
         let mut stmt = conn
             .prepare(
                 r#"SELECT date(ts,'unixepoch','localtime') d, COUNT(*),
@@ -451,7 +451,7 @@ impl Store {
                FROM request_log WHERE ts >= ?1 AND {column} != '' GROUP BY {column}
                ORDER BY SUM(input_tokens) + SUM(output_tokens) DESC"#
         );
-        let conn = self.conn.lock().unwrap();
+        let conn = self.conn.lock().unwrap_or_else(|e| e.into_inner());
         let mut stmt = conn.prepare(&sql).map_err(|e| e.to_string())?;
         let rows = stmt
             .query_map(rusqlite::params![since], |r| {
