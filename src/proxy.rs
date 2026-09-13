@@ -36,6 +36,14 @@ pub fn router() -> axum::Router<AppHandle> {
             "/backend-api/codex/responses",
             axum::routing::get(ws_upgrade).post(responses),
         )
+        // codex CLI's statusline is fed exclusively by its periodic account
+        // usage poll (GET {base}/api/codex/usage for CodexApi-path base URLs);
+        // without this route the poll 404s and the statusline freezes
+        .route("/api/codex/usage", axum::routing::get(codex_usage))
+        .route("/v1/api/codex/usage", axum::routing::get(codex_usage))
+        .route("/wham/usage", axum::routing::get(codex_usage))
+        .route("/v1/user-auth-credential/whoami", axum::routing::get(whoami))
+        .route("/user-auth-credential/whoami", axum::routing::get(whoami))
 }
 
 fn auth_check(app: &App, headers: &HeaderMap) -> Result<String, Response> {
@@ -64,6 +72,176 @@ async fn models(State(app): State<AppHandle>, headers: HeaderMap) -> Response {
         .map(|m| serde_json::json!({"id": m, "object": "model", "owned_by": "openai"}))
         .collect();
     axum::Json(serde_json::json!({"object": "list", "data": data})).into_response()
+}
+
+/// Pool-aggregate usage poll ("池子总量"): probes every enabled account and
+/// reports the pool as ONE virtual account — used% is the capacity-weighted
+/// mean of per-account usage, so it stays within 0-100 even when accounts
+/// differ by plan. Weights come from the empirical tokens-per-1% calibration;
+/// uncalibrated accounts fall back to the mean calibrated weight (or equal
+/// weight when nothing is calibrated yet). reset_at = earliest window reset.
+async fn codex_usage_pool(app: &App) -> Response {
+    let accounts = app.store.list_accounts().unwrap_or_default();
+    let mut collected: Vec<(Account, crate::usage::Report)> = Vec::new();
+    for a in accounts.iter().filter(|a| !a.disabled) {
+        let body = match crate::usage::fetch_raw(
+            &app.http,
+            &app.usage_root,
+            &a.access_token,
+            &a.account_id,
+            &app.cfg.header_defaults,
+        )
+        .await
+        {
+            Ok(b) => b,
+            Err(_) => continue,
+        };
+        if let Ok(report) = crate::usage::parse(body.as_bytes()) {
+            if !a.plan_type.is_empty()
+                && !report.plan_type.is_empty()
+                && report.plan_type != a.plan_type
+            {
+                log::info!(
+                    "plan changed for {}: {} -> {}",
+                    a.email, a.plan_type, report.plan_type
+                );
+                let _ = app.store.set_account_plan(&a.id, &report.plan_type);
+            }
+            app.observe_usage(&a.id, &report);
+            collected.push((a.clone(), report));
+        }
+    }
+    if collected.is_empty() {
+        return (StatusCode::BAD_GATEWAY, "no account usage probe succeeded").into_response();
+    }
+
+    // weight = calibrated capacity (tokens per 1%); unknown → fallback weight
+    struct Entry {
+        weight: Option<f64>,
+        pct: f64,
+        reset_at: i64,
+        win_secs: i64,
+        plan: String,
+    }
+    let mut entries: Vec<Entry> = Vec::new();
+    for (a, rep) in &collected {
+        let pct = rep
+            .main
+            .primary
+            .used_pct
+            .unwrap_or(0.0)
+            .max(rep.main.secondary.used_pct.unwrap_or(0.0));
+        let weight = app
+            .store
+            .calibration(&a.id)
+            .ok()
+            .flatten()
+            .map(|c| c.tokens_per_pct);
+        entries.push(Entry {
+            weight,
+            pct,
+            reset_at: rep.main.primary.reset_at.unwrap_or(0),
+            win_secs: rep.main.primary.window_seconds.unwrap_or(604800),
+            plan: rep.plan_type.clone(),
+        });
+    }
+    let used = weighted_used(
+        &entries.iter().map(|e| (e.pct, e.weight)).collect::<Vec<_>>(),
+    );
+    let mut min_reset = i64::MAX;
+    let mut win = 604800i64;
+    let mut plan = "pro".to_string();
+    let mut best_pct = f64::MAX;
+    for e in &entries {
+        if e.reset_at > 0 {
+            min_reset = min_reset.min(e.reset_at);
+        }
+        if e.win_secs > win {
+            win = e.win_secs;
+        }
+        if e.pct < best_pct {
+            best_pct = e.pct;
+            plan = e.plan.clone();
+        }
+    }
+    let now = crate::store::now_secs();
+    // Shape must match the CLI's RateLimitStatusPayload exactly: used_percent
+    // and window fields deserialize as i32 (floats fail the whole response),
+    // and account_id/user_id must equal the PAT whoami identity or the TUI
+    // filters ordinary_usage_allowed out of the /status card.
+    let payload = serde_json::json!({
+        "plan_type": plan,
+        "rate_limit": {
+            "allowed": true,
+            "limit_reached": used >= 99.9,
+            "primary_window": {
+                "used_percent": used.round() as i64,
+                "limit_window_seconds": win,
+                "reset_at": if min_reset == i64::MAX { 0 } else { min_reset },
+                "reset_after_seconds": if min_reset == i64::MAX { 0 } else { (min_reset - now).max(0) },
+            },
+        },
+        "rate_limit_reset_credits": { "available_count": 0 },
+        "account_id": POOL_IDENTITY.account_id,
+        "user_id": POOL_IDENTITY.user_id,
+    });
+    (
+        [(axum::http::header::CONTENT_TYPE, "application/json")],
+        payload.to_string(),
+    )
+        .into_response()
+}
+
+/// The virtual ChatGPT identity herdex presents to the CLI's PAT auth flow.
+/// The whoami endpoint serves the metadata; the usage endpoint must echo the
+/// same account_id/user_id (the app-server compares them field-by-field).
+pub const POOL_IDENTITY: PoolIdentity = PoolIdentity {
+    email: "pool@herdex.local",
+    user_id: "herdex-virtual-pool-user",
+    account_id: "herdex-virtual-pool-account",
+};
+
+pub struct PoolIdentity {
+    pub email: &'static str,
+    pub user_id: &'static str,
+    pub account_id: &'static str,
+}
+
+async fn whoami() -> Response {
+    log::info!("whoami <- PAT auth bootstrap");
+    let body = serde_json::json!({
+        "email": POOL_IDENTITY.email,
+        "chatgpt_user_id": POOL_IDENTITY.user_id,
+        "chatgpt_account_id": POOL_IDENTITY.account_id,
+        "chatgpt_plan_type": "pro",
+        "chatgpt_account_is_fedramp": false,
+    });
+    (
+        [(axum::http::header::CONTENT_TYPE, "application/json")],
+        body.to_string(),
+    )
+        .into_response()
+}
+
+/// Serves the CLI's account usage poll: zero-cost probe of every enabled
+/// account; observations feed back into the pool.
+/// Auth note: when the CLI's chatgpt_base_url points here, the poll carries
+/// the CLI's own ChatGPT OAuth token instead of a herdex API key — accept any
+/// bearer on this LAN-only route (exposes usage percentages only).
+/// The CLI's statusline data source: the pool as ONE virtual account —
+/// used% is the capacity-weighted mean of per-account usage (token-calibrated
+/// weights), so it always lands in 0-100.
+async fn codex_usage(State(app): State<AppHandle>, headers: HeaderMap) -> Response {
+    let has_bearer = headers
+        .get("Authorization")
+        .and_then(|v| v.to_str().ok())
+        .map(|v| v.starts_with("Bearer "))
+        .unwrap_or(false);
+    if !has_bearer {
+        return (StatusCode::UNAUTHORIZED, "missing bearer token").into_response();
+    }
+    log::info!("usage poll <- {}", headers.get("user-agent").and_then(|v| v.to_str().ok()).unwrap_or("-"));
+    codex_usage_pool(&app).await
 }
 
 /// Decides whether one account's failure should move to the next.
@@ -314,6 +492,18 @@ async fn attempt_once(
     app.pool.pin(session_key, &acc.id, model);
     let mut out = Response::builder().status(StatusCode::from_u16(status).unwrap_or(StatusCode::OK));
     copy_headers(out.headers_mut().unwrap(), &resp_headers);
+    // The CLI's statusline also updates from turn response headers, which
+    // would otherwise overwrite the poll's pool value with the single
+    // serving account's usage — rewrite to the pool aggregate for coherence.
+    if resp_headers.contains_key("x-codex-primary-used-percent") {
+        if let Some(p) = pool_used_pct(app) {
+            if let Ok(v) = axum::http::HeaderValue::from_str(&format!("{p:.1}")) {
+                out.headers_mut()
+                    .unwrap()
+                    .insert("x-codex-primary-used-percent", v);
+            }
+        }
+    }
 
     let tail: Arc<Mutex<Vec<u8>>> = Arc::new(Mutex::new(Vec::new()));
     let log_tail = tail.clone();
@@ -409,6 +599,51 @@ fn extract_int(data: &[u8], key: &str) -> i64 {
         .ok()
         .and_then(|s| s.parse().ok())
         .unwrap_or(0)
+}
+
+/// Capacity-weighted pool usage: each account weighs by its calibrated
+/// tokens-per-1%; accounts without calibration share the mean of known
+/// weights (1.0 when nothing is calibrated yet). Shared by the usage poll
+/// and the outbound header rewrite so both CLI data sources agree.
+fn weighted_used(entries: &[(f64, Option<f64>)]) -> f64 {
+    let known: Vec<f64> = entries.iter().filter_map(|(_, w)| *w).collect();
+    let fallback = if known.is_empty() {
+        1.0
+    } else {
+        known.iter().sum::<f64>() / known.len() as f64
+    };
+    let mut wsum = 0.0f64;
+    let mut wpct = 0.0f64;
+    for (pct, w) in entries {
+        let w = w.unwrap_or(fallback);
+        wsum += w;
+        wpct += w * pct;
+    }
+    if wsum > 0.0 { wpct / wsum } else { 0.0 }
+}
+
+/// Pool-wide primary usage for the outbound header rewrite, sourced from the
+/// pool's latest "default" observations (refreshed by the usage poll and the
+/// per-request header observations). None when the pool has no data yet.
+fn pool_used_pct(app: &App) -> Option<f64> {
+    let snap = app.pool.snapshot();
+    let mut entries: Vec<(f64, Option<f64>)> = Vec::new();
+    for (acc, by_model) in &snap {
+        if let Some(q) = by_model.get("default") {
+            let w = app
+                .store
+                .calibration(acc)
+                .ok()
+                .flatten()
+                .map(|c| c.tokens_per_pct);
+            entries.push((q.primary_pct, w));
+        }
+    }
+    if entries.is_empty() {
+        None
+    } else {
+        Some(weighted_used(&entries))
+    }
 }
 
 fn copy_headers(dst: &mut axum::http::HeaderMap, src: &reqwest::header::HeaderMap) {

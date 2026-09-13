@@ -143,10 +143,17 @@ impl App {
         if acc.plan_type.is_empty() && !report.plan_type.is_empty() {
             let _ = self.store.set_account_plan(&acc.id, &report.plan_type);
         }
+        self.observe_usage(&acc.id, &report);
+        Ok(report)
+    }
+
+    /// Records a usage report's windows into the pool ("default" for the main
+    /// limit, per-model for additional limits like spark).
+    pub fn observe_usage(&self, acc_id: &str, report: &usage::Report) {
         let now = crate::store::now_secs();
         if report.main.primary.used_pct.is_some() || report.main.primary.reset_at.is_some() {
             self.pool.observe(
-                &acc.id,
+                acc_id,
                 "default",
                 crate::pool::Quota {
                     primary_pct: report.main.primary.used_pct.unwrap_or(0.0),
@@ -161,7 +168,7 @@ impl App {
         }
         for a in &report.additional {
             self.pool.observe(
-                &acc.id,
+                acc_id,
                 &usage::model_key(&a.name),
                 crate::pool::Quota {
                     primary_pct: a.limit.primary.used_pct.unwrap_or(0.0),
@@ -174,7 +181,6 @@ impl App {
                 },
             );
         }
-        Ok(report)
     }
 
     /// Consumes one banked reset credit, then re-probes usage.
