@@ -20,6 +20,13 @@ struct Args {
 }
 
 fn main() {
+    // the rustls dependency tree carries both aws-lc-rs and ring features;
+    // rustls cannot auto-pick a process-level CryptoProvider in that case
+    // and panics on first use — install ours explicitly, before any TLS.
+    rustls::crypto::aws_lc_rs::default_provider()
+        .install_default()
+        .expect("install rustls crypto provider");
+
     let args = Args::parse();
 
     let cfg = match config::load(&args.config) {

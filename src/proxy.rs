@@ -6,10 +6,9 @@ use crate::app::{App, AppHandle};
 use crate::pool;
 use crate::store::{Account, LogEntry};
 use axum::body::{Body, Bytes};
-use axum::extract::{State, WebSocketUpgrade};
+use axum::extract::State;
 use axum::http::{HeaderMap, Method, StatusCode, Uri};
 use axum::response::{IntoResponse, Response};
-use futures_util::{SinkExt, StreamExt};
 use std::sync::{Arc, Mutex};
 use std::time::Instant;
 
@@ -28,14 +27,8 @@ const HOP_HEADERS: [&str; 9] = [
 pub fn router() -> axum::Router<AppHandle> {
     axum::Router::new()
         .route("/v1/models", axum::routing::get(models))
-        .route(
-            "/v1/responses",
-            axum::routing::get(ws_upgrade).post(responses),
-        )
-        .route(
-            "/backend-api/codex/responses",
-            axum::routing::get(ws_upgrade).post(responses),
-        )
+        .route("/v1/responses", axum::routing::post(responses))
+        .route("/backend-api/codex/responses", axum::routing::post(responses))
         // codex CLI's statusline is fed exclusively by its periodic account
         // usage poll (GET {base}/api/codex/usage for CodexApi-path base URLs);
         // without this route the poll 404s and the statusline freezes
@@ -99,7 +92,10 @@ async fn codex_usage_pool(app: &App) -> Response {
         .await
         {
             Ok(b) => b,
-            Err(_) => continue,
+            Err(e) => {
+                log::warn!("usage poll: wham fetch failed for {}: {e}", a.email);
+                continue;
+            }
         };
         if let Ok(report) = crate::usage::parse(body.as_bytes()) {
             if !a.plan_type.is_empty()
@@ -362,7 +358,7 @@ async fn attempt_once(
             }
         }
     }
-    let res = loop {
+    let mut res = loop {
         let rb = app
             .http
             .post(&url)
@@ -492,6 +488,48 @@ async fn attempt_once(
         return out.body(Body::from(snippet)).map_err(|e| (500, e.to_string()));
     }
 
+    // success status, BUT the upstream may carry in-stream error events
+    // inside 200 streams (chatgpt.com sends server_is_overloaded/slow_down
+    // after only lifecycle events). Buffer upstream chunks until the first
+    // CONTENT event: an error arriving before any content is still
+    // failoverable — nothing user-visible has reached the client. Progress
+    // markers are the content-bearing events (output items, deltas); the
+    // bare lifecycle frames (created/in_progress) carry nothing.
+    let mut buffered: Vec<Bytes> = Vec::new();
+    loop {
+        let chunk = match res.chunk().await {
+            Ok(Some(c)) => c,
+            Ok(None) => break, // stream ended without content — fall through
+            Err(_) => {
+                app.pool.mark_failure(&acc.id, model);
+                return Err((0, format!("{}: upstream stream error", acc.email)));
+            }
+        };
+        if is_progress_chunk(&chunk) {
+            buffered.push(chunk);
+            break;
+        }
+        buffered.push(chunk.clone());
+        let joined: Vec<u8> = buffered
+            .iter()
+            .flat_map(|b| b.iter().copied())
+            .collect();
+        if let Some(code) = find_stream_error(&joined) {
+            app.pool.mark_failure(&acc.id, model);
+            log::warn!(
+                "{} upstream error event before any content (code {:?}) via {} — failing over",
+                model,
+                code,
+                acc.email
+            );
+            return Err((503, format!("{}: {code}", acc.email)));
+        }
+        if buffered.len() > 64 {
+            // marker never came but no error either — stream anyway rather
+            // than stall the client indefinitely
+            break;
+        }
+    }
     // success: stream to client, log usage after the stream completes
     app.pool.mark_used(&acc.id);
     app.pool.pin(session_key, &acc.id, model);
@@ -520,6 +558,13 @@ async fn attempt_once(
     let store = app.store.clone();
     let stream = async_stream::stream! {
         let mut res = res;
+        for c in buffered {
+            {
+                let mut t = log_tail.lock().unwrap();
+                t.extend_from_slice(&c);
+            }
+            yield Ok::<_, std::io::Error>(c);
+        }
         while let Some(chunk) = res.chunk().await.transpose() {
             match chunk {
                 Ok(c) => {
@@ -543,7 +588,14 @@ async fn attempt_once(
         let input = extract_int(&t, "\"input_tokens\":");
         let cached = extract_int(&t, "\"cached_tokens\":");
         let output = extract_int(&t, "\"output_tokens\":");
+        // in-stream error events inside a 200 stream (server_is_overloaded,
+        // slow_down, …) — the client sees them but our status-based failover
+        // never fired; surface them in the log row and the journal
+        let err_code = find_stream_error(&t);
         drop(t);
+        if let Some(code) = err_code.as_ref() {
+            log::warn!("{} stream carried error event (code {:?}) via {} — in-stream 200 errors bypass status failover", log_model, code, log_email);
+        }
         store.add_log(&LogEntry {
             ts: crate::store::now_secs(),
             account_email: log_email,
@@ -554,10 +606,22 @@ async fn attempt_once(
             input_tokens: input,
             cached_tokens: cached,
             output_tokens: output,
-            error: String::new(),
+            error: err_code.unwrap_or_default(),
         });
     };
     out.body(Body::from_stream(stream)).map_err(|e| (500, e.to_string()))
+}
+
+/// True when the chunk carries user-visible content: output items, text
+/// deltas, function calls. Lifecycle frames (created/in_progress) do NOT
+/// count — a turn can sit in "in_progress" for a long reasoning stretch
+/// before its first content event, and that whole window is still
+/// failoverable because the client has received nothing meaningful.
+fn is_progress_chunk(chunk: &[u8]) -> bool {
+    let t = std::str::from_utf8(chunk).unwrap_or("");
+    ["response.output_item.added", "response.output_text.delta", "response.output_item.done", "response.function_call_arguments.delta"]
+        .iter()
+        .any(|m| t.contains(m))
 }
 
 fn header_pct(h: &reqwest::header::HeaderMap, name: &str) -> Option<f64> {
@@ -567,6 +631,23 @@ fn header_pct(h: &reqwest::header::HeaderMap, name: &str) -> Option<f64> {
 fn header_minutes(h: &reqwest::header::HeaderMap, name: &str) -> Option<i64> {
     let m: i64 = h.get(name)?.to_str().ok()?.parse().ok()?;
     (m > 0).then(|| m * 60)
+}
+
+/// Scans a stream tail for an SSE error event and returns its error code.
+fn find_stream_error(tail: &[u8]) -> Option<String> {
+    let t = std::str::from_utf8(tail).ok()?;
+    let idx = t.rfind("\"type\":\"error\"")?;
+    let rest = &t[idx..];
+    let code = rest
+        .find("\"code\":")
+        .and_then(|p| {
+            let after = &rest[p + "\"code\":".len()..];
+            let start = after.find('"')? + 1;
+            let end = after[start..].find('"')?;
+            Some(after[start..start + end].to_string())
+        })
+        .unwrap_or_else(|| "unknown".to_string());
+    Some(code)
 }
 
 fn headers_get(h: &reqwest::header::HeaderMap, name: &str) -> Option<String> {
@@ -705,290 +786,6 @@ fn remove_param(body: &[u8], path: &str) -> Option<Vec<u8>> {
     serde_json::to_vec(&v).ok()
 }
 
-// ---- WebSocket passthrough ----
-
-#[derive(Default)]
-struct WsTurnCtx {
-    model: Option<String>,
-    turn_start: Option<std::time::Instant>,
-}
-
-/// Inspects one upstream WS frame (JSON mirror of the SSE event stream) and
-/// records what the HTTP path gets for free: per-turn usage into request_log,
-/// rate-limit windows into the pool + probe sequence, and in-stream error
-/// frames as warnings (e.g. server_is_overloaded — invisible until now).
-/// Parse failures are silently ignored; sniffing must never disturb the pipe.
-fn sniff_upstream_event(
-    app: &AppHandle,
-    ctx: &Mutex<WsTurnCtx>,
-    acc: &crate::store::Account,
-    api_key: &str,
-    text: &str,
-    started: std::time::Instant,
-) {
-    let Ok(v) = serde_json::from_str::<serde_json::Value>(text) else {
-        return;
-    };
-    let kind = v.get("type").and_then(|t| t.as_str()).unwrap_or("");
-    match kind {
-        "response.completed" => {
-            let usage = v.pointer("/response/usage");
-            let inp = usage
-                .and_then(|u| u.get("input_tokens"))
-                .and_then(|x| x.as_i64())
-                .unwrap_or(0);
-            let cached = usage
-                .and_then(|u| u.get("cached_input_tokens"))
-                .and_then(|x| x.as_i64())
-                .unwrap_or(0);
-            let out = usage
-                .and_then(|u| u.get("output_tokens"))
-                .and_then(|x| x.as_i64())
-                .unwrap_or(0);
-            if inp == 0 && out == 0 {
-                return;
-            }
-            let (model, latency) = {
-                let c = ctx.lock().unwrap();
-                let ms = c
-                    .turn_start
-                    .map(|t| t.elapsed().as_millis() as i64)
-                    .unwrap_or_else(|| started.elapsed().as_millis() as i64);
-                (c.model.clone().unwrap_or_default(), ms)
-            };
-            app.store.add_log(&crate::store::LogEntry {
-                ts: crate::store::now_secs(),
-                account_email: acc.email.clone(),
-                api_key: api_key.to_string(),
-                model: model.clone(),
-                status: 200,
-                latency_ms: latency,
-                input_tokens: inp,
-                cached_tokens: cached,
-                output_tokens: out,
-                error: String::new(),
-            });
-            let _ = ctx.lock().unwrap().turn_start.take();
-        }
-        "codex.rate_limits" => {
-            let pct = v
-                .pointer("/rate_limits/primary/used_percent")
-                .and_then(|x| x.as_f64());
-            let Some(pct) = pct else { return };
-            let reset = v
-                .pointer("/rate_limits/primary/reset_at")
-                .and_then(|x| x.as_i64())
-                .unwrap_or(0);
-            let window_secs = v
-                .pointer("/rate_limits/primary/window_minutes")
-                .and_then(|x| x.as_i64())
-                .unwrap_or(10080)
-                * 60;
-            let plan = v
-                .get("plan_type")
-                .and_then(|p| p.as_str())
-                .unwrap_or("")
-                .to_string();
-            let model = ctx.lock().unwrap().model.clone().unwrap_or_default();
-            app.pool.observe(
-                &acc.id,
-                &model,
-                crate::pool::Quota {
-                    primary_pct: pct,
-                    secondary_pct: 0.0,
-                    primary_reset_at: reset,
-                    secondary_reset_at: 0,
-                    primary_window_secs: window_secs,
-                    secondary_window_secs: 0,
-                    observed_at: crate::store::now_secs(),
-                },
-            );
-            if reset > 0 {
-                app.store
-                    .add_probe(&acc.id, crate::store::now_secs(), pct, reset, &plan);
-            }
-        }
-        "error" => {
-            let code = v
-                .get("code")
-                .or_else(|| v.pointer("/error/code"))
-                .and_then(|c| c.as_str())
-                .unwrap_or("unknown");
-            let msg = v
-                .get("message")
-                .or_else(|| v.pointer("/error/message"))
-                .and_then(|m| m.as_str())
-                .unwrap_or("");
-            log::warn!(
-                "ws-error frame: {} code={} via {}: {}",
-                model_or_default(ctx),
-                acc.email,
-                code,
-                msg
-            );
-        }
-        _ => {}
-    }
-}
-
-fn model_or_default(ctx: &Mutex<WsTurnCtx>) -> String {
-    ctx.lock().unwrap().model.clone().unwrap_or_default()
-}
-
-
-async fn ws_upgrade(
-    ws: WebSocketUpgrade,
-    State(app): State<AppHandle>,
-    headers: HeaderMap,
-) -> Response {
-    let api_key = match auth_check(&app, &headers) {
-        Ok(k) => k,
-        Err(res) => return res,
-    };
-    let session_key = headers
-        .get("Session-Id")
-        .and_then(|v| v.to_str().ok())
-        .unwrap_or("")
-        .to_string();
-    let candidates = app.pool.select("", &session_key).unwrap_or_default();
-    let Some(acc) = candidates.into_iter().next() else {
-        return (StatusCode::SERVICE_UNAVAILABLE, "no account available for websocket").into_response();
-    };
-    app.pool.pin(&session_key, &acc.id, "");
-    ws.on_upgrade(move |sock| async move { pipe(app, sock, headers, acc, api_key).await })
-}
-
-async fn pipe(app: AppHandle, sock: axum::extract::ws::WebSocket, headers: HeaderMap, acc: crate::store::Account, api_key: String) {
-    use tokio_tungstenite::tungstenite::Message as WsMessage;
-    // bookkeeping shared between the two directions
-    let ctx: Arc<Mutex<WsTurnCtx>> = Arc::new(Mutex::new(WsTurnCtx::default()));
-    let started = std::time::Instant::now();
-
-    let mut upstream_url = app.cfg.upstream.base_url.trim_end_matches('/').to_string();
-    upstream_url = upstream_url.replacen("https://", "wss://", 1).replacen("http://", "ws://", 1);
-    upstream_url.push_str("/responses");
-
-    let Ok(mut req) = upstream_url.as_str().into_client_request() else {
-        return;
-    };
-    use tokio_tungstenite::tungstenite::http::HeaderValue as TsHeaderValue;
-    if let Ok(v) = TsHeaderValue::from_str(&format!("Bearer {}", acc.access_token)) {
-        req.headers_mut().insert("Authorization", v);
-    }
-    if !acc.account_id.is_empty() {
-        if let Ok(v) = TsHeaderValue::from_str(&acc.account_id) {
-            req.headers_mut().insert("Chatgpt-Account-Id", v);
-        }
-    }
-    for (k, v) in &app.cfg.header_defaults {
-        if let (Ok(name), Ok(val)) = (
-            reqwest::header::HeaderName::from_bytes(k.as_bytes()),
-            v.parse::<reqwest::header::HeaderValue>(),
-        ) {
-            req.headers_mut().insert(name, val);
-        }
-    }
-    if let Some(v) = headers.get("Session-Id").and_then(|v| v.to_str().ok()) {
-        if let Ok(v) = TsHeaderValue::from_str(v) {
-            req.headers_mut().insert("Session-Id", v);
-        }
-    }
-
-    let (mut up_tx, mut up_rx) = match tokio_tungstenite::connect_async(req).await {
-        Ok((ws, _)) => ws.split(),
-        Err(_) => return,
-    };
-    let (mut cl_tx, mut cl_rx) = sock.split();
-
-    log::info!(
-        "ws pipe open <- {} (model {:?})",
-        acc.email,
-        ctx.lock().unwrap().model
-    );
-    let c2u = {
-        let ctx = ctx.clone();
-        tokio::spawn(async move {
-        while let Some(Ok(msg)) = cl_rx.next().await {
-            let out = match msg {
-                axum::extract::ws::Message::Text(t) => {
-                    // sniff the turn request for the model name + turn start
-                    if t.contains("\"model\"") {
-                        if let Ok(v) = serde_json::from_str::<serde_json::Value>(&t) {
-                            if let Some(m) = v.get("model").and_then(|m| m.as_str()) {
-                                let mut c = ctx.lock().unwrap();
-                                c.model = Some(m.to_string());
-                                c.turn_start = Some(std::time::Instant::now());
-                            }
-                        }
-                    }
-                    WsMessage::Text(t.to_string())
-                }
-                axum::extract::ws::Message::Binary(b) => WsMessage::Binary(b.to_vec()),
-                axum::extract::ws::Message::Ping(b) => WsMessage::Ping(b.to_vec()),
-                axum::extract::ws::Message::Pong(b) => WsMessage::Pong(b.to_vec()),
-                axum::extract::ws::Message::Close(f) => {
-                    use tokio_tungstenite::tungstenite::protocol::{CloseFrame, frame::coding::CloseCode};
-                    WsMessage::Close(f.map(|f| CloseFrame {
-                        code: CloseCode::from(f.code),
-                        reason: f.reason.to_string().into(),
-                    }))
-                }
-            };
-            if up_tx.send(out).await.is_err() {
-                log::info!("ws pipe c2u send failed <- {}", ctx.lock().unwrap().model.clone().unwrap_or_default());
-                break;
-            }
-        }
-        })
-    };
-    let u2c = {
-        let ctx = ctx.clone();
-        let app = app.clone();
-        let acc = acc.clone();
-        let api_key = api_key.clone();
-        tokio::spawn(async move {
-        while let Some(Ok(msg)) = up_rx.next().await {
-            let out = match msg {
-                WsMessage::Text(t) => {
-                    // sniff upstream event frames: usage accounting, rate-limit
-                    // observations, in-stream errors — HTTP path gets these from
-                    // headers/stream tail, WS would otherwise be a total blind spot
-                    if t.starts_with('{') {
-                        sniff_upstream_event(&app, &ctx, &acc, &api_key, &t, started);
-                    }
-                    axum::extract::ws::Message::Text(t.as_str().into())
-                }
-                WsMessage::Binary(b) => axum::extract::ws::Message::Binary(b.into()),
-                WsMessage::Ping(b) => axum::extract::ws::Message::Ping(b.into()),
-                WsMessage::Pong(b) => axum::extract::ws::Message::Pong(b.into()),
-                WsMessage::Close(f) => {
-                    log::info!(
-                        "ws upstream close <- {} code={} reason={:?}",
-                        ctx.lock().unwrap().model.clone().unwrap_or_default(),
-                        f.as_ref().map(|c| u16::from(c.code)).unwrap_or(0),
-                        f.as_ref().map(|c| c.reason.clone())
-                    );
-                    axum::extract::ws::Message::Close(f.map(|f| axum::extract::ws::CloseFrame {
-                        code: u16::from(f.code),
-                        reason: f.reason.to_string().as_str().into(),
-                    }))
-                }
-                _ => continue,
-            };
-            if cl_tx.send(out).await.is_err() {
-                log::info!("ws pipe u2c send failed <- {}", ctx.lock().unwrap().model.clone().unwrap_or_default());
-                break;
-            }
-        }
-        let _ = cl_tx.close().await;
-    })
-    };
-    let _ = c2u.await;
-    let _ = u2c.await;
-    app.pool.mark_used(&acc.id);
-}
-
-use tokio_tungstenite::tungstenite::client::IntoClientRequest;
 
 /// Official upstream path for the apps MCP (see codex_apps_mcp_url_for_base_url:
 /// with the default chatgpt_base_url it is {backend-api}/ps/mcp, not under
@@ -1159,5 +956,50 @@ mod tests {
         assert!(out["reasoning"].get("effort").is_none());
         assert!(remove_param(body, "missing.path").is_none());
         assert!(remove_param(b"not json", "x").is_none());
+    }
+
+    #[test]
+    fn weighted_pool_aggregation_uses_calibration_weights() {
+        // Pro 10x capacity at 29%, three prolite at 30% — the pool must be
+        // dominated by Pro's weight, NOT an equal-weight mean (29.75)
+        let entries = vec![
+            (29.0, Some(10_070_419.8)),
+            (30.0, Some(1_937_314.0)),
+            (30.0, Some(2_215_704.4)),
+            (30.0, Some(1_950_328.3)),
+        ];
+        let used = weighted_used(&entries);
+        // 29x10.07M + 30x(1.94+2.22+1.95)M over 16.17M total
+        assert!((used - 29.377).abs() < 0.05, "got {used}");
+
+        // single entry degenerates to its own value
+        assert_eq!(weighted_used(&[(29.0, Some(1e6))]), 29.0);
+
+        // nothing calibrated → equal weights
+        let e = vec![(29.0, None::<f64>), (30.0, None)];
+        assert!((weighted_used(&e) - 29.5).abs() < 1e-9);
+    }
+
+    #[test]
+    fn stream_error_detection() {
+        // error event inside a 200 stream is found with its code
+        let tail = b"data: {\"type\":\"error\",\"code\":\"server_is_overloaded\",\"message\":\"busy\"}";
+        assert_eq!(find_stream_error(tail).as_deref(), Some("server_is_overloaded"));
+
+        // normal usage tail → no error
+        let ok = b"data: {\"type\":\"response.completed\",\"response\":{\"usage\":{\"input_tokens\":10}}}";
+        assert_eq!(find_stream_error(ok), None);
+
+        // error-only frame → failoverable
+        let err_first = b"data: {\"type\":\"error\",\"code\":\"slow_down\"}";
+        assert!(!is_progress_chunk(err_first));
+
+        // lifecycle-only frame → still buffering, failoverable
+        let life = b"data: {\"type\":\"response.in_progress\"}";
+        assert!(!is_progress_chunk(life));
+
+        // content event → committed, no longer failoverable
+        let content = b"data: {\"type\":\"response.output_item.added\"}";
+        assert!(is_progress_chunk(content));
     }
 }
