@@ -229,10 +229,7 @@ async function loadCalibration(){
       <td>${a.tokens_per_pct!=null?fmtTokens(a.tokens_per_pct)+' tok/%':'—'}</td>
       <td>${a.remaining_tokens!=null?fmtTokens(a.remaining_tokens):'—'}</td>
       <td class="muted">${a.samples} 样本</td></tr>
-      ${(a.per_model||[]).length?a.per_model.map(m=>`
-      <tr><td class="muted" style="padding-left:2em">└ ${m.model}</td><td></td><td></td>
-      <td class="muted">${fmtTokens(m.tokens_per_pct)} tok/%</td><td></td>
-      <td class="muted">${m.intervals>0?m.intervals+' 区间':'未分离'}</td></tr>`).join(''):''}`).join('') || '<tr><td class="muted">暂无账号</td></tr>';
+      </tr>`).join('') || '<tr><td class="muted">暂无账号</td></tr>';
   } catch(e) { /* silent */ }
 }
 let st_keys = [];
