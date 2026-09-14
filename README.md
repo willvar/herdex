@@ -11,6 +11,9 @@ codex 专用账号池网关（Rust）。把多个 ChatGPT 账号聚合成一个 
 - **配额感知调度**：least usage（模型级与账号级取 max，防止模型级 0% 遮蔽账号级耗尽）→ LRU 排序；单账号 429 只冷却该账号+模型组合（短 TTL），永不熔断全池，全部冷却时仍按"上次失败时间最早者优先"返回候选而非报错
 - **黏性让位可配**：`pin_yield_gap_pp`（面板可调）三档语义：`-1` 黏性优先（钉住的号永远先试，哪怕已耗尽）、`0` 纯水填、`>0` 滞后带（黏性在领先值 gap 内不让位）
 - **池子口径 statusline**：CLI 的 usage 轮询返回**容量加权的池子聚合值**；turn 响应头同步改写为池子值——两条写入源一致，statusline 永远显示"整个号池还剩多少"而非单号
+- **流内过载 failover**：chatgpt.com 可能在 200 SSE 流内携带
+  `server_is_overloaded` 错误帧——缓冲至首个内容帧，错误先于内容到达时
+  无痕换号重试；流尾错误标记入账，日志与面板可查
 - **容量校准**：请求头实时探针 + 边界穿越记账（重放式，无运行时状态），
   解出每个账号每 1% 对应的 token 量；进一步按模型做最小二乘分离（`per_model`），
   校准收敛后池子估算从等权升级为 token 精确加权
@@ -105,7 +108,6 @@ whoami、模型请求——全部落在 herdex 上，凭据始终是 herdex API 
 
 - `POST /v1/responses`、`POST /backend-api/codex/responses` —— SSE 流式透传
 - `GET  /v1/models`
-- `WS   /v1/responses` —— WebSocket 透传
 - `GET  /api/codex/usage`（及 `/v1/api/codex/usage`、`/wham/usage`）—— 池子聚合用量
 - `GET  /v1/user-auth-credential/whoami` —— PAT 虚拟身份
 - `*    /backend-api/*`（其余路径）—— 上游后端反代
