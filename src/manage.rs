@@ -106,9 +106,7 @@ async fn calibration(State(app): State<AppHandle>, headers: HeaderMap) -> Respon
             "email": a.email, "plan_type": a.plan_type,
             "tokens_per_pct": if is_calibrated { serde_json::json!(tpp) } else { serde_json::Value::Null },
             "samples": samples,
-            "per_model": cal.per_model.iter().map(|(m, c, n)| serde_json::json!({
-                "model": m, "tokens_per_pct": c, "intervals": n,
-            })).collect::<Vec<_>>(),
+
             "used_pct": pct,
             "remaining_tokens": if is_calibrated { serde_json::json!(remaining_tokens) } else { serde_json::Value::Null },
             "calibrated": is_calibrated,
