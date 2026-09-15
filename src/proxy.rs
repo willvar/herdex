@@ -496,6 +496,7 @@ async fn attempt_once(
     // markers are the content-bearing events (output items, deltas); the
     // bare lifecycle frames (created/in_progress) carry nothing.
     let mut buffered: Vec<Bytes> = Vec::new();
+    let mut buffered_bytes = 0usize;
     loop {
         let chunk = match res.chunk().await {
             Ok(Some(c)) => c,
@@ -505,16 +506,19 @@ async fn attempt_once(
                 return Err((0, format!("{}: upstream stream error", acc.email)));
             }
         };
-        if is_progress_chunk(&chunk) {
-            buffered.push(chunk);
-            break;
-        }
         buffered.push(chunk.clone());
+        buffered_bytes += chunk.len();
+        if is_progress_chunk(&chunk) {
+            break; // first content event seen — commit to streaming
+        }
+        // evaluate the JOINED buffer: chunk boundaries may split the JSON,
+        // and upstream coalesces lifecycle + error events into one chunk
         let joined: Vec<u8> = buffered
             .iter()
             .flat_map(|b| b.iter().copied())
             .collect();
-        if let Some(code) = find_stream_error(&joined) {
+        if error_precedes_content(&joined) {
+            let code = find_stream_error(&joined).unwrap_or_else(|| "unknown".into());
             app.pool.mark_failure(&acc.id, model);
             log::warn!(
                 "{} upstream error event before any content (code {:?}) via {} — failing over",
@@ -524,7 +528,7 @@ async fn attempt_once(
             );
             return Err((503, format!("{}: {code}", acc.email)));
         }
-        if buffered.len() > 64 {
+        if buffered.len() > 64 || buffered_bytes > 2 * 1024 * 1024 {
             // marker never came but no error either — stream anyway rather
             // than stall the client indefinitely
             break;
@@ -622,6 +626,24 @@ fn is_progress_chunk(chunk: &[u8]) -> bool {
     ["response.output_item.added", "response.output_text.delta", "response.output_item.done", "response.function_call_arguments.delta"]
         .iter()
         .any(|m| t.contains(m))
+}
+
+/// In the buffered prefix, does the error event arrive BEFORE the first
+/// content-bearing event? Only then is the stream still failoverable.
+fn error_precedes_content(joined: &[u8]) -> bool {
+    let t = std::str::from_utf8(joined).unwrap_or("");
+    match (t.find("\"type\":\"error\""), first_content_pos(t)) {
+        (Some(_), None) => true,             // error only, no content
+        (Some(e), Some(c)) => e < c,         // error before content
+        (None, _) => false,                  // no error at all
+    }
+}
+
+fn first_content_pos(t: &str) -> Option<usize> {
+    ["response.output_item.added", "response.output_text.delta", "response.output_item.done", "response.function_call_arguments.delta"]
+        .iter()
+        .filter_map(|m| t.find(m))
+        .min()
 }
 
 fn header_pct(h: &reqwest::header::HeaderMap, name: &str) -> Option<f64> {
