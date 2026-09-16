@@ -508,11 +508,9 @@ async fn attempt_once(
         };
         buffered.push(chunk.clone());
         buffered_bytes += chunk.len();
-        if is_progress_chunk(&chunk) {
-            break; // first content event seen — commit to streaming
-        }
-        // evaluate the JOINED buffer: chunk boundaries may split the JSON,
-        // and upstream coalesces lifecycle + error events into one chunk
+        // evaluate the JOINED buffer FIRST: chunk boundaries may split the
+        // JSON, and upstream coalesces lifecycle + error events into one
+        // flush — a per-chunk progress check would commit before noticing
         let joined: Vec<u8> = buffered
             .iter()
             .flat_map(|b| b.iter().copied())
@@ -527,6 +525,9 @@ async fn attempt_once(
                 acc.email
             );
             return Err((503, format!("{}: {code}", acc.email)));
+        }
+        if is_progress_chunk(&chunk) {
+            break; // first content event seen — commit to streaming
         }
         if buffered.len() > 64 || buffered_bytes > 2 * 1024 * 1024 {
             // marker never came but no error either — stream anyway rather
