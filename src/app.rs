@@ -18,6 +18,10 @@ pub struct App {
     pub http: reqwest::Client,
     pub usage_root: String,
     pub pending: Mutex<HashMap<String, oauth::PKCE>>,
+    /// per-account refresh single-flight: concurrent refreshes would replay
+    /// the same refresh token — OpenAI's replay detection then kills the
+    /// whole token family ("already been used" 401s, unrecoverable)
+    pub refresh_guards: tokio::sync::Mutex<HashMap<String, Arc<tokio::sync::Mutex<()>>>>,
     /// unix day of the last request_log prune (0 = never)
     pub last_prune_day: std::sync::atomic::AtomicI64,
     /// upstream-rejected body params learned from 400s (non-codex clients
@@ -102,7 +106,30 @@ impl App {
     }
 
     /// Force-refreshes the account's tokens via the refresh grant.
+    /// Refreshes one account's tokens — SINGLE-FLIGHT per account. The
+    /// refresh token rotates on every use: two concurrent refreshes with the
+    /// same token means one of them is a replay, and OpenAI's replay
+    /// detection kills the whole token family. Always re-read the stored
+    /// tokens right before the call so the freshest rotation wins.
     pub async fn refresh_expired(&self, acc: &mut Account) -> Result<(), String> {
+        let guard = {
+            let mut g = self.refresh_guards.lock().await;
+            g.entry(acc.id.clone())
+                .or_insert_with(|| Arc::new(tokio::sync::Mutex::new(())))
+                .clone()
+        };
+        let _guard = guard.lock().await;
+        // freshest tokens from the DB — a concurrent flight may have just
+        // rotated them under us
+        if let Ok(latest) = self.store.list_accounts() {
+            if let Some(latest) = latest.iter().find(|x| x.id == acc.id) {
+                if latest.expires_at > acc.expires_at || latest.access_token != acc.access_token {
+                    acc.access_token = latest.access_token.clone();
+                    acc.refresh_token = latest.refresh_token.clone();
+                    acc.expires_at = latest.expires_at;
+                }
+            }
+        }
         let ts = oauth::refresh(
             &self.http,
             &self.cfg.oauth.issuer,
