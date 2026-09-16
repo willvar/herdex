@@ -79,11 +79,15 @@ pub fn auth_url(issuer: &str, client_id: &str, redirect_uri: &str, p: &PKCE) -> 
     q.insert("response_type", "code");
     q.insert("client_id", client_id);
     q.insert("redirect_uri", redirect_uri);
-    q.insert("scope", "openid profile email offline_access");
+    q.insert(
+        "scope",
+        "openid profile email offline_access api.connectors.read api.connectors.invoke",
+    );
+    q.insert("id_token_add_organizations", "true");
+    q.insert("codex_cli_simplified_flow", "true");
     q.insert("state", &p.state);
     q.insert("code_challenge", &p.challenge);
     q.insert("code_challenge_method", "S256");
-    q.insert("prompt", "login");
     q.insert("originator", "codex_cli_rs");
     let qs: Vec<String> = q
         .iter()

@@ -2,6 +2,7 @@
 //! driven through real HTTP requests (mirrors the Go proxy integration tests).
 
 use axum::Router;
+use std::collections::HashMap;
 use herdex::app::App;
 use herdex::config::Config;
 use herdex::pool::Pool;
@@ -126,6 +127,7 @@ async fn harness(accounts: &[&str]) -> Harness {
         pending: Mutex::new(Default::default()),
         last_prune_day: std::sync::atomic::AtomicI64::new(0),
         learned_strips: std::sync::Mutex::new(std::collections::HashSet::new()),
+        refresh_guards: tokio::sync::Mutex::new(HashMap::new()),
     });
     let pr = proxy::router().with_state(app);
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
@@ -275,6 +277,7 @@ async fn full_router_assembles_and_serves_panel() {
             pending: Mutex::new(Default::default()),
             last_prune_day: std::sync::atomic::AtomicI64::new(0),
         learned_strips: std::sync::Mutex::new(std::collections::HashSet::new()),
+        refresh_guards: tokio::sync::Mutex::new(HashMap::new()),
         })
     });
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
