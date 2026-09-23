@@ -45,7 +45,8 @@ pub fn ensure_material(state_root: &str, cfg: &TlsCfg) -> Result<PathBuf, String
     }
 
     // CA (persisted so the same CA signs renewed leaves)
-    let ca_key = load_or_create_ca_key(&ca_path, key_path.parent().unwrap_or(Path::new(".")))?;
+    let ca_key_path = Path::new(state_root).join("herdex-ca.key");
+    let ca_key = load_or_create_ca_key(&ca_key_path)?;
     let mut ca_params = CertificateParams::new(vec![]).map_err(|e| e.to_string())?;
     ca_params.is_ca = IsCa::Ca(rcgen::BasicConstraints::Unconstrained);
     ca_params
@@ -97,14 +98,19 @@ fn hosts_cn(cfg: &TlsCfg) -> String {
     cfg.enabled_hosts().first().cloned().unwrap_or_default()
 }
 
-fn load_or_create_ca_key(ca_path: &Path, dir: &Path) -> Result<KeyPair, String> {
-    let _ = dir;
-    if let Ok(existing) = std::fs::read_to_string(ca_path) {
+/// The CA key must be persisted separately from the CA certificate: the
+/// .pem holds the cert (public material, served at /ca.pem) while the key
+/// must outlive restarts so every leaf stays signed by the same CA.
+fn load_or_create_ca_key(key_path: &Path) -> Result<KeyPair, String> {
+    if let Ok(existing) = std::fs::read_to_string(key_path) {
         if !existing.trim().is_empty() {
             return KeyPair::from_pem(&existing).map_err(|e| e.to_string());
         }
     }
-    KeyPair::generate().map_err(|e| e.to_string())
+    let key = KeyPair::generate().map_err(|e| e.to_string())?;
+    std::fs::write(key_path, key.serialize_pem()).map_err(|e| e.to_string())?;
+    restrict_key_permissions(key_path);
+    Ok(key)
 }
 
 fn restrict_key_permissions(path: &Path) {
