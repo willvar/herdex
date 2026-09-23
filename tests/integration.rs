@@ -918,8 +918,25 @@ async fn full_router_assembles_and_serves_panel() {
         .send()
         .await
         .unwrap();
+    assert_eq!(res.status(), 307);
+    assert_eq!(res.headers()["location"], "/manage/panel/");
+
+    let res = client
+        .get(format!("http://{addr}/manage/panel/"))
+        .send()
+        .await
+        .unwrap();
     assert_eq!(res.status(), 200);
     assert_eq!(res.headers()["content-type"], "text/html; charset=utf-8");
+
+    // Removing the explicit route must not expose the retired URL through
+    // the static handler's former index fallback.
+    let res = client
+        .get(format!("http://{addr}/manage/panel/legacy"))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(res.status(), 404);
 
     // client routes still work through the same router
     let res = reqwest::Client::new()
