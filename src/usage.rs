@@ -284,6 +284,51 @@ pub fn model_key(limit_name: &str) -> String {
     limit_name.trim().to_lowercase().replace(' ', "-")
 }
 
+pub async fn fetch_model_slugs(
+    hc: &reqwest::Client,
+    root: &str,
+    token: &str,
+    account_id: &str,
+    defaults: &std::collections::HashMap<String, String>,
+    client_version: &str,
+) -> Result<Vec<String>, String> {
+    // the upstream catalog is tailored by client_version — an old version
+    // query yields an empty list, so this MUST track the real client
+    let url = format!(
+        "{}/models?client_version={}",
+        root.trim_end_matches('/'),
+        client_version
+    );
+    let res = hc
+        .get(url)
+        .headers(headers(token, account_id, defaults))
+        .send()
+        .await
+        .map_err(|e| e.to_string())?;
+    let status = res.status();
+    let body = res.text().await.unwrap_or_default();
+    if !status.is_success() {
+        return Err(format!(
+            "models endpoint {status}: {}",
+            &body[..body.len().min(160)]
+        ));
+    }
+    let v: serde_json::Value =
+        serde_json::from_str(&body).map_err(|e| format!("models decode: {e}"))?;
+    Ok(v.get("models")
+        .and_then(|m| m.as_array())
+        .map(|arr| {
+            arr.iter()
+                .filter_map(|m| {
+                    m.get("slug")
+                        .and_then(|s| s.as_str())
+                        .map(|s| s.to_string())
+                })
+                .collect()
+        })
+        .unwrap_or_default())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

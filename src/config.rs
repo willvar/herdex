@@ -54,6 +54,10 @@ pub struct Config {
     pub retention_days: Option<i64>,
     #[serde(default)]
     pub tls: TlsCfg,
+    /// Optional override for /v1/models. Empty = serve the intersection of
+    /// upstream-discovered catalogs (fallback: builtin catalog).
+    #[serde(default)]
+    pub models: Vec<String>,
 }
 
 /// Loads config with env interpolation (`env: NAME` mapping/scalar and
@@ -109,6 +113,15 @@ impl TlsCfg {
 impl Config {
     pub fn retention_days(&self) -> i64 {
         self.retention_days.unwrap_or(730)
+    }
+
+    /// The codex client version we serve for — upstream endpoints tailor
+    /// responses to it (the models catalog is empty for stale versions).
+    pub fn client_version(&self) -> &str {
+        self.header_defaults
+            .get("version")
+            .map(|s| s.as_str())
+            .unwrap_or("0.156.1")
     }
 
     fn apply_defaults(&mut self) {
