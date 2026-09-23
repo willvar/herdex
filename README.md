@@ -13,10 +13,13 @@ codex 专用账号池网关（Rust）。把多个 ChatGPT 账号聚合成一个 
 - **池子口径 statusline**：CLI 的 usage 轮询返回**容量加权的池子聚合值**；turn 响应头同步改写为池子值——两条写入源一致，statusline 永远显示"整个号池还剩多少"而非单号
 - **流内过载 failover**：chatgpt.com 可能在 200 SSE 流内携带
   `server_is_overloaded` 错误帧——缓冲至首个内容帧，错误先于内容到达时
-  无痕换号重试；流尾错误标记入账，日志与面板可查
+  无痕换号重试；判定不依赖 HTTP 分块数量。SSE 前缀超过 2 MiB 仍无完整内容时，
+  返回本地 `prefix_limit_exceeded` 错误，不冷却账号或自动换号；流尾错误标记入账
+  内部计量最多保留 8 MiB 的 JSON 文档或单个 SSE 事件；超限仍原样透传，
+  日志标记 `observer_limit_exceeded`（计量可能不完整），不冷却账号；SSE 从下一事件恢复计量。
 - **容量校准**：请求头实时探针 + 边界穿越记账（重放式，无运行时状态），
-  解出每个账号每 1% 对应的 token 量；进一步按模型做最小二乘分离（`per_model`），
-  校准收敛后池子估算从等权升级为 token 精确加权
+  解出每个账号每 1% 对应的混合 token 量（输入已包含缓存，不重复累计），
+  校准收敛后池子估算从等权升级为容量加权
 - **PAT 虚拟账号**：CLI 用 codex 的 PersonalAccessToken 认证模式接入，whoami 由
   网关应答——无需任何真实 OAuth，账号身份（`pool@herdex.local`）只存在于网关侧
 - **零成本用量探针**：定时探测 `wham/usage`（不消耗模型配额），各窗口全部入池
@@ -42,6 +45,7 @@ cargo build --release   # 需要 cmake（aws-lc-rs 构建）
 # /etc/herdex/herdex.toml
 listen = "127.0.0.1:8319"
 state-root = "/var/lib/herdex"        # SQLite 状态库目录
+retention-days = 730                  # 请求日志保留天数；缺省 730，0 = 永久
 
 [manage]
 # 面板认证密钥；支持 env 插值：{ env = "NAME" }、"env: NAME"、"{env:NAME}"
@@ -59,8 +63,6 @@ user-agent = "codex_cli_rs/0.153.4"
 originator = "codex_cli_rs"
 beta-features = "multi_agent"
 
-retention-days = 730                  # 请求日志保留天数；缺省 730，0 = 永久
-
 [log]
 level = "info"
 ```
@@ -72,6 +74,11 @@ herdex --config /etc/herdex/herdex.toml   # 默认路径同上；-c 短选项
 ```
 
 systemd 部署样例见 `deploy/herdex.service`（含完整沙箱加固）。
+
+数据库启动时自动迁移，升级前应备份。新探针记录请求日志序号，按观察顺序归属
+已完成请求，不再依赖同一秒内的时间比较；未知套餐不会作为套餐变更处理。
+旧探针保留秒级估算，新旧顺序边界不混算；旧日志若缺少账号 ID 且邮箱对应多个账号，
+不会强行分摊到容量校准中。容量及触顶时间仍是估算，上游额度更新可能有延迟。
 
 ## CLI 接入（PAT 虚拟账号模式）
 
@@ -118,8 +125,13 @@ whoami、模型请求——全部落在 herdex 上，凭据始终是 herdex API 
 ## 测试
 
 ```bash
-cargo test   # 32 个测试（单测 + HTTP 集成：假上游 + 真实 axum 链路）
+cargo fmt --check
+cargo clippy --all-targets --locked -- -D warnings
+cargo test --locked   # 单测 + HTTP 集成：假上游 + 真实 axum 链路
 ```
+
+后端回归覆盖慢速 SSE 分块、前缀预算、同秒请求归属、
+未知套餐、旧数据库迁移、断连收尾，以及历史清理后的容量统计。
 
 核心语义不变式（逐条测试锁定）：
 - 429 永不熔断全池；全部冷却时仍返回候选（按上次失败时间最早者优先），而不是直接报错

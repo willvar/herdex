@@ -1,5 +1,7 @@
 listen = "192.168.168.254:8317"
 state-root = "/var/lib/herdex"
+# request_log retention in days (default 730 = 2 years, 0 = keep forever)
+retention-days = 730
 
 [manage]
 # env 插值：值为 { env = "NAME" } 内联表或 "env: NAME"/"{env:NAME}" 标量
@@ -17,9 +19,6 @@ base-url = "https://chatgpt.com/backend-api/codex"
 user-agent = "codex_cli_rs/0.153.4"
 originator = "codex_cli_rs"
 beta-features = "multi_agent"
-
-# request_log retention in days (default 730 = 2 years, 0 = keep forever)
-retention-days = 730
 
 [log]
 level = "info"

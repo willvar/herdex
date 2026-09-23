@@ -5,10 +5,10 @@ use crate::oauth;
 use crate::pool::Pool;
 use crate::store::{Account, Store};
 use crate::usage;
+use axum::Router;
 use serde_json::json;
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
-use axum::Router;
 use std::time::Duration;
 
 pub struct App {
@@ -32,12 +32,18 @@ pub struct App {
 impl App {
     /// Path of the learned-strips cache file (survives restarts).
     pub fn learned_path(&self) -> String {
-        format!("{}/learned-strips.json", self.cfg.state_root.trim_end_matches('/'))
+        format!(
+            "{}/learned-strips.json",
+            self.cfg.state_root.trim_end_matches('/')
+        )
     }
 
     /// Loads the learned-strips set from disk; missing/corrupt file -> empty.
     pub fn load_learned_strips(cfg: &Config) -> std::collections::HashSet<String> {
-        let path = format!("{}/learned-strips.json", cfg.state_root.trim_end_matches('/'));
+        let path = format!(
+            "{}/learned-strips.json",
+            cfg.state_root.trim_end_matches('/')
+        );
         std::fs::read_to_string(&path)
             .ok()
             .and_then(|s| serde_json::from_str(&s).ok())
@@ -177,6 +183,11 @@ impl App {
 
     /// Records a usage report's windows into the pool ("default" for the main
     /// limit, per-model for additional limits like spark).
+    ///
+    /// This is the single probe-persistence point for every report path —
+    /// background pollers, CLI redeem/refresh and the panel quota check all
+    /// land here. add_probe dedupes only when the observed quota, metadata
+    /// and completed-request watermark are all unchanged.
     pub fn observe_usage(&self, acc_id: &str, report: &usage::Report) {
         let now = crate::store::now_secs();
         if report.main.primary.used_pct.is_some() || report.main.primary.reset_at.is_some() {
@@ -208,6 +219,10 @@ impl App {
                     observed_at: now,
                 },
             );
+        }
+        if let (Some(p), Some(r)) = (report.main.primary.used_pct, report.main.primary.reset_at) {
+            self.store
+                .add_probe(acc_id, crate::store::now_secs(), p, r, &report.plan_type);
         }
     }
 
@@ -263,10 +278,7 @@ impl App {
             if let Some(email) = email_of.get(acc_id) {
                 let mut mm = serde_json::Map::new();
                 for (model, q) in models {
-                    mm.insert(
-                        model.clone(),
-                        serde_json::to_value(q).unwrap_or_default(),
-                    );
+                    mm.insert(model.clone(), serde_json::to_value(q).unwrap_or_default());
                 }
                 quota_by_email.insert(email.clone(), serde_json::Value::Object(mm));
             }
@@ -320,21 +332,24 @@ pub fn build_http_client() -> reqwest::Client {
 pub fn build_router(app: AppHandle) -> axum::Router {
     // axum defaults to 2MB request bodies, which a single base64 image in a
     // codex request would blow through; local/LAN only, so be generous
-    let client = crate::proxy::router()
-        .layer(axum::extract::DefaultBodyLimit::max(64 << 20));
+    let client = crate::proxy::router().layer(axum::extract::DefaultBodyLimit::max(64 << 20));
     let manage_router = crate::manage::router();
     Router::new()
         .merge(client)
         .merge(manage_router)
-        .route("/manage", axum::routing::get(|| async {
-            axum::response::Redirect::temporary("/manage/panel")
-        }))
-        .route("/manage/panel", axum::routing::get(|| async {
-            axum::response::Response::builder()
-                .header("Content-Type", "text/html; charset=utf-8")
-                .body(axum::body::Body::from(crate::panel::PANEL))
-                .unwrap()
-        }))
+        .route(
+            "/manage",
+            axum::routing::get(|| async { axum::response::Redirect::temporary("/manage/panel") }),
+        )
+        .route(
+            "/manage/panel",
+            axum::routing::get(|| async {
+                axum::response::Response::builder()
+                    .header("Content-Type", "text/html; charset=utf-8")
+                    .body(axum::body::Body::from(crate::panel::PANEL))
+                    .unwrap()
+            }),
+        )
         .fallback(crate::proxy::codex_backend_fallback)
         .with_state(app)
 }
@@ -349,19 +364,24 @@ pub fn spawn_refresh_loop(app: AppHandle) {
             let days = app.cfg.retention_days();
             if days > 0 {
                 let today = crate::store::now_secs() / 86400;
-                let last = app.last_prune_day.load(std::sync::atomic::Ordering::Relaxed);
+                let last = app
+                    .last_prune_day
+                    .load(std::sync::atomic::Ordering::Relaxed);
                 if last != today {
                     match app.store.prune_logs(days) {
-                        Ok(n) if n > 0 => log::info!("pruned {n} request_log rows (retention {days}d)"),
+                        Ok(n) if n > 0 => {
+                            log::info!("pruned {n} request_log rows (retention {days}d)")
+                        }
                         Ok(_) => {}
                         Err(e) => log::warn!("prune failed: {e}"),
                     }
-                    match app.store.prune_probes(14) {
-                        Ok(n) if n > 0 => log::info!("pruned {n} usage_probes rows (14d)"),
+                    match app.store.prune_probes(31) {
+                        Ok(n) if n > 0 => log::info!("pruned {n} usage_probes rows (31d)"),
                         Ok(_) => {}
                         Err(e) => log::warn!("probe prune failed: {e}"),
                     }
-                    app.last_prune_day.store(today, std::sync::atomic::Ordering::Relaxed);
+                    app.last_prune_day
+                        .store(today, std::sync::atomic::Ordering::Relaxed);
                 }
             }
             let accounts = app.store.list_accounts().unwrap_or_default();
