@@ -29,6 +29,9 @@ const MAX_OBSERVATION_BYTES: usize = 8 * 1024 * 1024;
 
 pub fn router() -> axum::Router<AppHandle> {
     axum::Router::new()
+        // codex's own discovery path: {chatgpt_base_url}/models — proxy the
+        // upstream catalog with pool credentials so clients see live lists
+        .route("/models", axum::routing::get(catalog))
         .route("/v1/models", axum::routing::get(models))
         .route("/v1/responses", axum::routing::post(responses))
         .route(
@@ -84,7 +87,22 @@ async fn models(State(app): State<AppHandle>, headers: HeaderMap) -> Response {
     if auth_check(&app, &headers).is_err() {
         return (StatusCode::UNAUTHORIZED, "invalid api key").into_response();
     }
-    let data: Vec<serde_json::Value> = crate::store::MODEL_CATALOG
+    // priority: config override > upstream-discovered intersection > builtin
+    let configured = app.cfg.models.clone();
+    let slugs: Vec<String> = if !configured.is_empty() {
+        configured
+    } else {
+        let common = app.pool.common_models();
+        if common.is_empty() {
+            crate::store::MODEL_CATALOG
+                .iter()
+                .map(|m| m.to_string())
+                .collect()
+        } else {
+            common
+        }
+    };
+    let data: Vec<serde_json::Value> = slugs
         .iter()
         .map(|m| serde_json::json!({"id": m, "object": "model", "owned_by": "openai"}))
         .collect();
@@ -268,6 +286,43 @@ async fn accounts_check(State(app): State<AppHandle>, headers: HeaderMap) -> Res
         "default_account_id": POOL_IDENTITY.account_id,
     }))
     .into_response()
+}
+
+/// codex's model discovery: GET {chatgpt_base_url}/models. Proxy the
+/// upstream per-account catalog with pool credentials — the client gets the
+/// entitlement list of the account that serves it, without hardcoding.
+async fn catalog(State(app): State<AppHandle>, headers: HeaderMap) -> Response {
+    if auth_check(&app, &headers).is_err() {
+        return (StatusCode::UNAUTHORIZED, "invalid api key").into_response();
+    }
+    let Some(acc) = app
+        .store
+        .list_accounts()
+        .unwrap_or_default()
+        .into_iter()
+        .find(|a| !a.disabled)
+    else {
+        return (StatusCode::SERVICE_UNAVAILABLE, "no enabled account").into_response();
+    };
+    match crate::usage::fetch_model_slugs(
+        &app.http,
+        &app.cfg.upstream.base_url,
+        &acc.access_token,
+        &acc.account_id,
+        &app.cfg.header_defaults,
+        app.cfg.client_version(),
+    )
+    .await
+    {
+        Ok(slugs) if !slugs.is_empty() => {
+            let data: Vec<serde_json::Value> = slugs
+                .iter()
+                .map(|m| serde_json::json!({"id": m, "object": "model", "owned_by": "openai"}))
+                .collect();
+            axum::Json(serde_json::json!({"object": "list", "data": data})).into_response()
+        }
+        _ => (StatusCode::BAD_GATEWAY, "models catalog unavailable").into_response(),
+    }
 }
 
 /// Serves the CLI's account usage poll: zero-cost probe of every enabled

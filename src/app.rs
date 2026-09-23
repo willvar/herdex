@@ -181,6 +181,33 @@ impl App {
         Ok(report)
     }
 
+    /// Refreshes one account's model catalog from the upstream /models
+    /// endpoint into the pool's per-account model sets (persisted, so
+    /// restarts keep the discovery).
+    pub async fn refresh_models(&self, a: &Account) {
+        match crate::usage::fetch_model_slugs(
+            &self.http,
+            &self.cfg.upstream.base_url,
+            &a.access_token,
+            &a.account_id,
+            &self.cfg.header_defaults,
+            self.cfg.client_version(),
+        )
+        .await
+        {
+            Ok(slugs) if !slugs.is_empty() => {
+                self.pool.set_account_models(&a.id, &slugs);
+                if let Err(e) = self.store.set_account_models(&a.id, &slugs) {
+                    log::warn!("model catalog store {}: {e}", a.email);
+                }
+            }
+            Ok(_) => {} // empty catalog: keep previous
+            Err(e) => log::warn!("models fetch {}: {e}", a.email),
+        }
+    }
+
+    /// Records a usage report's windows into the pool ("default" for the
+    /// limit, per-model for additional limits like spark).
     /// Records a usage report's windows into the pool ("default" for the main
     /// limit, per-model for additional limits like spark).
     ///
