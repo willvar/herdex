@@ -883,6 +883,73 @@ async fn unauthenticated_rejected() {
 }
 
 #[tokio::test]
+async fn pat_workspace_discovery_matches_identity_and_checks_credentials() {
+    let h = harness(&["a1"]).await;
+    let client = reqwest::Client::new();
+    let identity: serde_json::Value = client
+        .get(format!("{}/v1/user-auth-credential/whoami", h.proxy_url))
+        .bearer_auth("sk-test")
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    for path in [
+        "/api/codex/accounts/check",
+        "/backend-api/wham/accounts/check",
+    ] {
+        let url = format!("{}{path}", h.proxy_url);
+        let response = client
+            .get(&url)
+            .bearer_auth("sk-test")
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(
+            response.status(),
+            200,
+            "{path}: workspace discovery must stay local"
+        );
+        let discovery: serde_json::Value = response.json().await.unwrap();
+        let accounts = discovery["accounts"].as_array().unwrap();
+        assert_eq!(accounts.len(), 1);
+        assert_eq!(accounts[0]["id"], identity["chatgpt_account_id"]);
+        // NO_CONSTRAINT retains the configured HTTPS gateway origin rather
+        // than routing the gateway credential to a real OpenAI workspace.
+        assert_eq!(accounts[0]["workspace_backend_origin"], "NO_CONSTRAINT");
+        assert_eq!(accounts[0]["account_routing_override"], "NO_CONSTRAINT");
+        assert_eq!(
+            discovery["default_account_id"],
+            identity["chatgpt_account_id"]
+        );
+        assert_eq!(client.get(&url).send().await.unwrap().status(), 401);
+        assert_eq!(
+            client
+                .get(&url)
+                .bearer_auth("invalid")
+                .send()
+                .await
+                .unwrap()
+                .status(),
+            401
+        );
+    }
+    h.store.set_api_key_disabled("sk-test", true).unwrap();
+    let response = client
+        .get(format!("{}/api/codex/accounts/check", h.proxy_url))
+        .bearer_auth("sk-test")
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(
+        response.status(),
+        401,
+        "disabled keys cannot discover a workspace"
+    );
+}
+
+#[tokio::test]
 async fn full_router_assembles_and_serves_panel() {
     let h = harness(&["a1"]).await;
     let root = herdex::app::build_router({
