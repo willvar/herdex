@@ -1,6 +1,6 @@
 use serde::Deserialize;
-use toml::Value;
 use std::collections::HashMap;
+use toml::Value;
 
 #[derive(Deserialize, Clone, Default)]
 #[serde(rename_all = "kebab-case", default)]
@@ -60,7 +60,8 @@ pub fn load(path: &str) -> Result<Config, String> {
     let raw = std::fs::read_to_string(path).map_err(|e| e.to_string())?;
     let mut value: Value = toml::from_str(&raw).map_err(|e| format!("parse {}: {e}", path))?;
     interpolate(&mut value);
-    let mut cfg: Config = Config::deserialize(value).map_err(|e| format!("config {}: {e}", path))?;
+    let mut cfg: Config =
+        Config::deserialize(value).map_err(|e| format!("config {}: {e}", path))?;
     cfg.apply_defaults();
     cfg.validate()?;
     Ok(cfg)
@@ -144,15 +145,31 @@ fn interpolate(v: &mut Value) {
 mod tests {
     use super::*;
 
+    #[test]
+    fn shipped_example_keeps_retention_at_the_root() {
+        let mut value: Value = toml::from_str(include_str!("../config.example.toml")).unwrap();
+        interpolate(&mut value);
+        let cfg = Config::deserialize(value).unwrap();
+        assert_eq!(cfg.retention_days, Some(730));
+        assert!(!cfg.header_defaults.contains_key("retention-days"));
+    }
+
     fn write_tmp(body: &str) -> String {
-        let path = std::env::temp_dir().join(format!("herdex-cfg-{}-{}.toml", std::process::id(), rand_suffix()));
+        let path = std::env::temp_dir().join(format!(
+            "herdex-cfg-{}-{}.toml",
+            std::process::id(),
+            rand_suffix()
+        ));
         std::fs::write(&path, body).unwrap();
         path.to_string_lossy().to_string()
     }
 
     fn rand_suffix() -> u64 {
         use std::time::{SystemTime, UNIX_EPOCH};
-        SystemTime::now().duration_since(UNIX_EPOCH).unwrap().subsec_nanos() as u64
+        SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .subsec_nanos() as u64
     }
 
     #[test]
@@ -189,6 +206,9 @@ mod tests {
         ))
         .unwrap();
         assert_eq!(cfg.oauth.issuer, "https://fake.invalid");
-        assert_eq!(cfg.header_defaults.get("originator").unwrap(), "codex_cli_rs");
+        assert_eq!(
+            cfg.header_defaults.get("originator").unwrap(),
+            "codex_cli_rs"
+        );
     }
 }

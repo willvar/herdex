@@ -16,14 +16,26 @@ pub fn router() -> axum::Router<AppHandle> {
     axum::Router::new()
         .route("/manage/api/state", axum::routing::get(state))
         .route("/manage/api/login/start", axum::routing::post(login_start))
-        .route("/manage/api/login/finish", axum::routing::post(login_finish))
-        .route("/manage/api/accounts/{id}/quota", axum::routing::post(quota))
+        .route(
+            "/manage/api/login/finish",
+            axum::routing::post(login_finish),
+        )
+        .route(
+            "/manage/api/accounts/{id}/quota",
+            axum::routing::post(quota),
+        )
         .route(
             "/manage/api/accounts/{id}/quota/consume",
             axum::routing::post(consume),
         )
-        .route("/manage/api/accounts/{id}/disable", axum::routing::post(disable))
-        .route("/manage/api/accounts/{id}", axum::routing::delete(delete_account))
+        .route(
+            "/manage/api/accounts/{id}/disable",
+            axum::routing::post(disable),
+        )
+        .route(
+            "/manage/api/accounts/{id}",
+            axum::routing::delete(delete_account),
+        )
         .route("/manage/api/keys", axum::routing::post(add_key))
         .route(
             "/manage/api/keys/{key}",
@@ -32,8 +44,11 @@ pub fn router() -> axum::Router<AppHandle> {
         .route("/manage/api/settings", axum::routing::put(put_settings))
         .route("/manage/api/usage", axum::routing::get(usage))
         .route("/manage/api/calibration", axum::routing::get(calibration))
+        .route("/manage/api/history", axum::routing::get(history))
 }
 
+// Err carries an axum Response; boxing it everywhere for a lint is not worth it
+#[allow(clippy::result_large_err)]
 fn auth_check(app: &AppHandle, headers: &HeaderMap) -> Result<(), Response> {
     let key = headers
         .get("Authorization")
@@ -58,7 +73,11 @@ async fn usage(
     if let Err(res) = auth_check(&st, &headers) {
         return res;
     }
-    let days: i64 = q.get("days").and_then(|v| v.parse().ok()).unwrap_or(7).clamp(1, 90);
+    let days: i64 = q
+        .get("days")
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(7)
+        .clamp(1, 90);
     let store = &st.store;
     let r = serde_json::json!({
         "daily": store.usage_daily(days).unwrap_or_default(),
@@ -66,7 +85,37 @@ async fn usage(
         "by_key": store.usage_by(UsageDim::Key, days).unwrap_or_default(),
         "by_model": store.usage_by(UsageDim::Model, days).unwrap_or_default(),
     });
-    ([(axum::http::header::CONTENT_TYPE, "application/json")], r.to_string()).into_response()
+    (
+        [(axum::http::header::CONTENT_TYPE, "application/json")],
+        r.to_string(),
+    )
+        .into_response()
+}
+
+/// Probe history + per-day per-model burns for the panel's charts.
+async fn history(
+    State(app): State<AppHandle>,
+    headers: HeaderMap,
+    axum::extract::Query(q): axum::extract::Query<std::collections::HashMap<String, String>>,
+) -> Response {
+    if let Err(res) = auth_check(&app, &headers) {
+        return res;
+    }
+    let days: i64 = q
+        .get("days")
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(7)
+        .clamp(1, 90);
+    let store = &app.store;
+    let r = serde_json::json!({
+        "probes": store.probe_history(days).unwrap_or_default(),
+        "model_daily": store.usage_daily_by_model(days).unwrap_or_default(),
+    });
+    (
+        [(axum::http::header::CONTENT_TYPE, "application/json")],
+        r.to_string(),
+    )
+        .into_response()
 }
 
 /// Per-account capacity calibration (empirical tokens-per-1%) plus remaining
@@ -103,7 +152,7 @@ async fn calibration(State(app): State<AppHandle>, headers: HeaderMap) -> Respon
             }
         }
         rows.push(serde_json::json!({
-            "email": a.email, "plan_type": a.plan_type,
+            "account_id": a.id, "email": a.email, "plan_type": a.plan_type,
             "tokens_per_pct": if is_calibrated { serde_json::json!(tpp) } else { serde_json::Value::Null },
             "samples": samples,
 
@@ -117,7 +166,11 @@ async fn calibration(State(app): State<AppHandle>, headers: HeaderMap) -> Respon
         "calibrated_accounts": calibrated,
         "pool_remaining_tokens": if calibrated > 0 { serde_json::json!(total_remaining) } else { serde_json::Value::Null },
     });
-    ([(axum::http::header::CONTENT_TYPE, "application/json")], r.to_string()).into_response()
+    (
+        [(axum::http::header::CONTENT_TYPE, "application/json")],
+        r.to_string(),
+    )
+        .into_response()
 }
 
 async fn state(State(app): State<AppHandle>, headers: HeaderMap) -> Response {
@@ -145,10 +198,7 @@ async fn login_start(State(app): State<AppHandle>, headers: HeaderMap) -> Respon
         &callback_uri(),
         &pkce,
     );
-    app.pending
-        .lock()
-        .unwrap()
-        .insert(pkce.state.clone(), pkce);
+    app.pending.lock().unwrap().insert(pkce.state.clone(), pkce);
     Json(json!({"auth_url": auth_url, "state": auth_url.split("state=").nth(1).unwrap_or("").split('&').next().unwrap_or("")})).into_response()
 }
 
@@ -174,14 +224,20 @@ async fn login_finish(
         }
     }
     if code.is_empty() {
-        return err_json(StatusCode::BAD_REQUEST, "callback url has no code parameter");
+        return err_json(
+            StatusCode::BAD_REQUEST,
+            "callback url has no code parameter",
+        );
     }
     let pkce = {
         let mut pending = app.pending.lock().unwrap();
         pending.remove(&state_param)
     };
     let Some(pkce) = pkce else {
-        return err_json(StatusCode::BAD_REQUEST, "unknown state (already finished or expired?)");
+        return err_json(
+            StatusCode::BAD_REQUEST,
+            "unknown state (already finished or expired?)",
+        );
     };
     let ts = match oauth::exchange(
         &app.http,
@@ -201,7 +257,10 @@ async fn login_finish(
         Err(e) => return err_json(StatusCode::BAD_GATEWAY, e),
     };
     if claims.account_id().is_empty() {
-        return err_json(StatusCode::BAD_GATEWAY, "id_token has no chatgpt_account_id");
+        return err_json(
+            StatusCode::BAD_GATEWAY,
+            "id_token has no chatgpt_account_id",
+        );
     }
     let expires_at = if ts.expires_in > 0 {
         crate::store::now_secs() + ts.expires_in
@@ -242,6 +301,7 @@ async fn quota(
         return err_json(StatusCode::NOT_FOUND, "account not found");
     };
     match app.fetch_usage(&acc).await {
+        // probe persistence happens inside observe_usage (single point)
         Ok(report) => Json(report).into_response(),
         Err(e) => err_json(StatusCode::BAD_GATEWAY, e),
     }
@@ -305,7 +365,11 @@ struct AddKeyReq {
     comment: String,
 }
 
-async fn add_key(State(app): State<AppHandle>, headers: HeaderMap, Json(req): Json<AddKeyReq>) -> Response {
+async fn add_key(
+    State(app): State<AppHandle>,
+    headers: HeaderMap,
+    Json(req): Json<AddKeyReq>,
+) -> Response {
     if let Err(res) = auth_check(&app, &headers) {
         return res;
     }

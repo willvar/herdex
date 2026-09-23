@@ -1,7 +1,7 @@
 //! herdex — codex-only account pool gateway (Rust).
 //!
-//! The TLS stack is pinned to the versions used by codex-rs (reqwest 0.12.28
-//! + rustls 0.23.36 + aws-lc-rs) so the outbound fingerprint matches the
+//! The TLS stack is pinned to the versions used by codex-rs (reqwest 0.12.28,
+//! rustls 0.23.36, aws-lc-rs) so the outbound fingerprint matches the
 //! official client.
 
 use clap::Parser as _;
@@ -36,7 +36,11 @@ fn main() {
             std::process::exit(1);
         }
     };
-    let level = if cfg.log.level.is_empty() { "info".into() } else { cfg.log.level.clone() };
+    let level = if cfg.log.level.is_empty() {
+        "info".into()
+    } else {
+        cfg.log.level.clone()
+    };
     env_logger::Builder::from_env(env_logger::Env::default().default_filter_or(level)).init();
     let runtime = tokio::runtime::Builder::new_multi_thread()
         .enable_all()
@@ -83,7 +87,11 @@ async fn async_main(cfg: config::Config) {
 
     let root = herdex::app::build_router(app.clone());
 
-    log::info!("herdex listening on {} (state: {})", cfg.listen, cfg.state_root);
+    log::info!(
+        "herdex listening on {} (state: {})",
+        cfg.listen,
+        cfg.state_root
+    );
     let listener = match tokio::net::TcpListener::bind(&cfg.listen).await {
         Ok(l) => l,
         Err(e) => {
