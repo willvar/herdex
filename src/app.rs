@@ -339,16 +339,19 @@ pub fn build_router(app: AppHandle) -> axum::Router {
         .merge(manage_router)
         .route(
             "/manage",
-            axum::routing::get(|| async { axum::response::Redirect::temporary("/manage/panel") }),
+            axum::routing::get(|| async { axum::response::Redirect::temporary("/manage/panel/") }),
         )
         .route(
             "/manage/panel",
-            axum::routing::get(|| async {
-                axum::response::Response::builder()
-                    .header("Content-Type", "text/html; charset=utf-8")
-                    .body(axum::body::Body::from(crate::panel::PANEL))
-                    .unwrap()
-            }),
+            axum::routing::get(|| async { axum::response::Redirect::temporary("/manage/panel/") }),
+        )
+        .route(
+            "/manage/panel/",
+            axum::routing::get(crate::panel::serve_root),
+        )
+        .route(
+            "/manage/panel/{*rest}",
+            axum::routing::get(crate::panel::serve),
         )
         .fallback(crate::proxy::codex_backend_fallback)
         .with_state(app)
