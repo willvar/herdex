@@ -89,9 +89,10 @@ systemd 部署样例见 `deploy/herdex.service`（含完整沙箱加固）。
 
 Codex 0.156.1 起的工作区路由要求 HTTPS 后端。herdex 内建 TLS：在配置中启用
 `[tls]` 后首次启动会自动生成私有 CA 并签发叶子证书（SAN 覆盖配置的 hosts，
-支持 IP 地址，无需域名）。CA 通过 `http://<host>:8088/ca.pem` 分发（无需认证），
-客户端让 Codex 显式额外信任该 CA（`CODEX_CA_CERTIFICATE`），不必安装到系统
-信任库，也不关闭证书校验。
+支持 IP 地址，无需域名）。CA 通过面板头部「下载 CA 证书」或
+`https://<host>:<listen 端口>/ca.pem` 直链分发；首次访问会提示证书不受信任——
+点「高级→继续访问」进面板下载 CA 即可，属预期流程。客户端让 Codex 显式额外
+信任该 CA（`CODEX_CA_CERTIFICATE`），不必安装到系统信任库，也不关闭证书校验。
 
 codex 端三处配置如下，`/status` 显示池子聚合：
 
