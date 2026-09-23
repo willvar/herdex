@@ -4,12 +4,11 @@
 
 use crate::app::{App, AppHandle};
 use crate::pool;
-use crate::store::{Account, LogEntry};
+use crate::store::{Account, LogEntry, Store};
 use axum::body::{Body, Bytes};
 use axum::extract::State;
 use axum::http::{HeaderMap, Method, StatusCode, Uri};
 use axum::response::{IntoResponse, Response};
-use std::sync::{Arc, Mutex};
 use std::time::Instant;
 
 const HOP_HEADERS: [&str; 9] = [
@@ -24,18 +23,28 @@ const HOP_HEADERS: [&str; 9] = [
     "upgrade",
 ];
 
+const MAX_PREFIX_BYTES: usize = 2 * 1024 * 1024;
+// Observation is best-effort; exceeding this budget never truncates the wire.
+const MAX_OBSERVATION_BYTES: usize = 8 * 1024 * 1024;
+
 pub fn router() -> axum::Router<AppHandle> {
     axum::Router::new()
         .route("/v1/models", axum::routing::get(models))
         .route("/v1/responses", axum::routing::post(responses))
-        .route("/backend-api/codex/responses", axum::routing::post(responses))
+        .route(
+            "/backend-api/codex/responses",
+            axum::routing::post(responses),
+        )
         // codex CLI's statusline is fed exclusively by its periodic account
         // usage poll (GET {base}/api/codex/usage for CodexApi-path base URLs);
         // without this route the poll 404s and the statusline freezes
         .route("/api/codex/usage", axum::routing::get(codex_usage))
         .route("/v1/api/codex/usage", axum::routing::get(codex_usage))
         .route("/wham/usage", axum::routing::get(codex_usage))
-        .route("/v1/user-auth-credential/whoami", axum::routing::get(whoami))
+        .route(
+            "/v1/user-auth-credential/whoami",
+            axum::routing::get(whoami),
+        )
         .route("/user-auth-credential/whoami", axum::routing::get(whoami))
         // apps MCP: forwarded with pool-account credentials (the same auth
         // shape /responses uses) because the CLI's own OAuth forwarded from
@@ -44,6 +53,8 @@ pub fn router() -> axum::Router<AppHandle> {
         .route("/v1/api/codex/ps/mcp", axum::routing::any(codex_apps_mcp))
 }
 
+// Err carries an axum Response; boxing everywhere is not worth it
+#[allow(clippy::result_large_err)]
 fn auth_check(app: &App, headers: &HeaderMap) -> Result<String, Response> {
     let key = headers
         .get("Authorization")
@@ -104,7 +115,9 @@ async fn codex_usage_pool(app: &App) -> Response {
             {
                 log::info!(
                     "plan changed for {}: {} -> {}",
-                    a.email, a.plan_type, report.plan_type
+                    a.email,
+                    a.plan_type,
+                    report.plan_type
                 );
                 let _ = app.store.set_account_plan(&a.id, &report.plan_type);
             }
@@ -147,7 +160,10 @@ async fn codex_usage_pool(app: &App) -> Response {
         });
     }
     let used = weighted_used(
-        &entries.iter().map(|e| (e.pct, e.weight)).collect::<Vec<_>>(),
+        &entries
+            .iter()
+            .map(|e| (e.pct, e.weight))
+            .collect::<Vec<_>>(),
     );
     let mut min_reset = i64::MAX;
     let mut win = 604800i64;
@@ -241,13 +257,22 @@ async fn codex_usage(State(app): State<AppHandle>, headers: HeaderMap) -> Respon
     if !has_bearer {
         return (StatusCode::UNAUTHORIZED, "missing bearer token").into_response();
     }
-    log::info!("usage poll <- {}", headers.get("user-agent").and_then(|v| v.to_str().ok()).unwrap_or("-"));
+    log::info!(
+        "usage poll <- {}",
+        headers
+            .get("user-agent")
+            .and_then(|v| v.to_str().ok())
+            .unwrap_or("-")
+    );
     codex_usage_pool(&app).await
 }
 
 /// Decides whether one account's failure should move to the next.
 fn failoverable(status: u16, body: &str) -> bool {
     match status {
+        // status 0 = connection-level failure (DNS/TCP/TLS/timeout) — never
+        // the account's fault; always try the next candidate
+        0 => true,
         401 | 403 | 408 | 429 | 500 | 502 | 503 | 504 => true,
         // plan-gated models reject per-account (e.g. spark on plus); try next
         400 => body.contains("not supported"),
@@ -259,25 +284,22 @@ fn upstream_status(last: u16) -> StatusCode {
     StatusCode::from_u16(if last >= 400 { last } else { 502 }).unwrap_or(StatusCode::BAD_GATEWAY)
 }
 
-async fn responses(
-    State(app): State<AppHandle>,
-    headers: HeaderMap,
-    body: Bytes,
-) -> Response {
+async fn responses(State(app): State<AppHandle>, headers: HeaderMap, body: Bytes) -> Response {
     let api_key = match auth_check(&app, &headers) {
         Ok(k) => k,
         Err(res) => return res,
     };
     let probe: Result<serde_json::Value, _> = serde_json::from_slice(&body);
-    let model = match probe.ok().and_then(|v| v.get("model").and_then(|m| m.as_str()).map(String::from)) {
+    let model = match probe
+        .ok()
+        .and_then(|v| v.get("model").and_then(|m| m.as_str()).map(String::from))
+    {
         Some(m) => m,
-        None => {
-            return (
-                StatusCode::BAD_REQUEST,
-                r#"{"error":{"message":"missing \"model\" in request body","type":"server_error"}}"#,
-            )
-                .into_response()
-        }
+        None => return (
+            StatusCode::BAD_REQUEST,
+            r#"{"error":{"message":"missing \"model\" in request body","type":"server_error"}}"#,
+        )
+            .into_response(),
     };
 
     let session_key = headers
@@ -313,7 +335,18 @@ async fn responses(
                 continue;
             }
         }
-        match attempt_once(&app, &headers, &body, &acc, &model, start, &session_key, &api_key).await {
+        match attempt_once(
+            &app,
+            &headers,
+            &body,
+            &acc,
+            &model,
+            start,
+            &session_key,
+            &api_key,
+        )
+        .await
+        {
             Ok(resp) => return resp,
             Err((status, msg)) => {
                 last_status = status;
@@ -332,6 +365,7 @@ async fn responses(
 
 type AttemptResult = Result<Response, (u16, String)>;
 
+#[allow(clippy::too_many_arguments)] // the pipeline stages are all distinct inputs
 async fn attempt_once(
     app: &App,
     client_headers: &HeaderMap,
@@ -342,7 +376,10 @@ async fn attempt_once(
     session_key: &str,
     api_key: &str,
 ) -> AttemptResult {
-    let url = format!("{}/responses", app.cfg.upstream.base_url.trim_end_matches('/'));
+    let url = format!(
+        "{}/responses",
+        app.cfg.upstream.base_url.trim_end_matches('/')
+    );
     // Self-healing body: when the backend rejects a named parameter, strip it
     // and retry the same account. Genuine codex requests are accepted as-is,
     // so the byte-for-byte passthrough invariant is untouched in practice.
@@ -362,8 +399,20 @@ async fn attempt_once(
         let rb = app
             .http
             .post(&url)
-            .header("Content-Type", client_headers.get("Content-Type").and_then(|v| v.to_str().ok()).unwrap_or("application/json"))
-            .header("Accept", client_headers.get("Accept").and_then(|v| v.to_str().ok()).unwrap_or("text/event-stream"))
+            .header(
+                "Content-Type",
+                client_headers
+                    .get("Content-Type")
+                    .and_then(|v| v.to_str().ok())
+                    .unwrap_or("application/json"),
+            )
+            .header(
+                "Accept",
+                client_headers
+                    .get("Accept")
+                    .and_then(|v| v.to_str().ok())
+                    .unwrap_or("text/event-stream"),
+            )
             .bearer_auth(&acc.access_token)
             .header("Chatgpt-Account-Id", &acc.account_id);
         let rb = app.apply_identity(rb, client_headers);
@@ -394,9 +443,7 @@ async fn attempt_once(
             for (k, v) in &headers {
                 hr = hr.header(k.as_str(), v.as_bytes());
             }
-            let built = hr
-                .body(text)
-                .map_err(|e| (500, e.to_string()))?;
+            let built = hr.body(text).map_err(|e| (500, e.to_string()))?;
             break reqwest::Response::from(built);
         }
         break res;
@@ -435,8 +482,16 @@ async fn attempt_once(
     // quota observation from upstream response headers
     let pri = header_pct(res.headers(), "x-codex-bengalfox-primary-used-percent");
     let sec = header_pct(res.headers(), "x-codex-bengalfox-secondary-used-percent");
-    let pri_reset = reset_epoch(res.headers(), "x-codex-bengalfox-primary-reset-at", "x-codex-bengalfox-primary-reset-after-seconds");
-    let sec_reset = reset_epoch(res.headers(), "x-codex-bengalfox-secondary-reset-at", "x-codex-bengalfox-secondary-reset-after-seconds");
+    let pri_reset = reset_epoch(
+        res.headers(),
+        "x-codex-bengalfox-primary-reset-at",
+        "x-codex-bengalfox-primary-reset-after-seconds",
+    );
+    let sec_reset = reset_epoch(
+        res.headers(),
+        "x-codex-bengalfox-secondary-reset-at",
+        "x-codex-bengalfox-secondary-reset-after-seconds",
+    );
     let pri_secs = header_minutes(res.headers(), "x-codex-bengalfox-primary-window-minutes");
     let sec_secs = header_minutes(res.headers(), "x-codex-bengalfox-secondary-window-minutes");
     if pri.is_some() || sec.is_some() || pri_reset.is_some() || sec_reset.is_some() {
@@ -454,8 +509,8 @@ async fn attempt_once(
             },
         );
         // every successful response carries the main window's live usage —
-        // feed it to the probe sequence (dedupe: only % changes stored), which
-        // makes capacity calibration converge orders of magnitude faster.
+        // feed it to the probe sequence, deduplicating only when quota,
+        // metadata and the completed-log watermark are all unchanged.
         // NOTE: main `x-codex-*` family, not bengalfox (spark window) above.
         let main_pri = header_pct(res.headers(), "x-codex-primary-used-percent");
         let main_reset = reset_epoch(
@@ -465,27 +520,37 @@ async fn attempt_once(
         );
         if let (Some(p), Some(r)) = (main_pri, main_reset) {
             let plan = headers_get(res.headers(), "x-codex-plan-type").unwrap_or_default();
-            app.store.add_probe(&acc.id, crate::store::now_secs(), p, r, &plan);
+            app.store
+                .add_probe(&acc.id, crate::store::now_secs(), p, r, &plan);
         }
     }
 
     let status = res.status().as_u16();
     let resp_headers = res.headers().clone();
     if status >= 400 {
-        let snippet = res
-            .text()
-            .await
-            .unwrap_or_default();
+        let snippet = res.text().await.unwrap_or_default();
         if failoverable(status, &snippet) {
             app.pool.mark_failure(&acc.id, model);
-            log::info!("{model} -> {status} ({}ms) via {}: {}", start.elapsed().as_millis(), acc.email, truncate(&snippet));
+            log::info!(
+                "{model} -> {status} ({}ms) via {}: {}",
+                start.elapsed().as_millis(),
+                acc.email,
+                truncate(&snippet)
+            );
             return Err((status, format!("{}: {status} {snippet}", acc.email)));
         }
         // genuine client error: pass through untouched
-        let mut out = Response::builder().status(StatusCode::from_u16(status).unwrap_or(StatusCode::BAD_REQUEST));
+        let mut out = Response::builder()
+            .status(StatusCode::from_u16(status).unwrap_or(StatusCode::BAD_REQUEST));
         copy_headers(out.headers_mut().unwrap(), &resp_headers);
-        log::info!("{model} -> {status} ({}ms) via {}", start.elapsed().as_millis(), acc.email);
-        return out.body(Body::from(snippet)).map_err(|e| (500, e.to_string()));
+        log::info!(
+            "{model} -> {status} ({}ms) via {}",
+            start.elapsed().as_millis(),
+            acc.email
+        );
+        return out
+            .body(Body::from(snippet))
+            .map_err(|e| (500, e.to_string()));
     }
 
     // success status, BUT the upstream may carry in-stream error events
@@ -495,29 +560,55 @@ async fn attempt_once(
     // failoverable — nothing user-visible has reached the client. Progress
     // markers are the content-bearing events (output items, deltas); the
     // bare lifecycle frames (created/in_progress) carry nothing.
-    let mut buffered: Vec<Bytes> = Vec::new();
-    let mut buffered_bytes = 0usize;
+    let mut buffered = Vec::new();
+    let mut remainder = Bytes::new();
+    // Construct the guard before any await or response-body polling: dropping
+    // either the handler or the unpolled body must still finalize this attempt.
+    let mut observed = StreamLog {
+        stats: StreamStats::new(
+            resp_headers
+                .get("content-type")
+                .and_then(|v| v.to_str().ok())
+                .unwrap_or(""),
+        ),
+        store: app.store.clone(),
+        pool: app.pool.clone(),
+        account_id: acc.id.clone(),
+        entry: Some(LogEntry {
+            account_id: acc.id.clone(),
+            account_email: acc.email.clone(),
+            api_key: api_key.to_owned(),
+            model: model.to_owned(),
+            status: status as i64,
+            latency_ms: latency,
+            ..Default::default()
+        }),
+    };
     loop {
-        let chunk = match res.chunk().await {
-            Ok(Some(c)) => c,
-            Ok(None) => break, // stream ended without content — fall through
+        let ended = match res.chunk().await {
+            Ok(Some(c)) => {
+                // Apply the budget to bytes, not transport chunks. Observe
+                // only the bytes within it before deciding whether to commit.
+                let take = c.len().min(MAX_PREFIX_BYTES - buffered.len());
+                observed.stats.push(&c[..take]);
+                buffered.extend_from_slice(&c[..take]);
+                remainder = c.slice(take..);
+                false
+            }
+            Ok(None) => {
+                observed.eof();
+                true
+            }
             Err(_) => {
-                app.pool.mark_failure(&acc.id, model);
+                observed.transport_error();
                 return Err((0, format!("{}: upstream stream error", acc.email)));
             }
         };
-        buffered.push(chunk.clone());
-        buffered_bytes += chunk.len();
-        // evaluate the JOINED buffer FIRST: chunk boundaries may split the
-        // JSON, and upstream coalesces lifecycle + error events into one
-        // flush — a per-chunk progress check would commit before noticing
-        let joined: Vec<u8> = buffered
-            .iter()
-            .flat_map(|b| b.iter().copied())
-            .collect();
-        if error_precedes_content(&joined) {
-            let code = find_stream_error(&joined).unwrap_or_else(|| "unknown".into());
-            app.pool.mark_failure(&acc.id, model);
+        // The same observer spans every chunk, including an incomplete
+        // event carried over into the streaming phase. Event order decides
+        // whether a coalesced content/error pair can still fail over.
+        if let Some(code) = observed.stats.error_before_content.clone() {
+            observed.record(None, false);
             log::warn!(
                 "{} upstream error event before any content (code {:?}) via {} — failing over",
                 model,
@@ -526,19 +617,37 @@ async fn attempt_once(
             );
             return Err((503, format!("{}: {code}", acc.email)));
         }
-        if is_progress_chunk(&chunk) {
-            break; // first content event seen — commit to streaming
-        }
-        if buffered.len() > 64 || buffered_bytes > 2 * 1024 * 1024 {
-            // marker never came but no error either — stream anyway rather
-            // than stall the client indefinitely
+        if ended
+            || observed.stats.content_seen
+            || (!remainder.is_empty() && observed.stats.json_body.is_some())
+        {
+            // JSON is not subject to SSE event gating: large JSON bodies
+            // retain the existing passthrough behavior and EOF usage parsing.
+            observed.stats.push(&remainder);
             break;
+        }
+        if !remainder.is_empty() {
+            // This is a local buffering policy, not an account failure. Return
+            // directly so the caller neither retries nor cools this account.
+            if let Some(entry) = observed.entry.as_mut() {
+                entry.status = StatusCode::BAD_GATEWAY.as_u16() as i64;
+            }
+            observed.record(Some("prefix_limit_exceeded"), false);
+            return Ok((
+                StatusCode::BAD_GATEWAY,
+                axum::Json(serde_json::json!({"error": {
+                    "code": "prefix_limit_exceeded",
+                    "message": "upstream SSE prefix exceeded the buffering limit before content"
+                }})),
+            )
+                .into_response());
         }
     }
     // success: stream to client, log usage after the stream completes
     app.pool.mark_used(&acc.id);
     app.pool.pin(session_key, &acc.id, model);
-    let mut out = Response::builder().status(StatusCode::from_u16(status).unwrap_or(StatusCode::OK));
+    let mut out =
+        Response::builder().status(StatusCode::from_u16(status).unwrap_or(StatusCode::OK));
     copy_headers(out.headers_mut().unwrap(), &resp_headers);
     // The CLI's statusline also updates from turn response headers, which
     // would otherwise overwrite the poll's pool value with the single
@@ -553,68 +662,93 @@ async fn attempt_once(
         }
     }
 
-    let tail: Arc<Mutex<Vec<u8>>> = Arc::new(Mutex::new(Vec::new()));
-    let log_tail = tail.clone();
-    let log_model = model.to_string();
-    let log_email = acc.email.clone();
-    let log_key = api_key.to_string();
-    let log_status = status as i64;
-    let log_latency = latency;
-    let store = app.store.clone();
     let stream = async_stream::stream! {
         let mut res = res;
-        for c in buffered {
-            {
-                let mut t = log_tail.lock().unwrap();
-                t.extend_from_slice(&c);
-            }
-            yield Ok::<_, std::io::Error>(c);
+        if !buffered.is_empty() {
+            yield Ok::<_, std::io::Error>(Bytes::from(buffered));
+        }
+        if !remainder.is_empty() {
+            yield Ok::<_, std::io::Error>(remainder);
         }
         while let Some(chunk) = res.chunk().await.transpose() {
             match chunk {
                 Ok(c) => {
-                    {
-                        let mut t = log_tail.lock().unwrap();
-                        t.extend_from_slice(&c);
-                        if t.len() > 64 * 1024 {
-                            let drop = t.len() - 64 * 1024;
-                            t.drain(..drop);
-                        }
-                    }
+                    observed.stats.push(&c);
                     yield Ok::<_, std::io::Error>(c);
                 }
                 Err(e) => {
-                    yield Err(std::io::Error::new(std::io::ErrorKind::Other, e));
-                    break;
+                    // A body consumer may stop polling as soon as it receives
+                    // Err, so finalize the upstream failure before yielding it.
+                    observed.transport_error();
+                    yield Err(std::io::Error::other(e));
+                    return;
                 }
             }
         }
-        let t = log_tail.lock().unwrap();
-        let input = extract_int(&t, "\"input_tokens\":");
-        let cached = extract_int(&t, "\"cached_tokens\":");
-        let output = extract_int(&t, "\"output_tokens\":");
-        // in-stream error events inside a 200 stream (server_is_overloaded,
-        // slow_down, …) — the client sees them but our status-based failover
-        // never fired; surface them in the log row and the journal
-        let err_code = find_stream_error(&t);
-        drop(t);
-        if let Some(code) = err_code.as_ref() {
-            log::warn!("{} stream carried error event (code {:?}) via {} — in-stream 200 errors bypass status failover", log_model, code, log_email);
-        }
-        store.add_log(&LogEntry {
-            ts: crate::store::now_secs(),
-            account_email: log_email,
-            api_key: log_key,
-            model: log_model,
-            status: log_status,
-            latency_ms: log_latency,
-            input_tokens: input,
-            cached_tokens: cached,
-            output_tokens: output,
-            error: err_code.unwrap_or_default(),
-        });
+        observed.eof();
     };
-    out.body(Body::from_stream(stream)).map_err(|e| (500, e.to_string()))
+    out.body(Body::from_stream(stream))
+        .map_err(|e| (500, e.to_string()))
+}
+
+/// Finalize once even when a response is dropped before its first poll or
+/// while suspended at a yield. User cancellation alone never cools an account.
+struct StreamLog {
+    stats: StreamStats,
+    store: Store,
+    pool: pool::Pool,
+    account_id: String,
+    entry: Option<LogEntry>,
+}
+
+impl StreamLog {
+    fn eof(&mut self) {
+        self.stats.finish();
+        self.record(None, false);
+    }
+
+    fn transport_error(&mut self) {
+        self.record(Some("upstream_stream_error"), true);
+    }
+
+    fn record(&mut self, fallback_error: Option<&str>, upstream_failed: bool) {
+        let Some(mut entry) = self.entry.take() else {
+            return;
+        };
+        entry.ts = crate::store::now_secs();
+        entry.input_tokens = self.stats.input;
+        entry.cached_tokens = self.stats.cached;
+        entry.output_tokens = self.stats.output;
+        entry.error = self
+            .stats
+            .error
+            .as_deref()
+            .or(fallback_error)
+            .or_else(|| {
+                self.stats
+                    .observation_limited
+                    .then_some("observer_limit_exceeded")
+            })
+            .unwrap_or_default()
+            .to_owned();
+        if upstream_failed || self.stats.error.is_some() {
+            self.pool.mark_failure(&self.account_id, &entry.model);
+            log::warn!(
+                "{} stream failed via {}: {}",
+                entry.model,
+                entry.account_email,
+                entry.error
+            );
+        }
+        self.store.add_log(&entry);
+    }
+}
+
+impl Drop for StreamLog {
+    fn drop(&mut self) {
+        let error = (!self.stats.completed).then_some("client_cancelled");
+        self.record(error, false);
+    }
 }
 
 /// True when the chunk carries user-visible content: output items, text
@@ -622,33 +756,23 @@ async fn attempt_once(
 /// count — a turn can sit in "in_progress" for a long reasoning stretch
 /// before its first content event, and that whole window is still
 /// failoverable because the client has received nothing meaningful.
-fn is_progress_chunk(chunk: &[u8]) -> bool {
-    let t = std::str::from_utf8(chunk).unwrap_or("");
-    ["response.output_item.added", "response.output_text.delta", "response.output_item.done", "response.function_call_arguments.delta"]
-        .iter()
-        .any(|m| t.contains(m))
-}
-
-/// In the buffered prefix, does the error event arrive BEFORE the first
-/// content-bearing event? Only then is the stream still failoverable.
-fn error_precedes_content(joined: &[u8]) -> bool {
-    let t = std::str::from_utf8(joined).unwrap_or("");
-    match (t.find("\"type\":\"error\""), first_content_pos(t)) {
-        (Some(_), None) => true,             // error only, no content
-        (Some(e), Some(c)) => e < c,         // error before content
-        (None, _) => false,                  // no error at all
-    }
-}
-
-fn first_content_pos(t: &str) -> Option<usize> {
-    ["response.output_item.added", "response.output_text.delta", "response.output_item.done", "response.function_call_arguments.delta"]
-        .iter()
-        .filter_map(|m| t.find(m))
-        .min()
+fn is_content_type(ty: &str) -> bool {
+    matches!(
+        ty,
+        "response.output_item.added"
+            | "response.output_text.delta"
+            | "response.output_item.done"
+            | "response.function_call_arguments.delta"
+    )
 }
 
 fn header_pct(h: &reqwest::header::HeaderMap, name: &str) -> Option<f64> {
-    h.get(name)?.to_str().ok()?.trim_end_matches('%').parse().ok()
+    h.get(name)?
+        .to_str()
+        .ok()?
+        .trim_end_matches('%')
+        .parse()
+        .ok()
 }
 
 fn header_minutes(h: &reqwest::header::HeaderMap, name: &str) -> Option<i64> {
@@ -656,21 +780,185 @@ fn header_minutes(h: &reqwest::header::HeaderMap, name: &str) -> Option<i64> {
     (m > 0).then(|| m * 60)
 }
 
-/// Scans a stream tail for an SSE error event and returns its error code.
-fn find_stream_error(tail: &[u8]) -> Option<String> {
-    let t = std::str::from_utf8(tail).ok()?;
-    let idx = t.rfind("\"type\":\"error\"")?;
-    let rest = &t[idx..];
-    let code = rest
-        .find("\"code\":")
-        .and_then(|p| {
-            let after = &rest[p + "\"code\":".len()..];
-            let start = after.find('"')? + 1;
-            let end = after[start..].find('"')?;
-            Some(after[start..start + end].to_string())
-        })
-        .unwrap_or_else(|| "unknown".to_string());
-    Some(code)
+/// Observe SSE or JSON without altering the bytes sent to the client. For
+/// SSE only the unfinished line/event is retained; completed events become a small
+/// summary, so a large response.completed never loses its usage to tail
+/// truncation. Byte buffers also allow UTF-8 and delimiters to span chunks.
+/// Non-streaming JSON responses are parsed as a single document at EOF.
+/// Oversized documents/events are not inspected; SSE resumes at the next event.
+#[derive(Default)]
+struct StreamStats {
+    json_body: Option<Vec<u8>>,
+    line: Vec<u8>,
+    data: Vec<u8>,
+    line_seen: bool,
+    after_cr: bool,
+    line_nonempty: bool,
+    skipping_event: bool,
+    observation_limited: bool,
+    content_seen: bool,
+    completed: bool,
+    error_before_content: Option<String>,
+    error: Option<String>,
+    input: i64,
+    cached: i64,
+    output: i64,
+}
+
+impl StreamStats {
+    fn new(content_type: &str) -> Self {
+        let media_type = content_type.split(';').next().unwrap_or("").trim();
+        let is_json = media_type.eq_ignore_ascii_case("application/json")
+            || media_type.to_ascii_lowercase().ends_with("+json");
+        Self {
+            json_body: is_json.then(Vec::new),
+            ..Self::default()
+        }
+    }
+
+    fn push(&mut self, chunk: &[u8]) {
+        if let Some(body) = self.json_body.as_mut() {
+            if !self.observation_limited {
+                if chunk.len() > MAX_OBSERVATION_BYTES - body.len() {
+                    self.observation_limited = true;
+                    *body = Vec::new();
+                } else {
+                    body.extend_from_slice(chunk);
+                }
+            }
+            return;
+        }
+        for part in chunk.split_inclusive(|b| *b == b'\r' || *b == b'\n') {
+            if self.after_cr {
+                self.after_cr = false;
+                if part == b"\n" {
+                    continue; // CRLF is one line ending, even across chunks
+                }
+            }
+            let last = *part.last().unwrap();
+            let ends_line = last == b'\r' || last == b'\n';
+            let bytes = if ends_line {
+                &part[..part.len() - 1]
+            } else {
+                part
+            };
+            self.line_nonempty |= !bytes.is_empty();
+            if !self.skipping_event {
+                if bytes.len() > MAX_OBSERVATION_BYTES - self.line.len() - self.data.len() {
+                    self.observation_limited = true;
+                    self.skipping_event = true;
+                    self.line = Vec::new();
+                    self.data = Vec::new();
+                } else {
+                    self.line.extend_from_slice(bytes);
+                }
+            }
+            if ends_line {
+                if self.skipping_event {
+                    // Do not interpret a suffix of an oversized event. Resume
+                    // only after its blank separator, even across chunk cuts.
+                    self.skipping_event = self.line_nonempty;
+                    self.line_seen = true;
+                } else {
+                    self.finish_line();
+                }
+                self.line_nonempty = false;
+                self.after_cr = last == b'\r';
+            }
+        }
+    }
+
+    fn finish_line(&mut self) {
+        // SSE permits one UTF-8 BOM at the start of the stream. Waiting for
+        // the first full line naturally handles a BOM split across chunks.
+        let line = if self.line_seen {
+            self.line.as_slice()
+        } else {
+            self.line_seen = true;
+            self.line
+                .strip_prefix(b"\xef\xbb\xbf")
+                .unwrap_or(&self.line)
+        };
+        if line.is_empty() {
+            self.finish_event();
+        } else if let Some(value) = line.strip_prefix(b"data:") {
+            // SSE permits one optional space after the colon; multiple
+            // data fields are joined with newlines before JSON decoding.
+            self.data
+                .extend_from_slice(value.strip_prefix(b" ").unwrap_or(value));
+            self.data.push(b'\n');
+        }
+        self.line.clear();
+    }
+
+    fn finish_event(&mut self) {
+        if let Ok(event) = serde_json::from_slice(&self.data) {
+            self.observe(event);
+        }
+        self.data.clear();
+    }
+
+    // Some upstreams omit the last blank line. Accept a complete final
+    // JSON event at EOF, but never treat partial JSON as content or usage.
+    fn finish(&mut self) {
+        if self.observation_limited && self.json_body.is_some() || self.skipping_event {
+            return;
+        }
+        if let Some(body) = self.json_body.as_mut() {
+            let body = std::mem::take(body);
+            if let Ok(event) = serde_json::from_slice(&body) {
+                self.observe(event);
+            }
+            return;
+        }
+        if !self.line.is_empty() {
+            self.finish_line();
+        }
+        self.finish_event();
+    }
+
+    fn observe(&mut self, v: serde_json::Value) {
+        let ty = v.get("type").and_then(|t| t.as_str()).unwrap_or("");
+        if ty == "response.completed" {
+            self.completed = true;
+        }
+        if is_content_type(ty) {
+            self.content_seen = true;
+        } else if ty == "error" {
+            let code = v
+                .get("code")
+                .and_then(|c| c.as_str())
+                .unwrap_or("unknown")
+                .to_owned();
+            if !self.content_seen && self.error_before_content.is_none() {
+                self.error_before_content = Some(code.clone());
+            }
+            self.error = Some(code);
+        }
+        // response.completed nests usage under response; token_count
+        // events carry it at the top level.
+        let Some(u) = v
+            .get("response")
+            .and_then(|r| r.get("usage"))
+            .or_else(|| v.get("usage"))
+        else {
+            return;
+        };
+        if let Some(n) = u.get("input_tokens").and_then(|x| x.as_i64()) {
+            self.input = n;
+        }
+        if let Some(n) = u
+            .get("input_tokens_details")
+            .and_then(|d| d.get("cached_tokens"))
+            .or_else(|| u.get("cached_tokens"))
+            .and_then(|x| x.as_i64())
+        {
+            self.cached = n;
+        }
+        if let Some(n) = u.get("output_tokens").and_then(|x| x.as_i64()) {
+            self.output = n;
+        }
+    }
 }
 
 fn headers_get(h: &reqwest::header::HeaderMap, name: &str) -> Option<String> {
@@ -695,21 +983,6 @@ fn reset_epoch(h: &reqwest::header::HeaderMap, at_key: &str, after_key: &str) ->
     None
 }
 
-fn extract_int(data: &[u8], key: &str) -> i64 {
-    let Some(pos) = data
-        .windows(key.len())
-        .rposition(|w| w == key.as_bytes())
-    else {
-        return 0;
-    };
-    let rest = &data[pos + key.len()..];
-    let end = rest.iter().position(|b| !b.is_ascii_digit()).unwrap_or(rest.len());
-    std::str::from_utf8(&rest[..end])
-        .ok()
-        .and_then(|s| s.parse().ok())
-        .unwrap_or(0)
-}
-
 /// Capacity-weighted pool usage: each account weighs by its calibrated
 /// tokens-per-1%; accounts without calibration share the mean of known
 /// weights (1.0 when nothing is calibrated yet). Shared by the usage poll
@@ -728,7 +1001,11 @@ fn weighted_used(entries: &[(f64, Option<f64>)]) -> f64 {
         wsum += w;
         wpct += w * pct;
     }
-    if wsum > 0.0 { wpct / wsum } else { 0.0 }
+    if wsum > 0.0 {
+        wpct / wsum
+    } else {
+        0.0
+    }
 }
 
 /// Pool-wide primary usage for the outbound header rewrite, sourced from the
@@ -778,7 +1055,10 @@ fn truncate(s: &str) -> String {
 /// None for any other error shape — only self-describing rejections are
 /// auto-corrected.
 fn rejected_param(snippet: &str) -> Option<String> {
-    for marker in ["Unsupported parameter: ", "Unrecognized request argument supplied: "] {
+    for marker in [
+        "Unsupported parameter: ",
+        "Unrecognized request argument supplied: ",
+    ] {
         if let Some(pos) = snippet.find(marker) {
             let rest = &snippet[pos + marker.len()..];
             let name: String = rest
@@ -808,7 +1088,6 @@ fn remove_param(body: &[u8], path: &str) -> Option<Vec<u8>> {
     }
     serde_json::to_vec(&v).ok()
 }
-
 
 /// Official upstream path for the apps MCP (see codex_apps_mcp_url_for_base_url:
 /// with the default chatgpt_base_url it is {backend-api}/ps/mcp, not under
@@ -855,7 +1134,14 @@ async fn codex_apps_mcp(
     for (k, v) in &app.cfg.header_defaults {
         rb = rb.header(k, v);
     }
-    for name in ["Accept", "Content-Type", "Mcp-Session-Id", "Mcp-Protocol-Version", "Originator", "User-Agent"] {
+    for name in [
+        "Accept",
+        "Content-Type",
+        "Mcp-Session-Id",
+        "Mcp-Protocol-Version",
+        "Originator",
+        "User-Agent",
+    ] {
         if let Some(v) = headers.get(name) {
             rb = rb.header(name, v);
         }
@@ -869,7 +1155,9 @@ async fn codex_apps_mcp(
     let status = res.status();
     log::info!("apps-mcp-proxy {} -> {}", method, status.as_u16());
 
-    let mut out = Response::builder().status(axum::http::StatusCode::from_u16(status.as_u16()).unwrap_or(StatusCode::BAD_GATEWAY));
+    let mut out = Response::builder().status(
+        axum::http::StatusCode::from_u16(status.as_u16()).unwrap_or(StatusCode::BAD_GATEWAY),
+    );
     for (k, v) in res.headers() {
         if HOP_HEADERS.contains(&k.as_str()) || k == "content-length" {
             continue;
@@ -898,7 +1186,10 @@ pub async fn codex_backend_fallback(
     body: Bytes,
 ) -> Response {
     const UPSTREAM_ROOT: &str = "https://chatgpt.com/backend-api";
-    let path_q = uri.path_and_query().map(|p| p.as_str()).unwrap_or(uri.path());
+    let path_q = uri
+        .path_and_query()
+        .map(|p| p.as_str())
+        .unwrap_or(uri.path());
     // CodexApi path style (chatgpt_base_url without /backend-api) uses
     // /api/codex/*; the official ChatGPT backend serves the same endpoints
     // under /backend-api/wham/* — except the apps MCP, which lives directly
@@ -910,7 +1201,10 @@ pub async fn codex_backend_fallback(
             format!("/wham{}", rest)
         }
     } else {
-        path_q.strip_prefix("/backend-api").unwrap_or(path_q).to_string()
+        path_q
+            .strip_prefix("/backend-api")
+            .unwrap_or(path_q)
+            .to_string()
     };
     let upstream_path = format!("/backend-api{}", rel);
     let url = format!("{}{}", UPSTREAM_ROOT, rel);
@@ -930,9 +1224,16 @@ pub async fn codex_backend_fallback(
         }
     };
     let status = res.status();
-    log::info!("backend-proxy {} {} -> {}", method, upstream_path, status.as_u16());
+    log::info!(
+        "backend-proxy {} {} -> {}",
+        method,
+        upstream_path,
+        status.as_u16()
+    );
 
-    let mut out = Response::builder().status(axum::http::StatusCode::from_u16(status.as_u16()).unwrap_or(StatusCode::BAD_GATEWAY));
+    let mut out = Response::builder().status(
+        axum::http::StatusCode::from_u16(status.as_u16()).unwrap_or(StatusCode::BAD_GATEWAY),
+    );
     for (k, v) in res.headers() {
         if HOP_HEADERS.contains(&k.as_str()) || k == "content-length" {
             continue;
@@ -951,6 +1252,86 @@ pub async fn codex_backend_fallback(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use futures_util::StreamExt;
+
+    #[tokio::test]
+    async fn dropped_stream_finalizes_once_before_poll_and_after_yield() {
+        for poll_first in [false, true] {
+            for outcome in ["cancelled", "completed", "eof", "transport_error"] {
+                let dir = std::env::temp_dir()
+                    .join(format!("herdex-stream-finalize-{}", uuid::Uuid::new_v4()));
+                let store = Store::open(dir.to_str().unwrap()).unwrap();
+                for id in ["a1", "a2"] {
+                    store
+                        .upsert_account(&Account {
+                            id: id.into(),
+                            email: format!("{id}@test"),
+                            plan_type: "pro".into(),
+                            ..Default::default()
+                        })
+                        .unwrap();
+                }
+                let pool = pool::Pool::new(store.clone());
+                let mut observed = StreamLog {
+                    stats: StreamStats::default(),
+                    store: store.clone(),
+                    pool: pool.clone(),
+                    account_id: "a1".into(),
+                    entry: Some(LogEntry {
+                        account_email: "a1@test".into(),
+                        model: "gpt-5.5".into(),
+                        status: 200,
+                        ..Default::default()
+                    }),
+                };
+                observed.stats.push(b"data:{\"type\":\"token_count\",\"usage\":{\"input_tokens\":120,\"cached_tokens\":80,\"output_tokens\":45}}\n\n");
+                match outcome {
+                    "completed" => observed
+                        .stats
+                        .push(b"data:{\"type\":\"response.completed\"}\n\n"),
+                    "eof" => observed.eof(),
+                    "transport_error" => observed.transport_error(),
+                    _ => {}
+                }
+                // Check both an unpolled body and one suspended at yield. The
+                // guard must already exist before the generator starts running.
+                let body = Body::from_stream(async_stream::stream! {
+                    yield Ok::<_, std::io::Error>(Bytes::from_static(b"buffered prefix"));
+                    observed.eof();
+                });
+                let mut stream = body.into_data_stream();
+                if poll_first {
+                    assert_eq!(stream.next().await.unwrap().unwrap(), "buffered prefix");
+                }
+                drop(stream);
+                let logs = store.recent_logs(5).unwrap();
+                assert_eq!(logs.len(), 1, "{outcome}: no missing or duplicate log");
+                assert_eq!(
+                    (
+                        logs[0].input_tokens,
+                        logs[0].cached_tokens,
+                        logs[0].output_tokens
+                    ),
+                    (120, 80, 45)
+                );
+                assert_eq!(
+                    logs[0].error,
+                    match outcome {
+                        "cancelled" => "client_cancelled",
+                        "transport_error" => "upstream_stream_error",
+                        _ => "",
+                    }
+                );
+                assert_eq!(
+                    pool.select("gpt-5.5", "").unwrap().len(),
+                    if outcome == "transport_error" { 1 } else { 2 }
+                );
+                drop(pool);
+                drop(store);
+                std::fs::remove_dir_all(dir).unwrap();
+            }
+        }
+    }
 
     #[test]
     fn rejected_param_extracts_named_params() {
@@ -959,7 +1340,9 @@ mod tests {
             Some("max_output_tokens".to_string())
         );
         assert_eq!(
-            rejected_param(r#"{"error":{"message":"Unrecognized request argument supplied: stream_options"}}"#),
+            rejected_param(
+                r#"{"error":{"message":"Unrecognized request argument supplied: stream_options"}}"#
+            ),
             Some("stream_options".to_string())
         );
         assert_eq!(rejected_param(r#"{"detail":"Invalid value"}"#), None);
@@ -972,10 +1355,8 @@ mod tests {
             serde_json::from_slice(&remove_param(body, "max_output_tokens").unwrap()).unwrap();
         assert!(out.get("max_output_tokens").is_none());
         assert_eq!(out["a"], 1);
-        let out: serde_json::Value = serde_json::from_slice(
-            &remove_param(body, "reasoning.effort").unwrap(),
-        )
-        .unwrap();
+        let out: serde_json::Value =
+            serde_json::from_slice(&remove_param(body, "reasoning.effort").unwrap()).unwrap();
         assert!(out["reasoning"].get("effort").is_none());
         assert!(remove_param(body, "missing.path").is_none());
         assert!(remove_param(b"not json", "x").is_none());
@@ -1005,24 +1386,138 @@ mod tests {
 
     #[test]
     fn stream_error_detection() {
-        // error event inside a 200 stream is found with its code
-        let tail = b"data: {\"type\":\"error\",\"code\":\"server_is_overloaded\",\"message\":\"busy\"}";
-        assert_eq!(find_stream_error(tail).as_deref(), Some("server_is_overloaded"));
+        let error = b"data:{\"type\": \"error\", \"code\": \"slow_down\"}\n\n";
+        let content = b"data: {\"type\":\"response.output_item.added\"}\n\n";
+        let mut stats = StreamStats::default();
+        stats.push(error);
+        stats.push(content);
+        assert!(stats.content_seen);
+        assert_eq!(stats.error_before_content.as_deref(), Some("slow_down"));
+        assert_eq!(stats.error.as_deref(), Some("slow_down"));
 
-        // normal usage tail → no error
-        let ok = b"data: {\"type\":\"response.completed\",\"response\":{\"usage\":{\"input_tokens\":10}}}";
-        assert_eq!(find_stream_error(ok), None);
+        let mut stats = StreamStats::default();
+        stats.push(content);
+        stats.push(error);
+        assert!(stats.content_seen);
+        assert!(stats.error_before_content.is_none());
+        assert_eq!(stats.error.as_deref(), Some("slow_down"));
+    }
 
-        // error-only frame → failoverable
-        let err_first = b"data: {\"type\":\"error\",\"code\":\"slow_down\"}";
-        assert!(!is_progress_chunk(err_first));
+    #[test]
+    fn stream_events_survive_every_byte_split() {
+        // Multiline data, optional spaces, all SSE line endings, and a
+        // multibyte character must behave identically at every split.
+        let wire = concat!(
+            ": heartbeat\r\n\r\n",
+            "data:{\"type\": \"response.output_text.delta\",\r\n",
+            "data: \"delta\": \"你好\"}\r\n\r\n",
+            "data: {\"type\":\"response.completed\",\"response\":{\"usage\":",
+            "{\"input_tokens\":120,\"input_tokens_details\":{\"cached_tokens\":80},\"output_tokens\":45}}}\r\r",
+            "data: [DONE]\n\n"
+        ).as_bytes();
+        for split in 0..=wire.len() {
+            let mut stats = StreamStats::default();
+            stats.push(&wire[..split]);
+            stats.push(&wire[split..]);
+            assert!(stats.content_seen, "split at {split}");
+            assert!(stats.error.is_none(), "split at {split}");
+            assert_eq!(
+                (stats.input, stats.cached, stats.output),
+                (120, 80, 45),
+                "split at {split}"
+            );
+        }
+        let mut stats = StreamStats::default();
+        for byte in wire.chunks(1) {
+            stats.push(byte);
+        }
+        assert!(stats.content_seen);
+        assert_eq!((stats.input, stats.cached, stats.output), (120, 80, 45));
+    }
 
-        // lifecycle-only frame → still buffering, failoverable
-        let life = b"data: {\"type\":\"response.in_progress\"}";
-        assert!(!is_progress_chunk(life));
+    #[test]
+    fn stream_accepts_bom_only_at_start_across_chunks() {
+        for (event, is_content) in [
+            (
+                "{\"type\":\"response.output_text.delta\",\"delta\":\"你好\"}",
+                true,
+            ),
+            ("{\"type\":\"error\",\"code\":\"slow_down\"}", false),
+        ] {
+            let wire = format!("\u{feff}data: {event}\n\n");
+            for size in 1..=wire.len() {
+                let mut stats = StreamStats::default();
+                for chunk in wire.as_bytes().chunks(size) {
+                    stats.push(chunk);
+                }
+                assert_eq!(stats.content_seen, is_content, "chunk size {size}");
+                assert_eq!(
+                    stats.error_before_content.as_deref(),
+                    if is_content { None } else { Some("slow_down") },
+                    "chunk size {size}"
+                );
+            }
+        }
+        let mut stats = StreamStats::default();
+        stats.push(b": heartbeat\n\n");
+        stats.push("\u{feff}data: {\"type\":\"error\",\"code\":\"slow_down\"}\n\n".as_bytes());
+        assert!(
+            stats.error.is_none(),
+            "a later BOM is not a data field prefix"
+        );
+    }
 
-        // content event → committed, no longer failoverable
-        let content = b"data: {\"type\":\"response.output_item.added\"}";
-        assert!(is_progress_chunk(content));
+    #[test]
+    fn json_responses_preserve_usage_across_chunks() {
+        let body = br#"{
+            "object": "response",
+            "usage": {
+                "input_tokens": 120,
+                "input_tokens_details": {"cached_tokens": 80},
+                "output_tokens": 45
+            }
+        }"#;
+        for content_type in [
+            "application/json; charset=utf-8",
+            "Application/JSON",
+            "application/response+json",
+        ] {
+            let mut stats = StreamStats::new(content_type);
+            for byte in body.chunks(1) {
+                stats.push(byte);
+            }
+            assert_eq!(stats.input, 0, "JSON is observed only at EOF");
+            stats.finish();
+            assert_eq!((stats.input, stats.cached, stats.output), (120, 80, 45));
+            stats.finish();
+            assert_eq!((stats.input, stats.cached, stats.output), (120, 80, 45));
+            assert!(stats.json_body.as_ref().unwrap().is_empty());
+        }
+    }
+
+    #[test]
+    fn stream_waits_for_event_boundary_and_accepts_final_usage_at_eof() {
+        let mut stats = StreamStats::default();
+        stats.push(b"data: {\"type\":\"response.output_item.added\"}\n");
+        assert!(!stats.content_seen);
+        stats.push(b"\n");
+        assert!(stats.content_seen);
+        stats.push(b"data: {\"type\":\"response.completed\",\"usage\":{\"input_tokens\":7,\"cached_tokens\":2,\"output_tokens\":3}}");
+        stats.finish();
+        assert_eq!((stats.input, stats.cached, stats.output), (7, 2, 3));
+
+        let mut torn = StreamStats::default();
+        torn.push(b"data: {\"type\":\"err");
+        torn.finish();
+        assert!(torn.error.is_none());
+        assert!(!torn.content_seen);
+    }
+
+    #[test]
+    fn network_failures_failover() {
+        // status 0 (DNS/TCP/TLS/timeout) is never the account's fault
+        assert!(failoverable(0, ""));
+        // ...and never mapped to a meaningful upstream status for the client
+        assert_eq!(upstream_status(0), StatusCode::BAD_GATEWAY);
     }
 }

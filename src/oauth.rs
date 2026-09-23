@@ -71,7 +71,11 @@ pub fn new_pkce() -> Result<PKCE, String> {
     let digest = Sha256::digest(verifier.as_bytes());
     let challenge = URL_SAFE_NO_PAD.encode(digest);
     let state = random_b64(16)?;
-    Ok(PKCE { verifier, challenge, state })
+    Ok(PKCE {
+        verifier,
+        challenge,
+        state,
+    })
 }
 
 pub fn auth_url(issuer: &str, client_id: &str, redirect_uri: &str, p: &PKCE) -> String {
@@ -93,7 +97,11 @@ pub fn auth_url(issuer: &str, client_id: &str, redirect_uri: &str, p: &PKCE) -> 
         .iter()
         .map(|(k, v)| format!("{}={}", k, url_encode(v)))
         .collect();
-    format!("{}/oauth/authorize?{}", issuer.trim_end_matches('/'), qs.join("&"))
+    format!(
+        "{}/oauth/authorize?{}",
+        issuer.trim_end_matches('/'),
+        qs.join("&")
+    )
 }
 
 pub async fn exchange(
@@ -128,7 +136,11 @@ pub async fn refresh(
     token_request(hc, issuer, &form).await
 }
 
-async fn token_request(hc: &reqwest::Client, issuer: &str, form: &[(&str, &str)]) -> Result<TokenSet, String> {
+async fn token_request(
+    hc: &reqwest::Client,
+    issuer: &str,
+    form: &[(&str, &str)],
+) -> Result<TokenSet, String> {
     let url = format!("{}/oauth/token", issuer.trim_end_matches('/'));
     let res = hc
         .post(url)
@@ -176,7 +188,9 @@ fn url_encode(s: &str) -> String {
     let mut out = String::new();
     for b in s.bytes() {
         match b {
-            b'A'..=b'Z' | b'a'..=b'z' | b'0'..=b'9' | b'-' | b'_' | b'.' | b'~' => out.push(b as char),
+            b'A'..=b'Z' | b'a'..=b'z' | b'0'..=b'9' | b'-' | b'_' | b'.' | b'~' => {
+                out.push(b as char)
+            }
             _ => out.push_str(&format!("%{:02X}", b)),
         }
     }
@@ -202,7 +216,12 @@ mod tests {
     #[test]
     fn auth_url_contains_essentials() {
         let p = new_pkce().unwrap();
-        let u = auth_url("https://auth.openai.com", "cid", "http://localhost:1455/auth/callback", &p);
+        let u = auth_url(
+            "https://auth.openai.com",
+            "cid",
+            "http://localhost:1455/auth/callback",
+            &p,
+        );
         assert!(u.starts_with("https://auth.openai.com/oauth/authorize?"));
         assert!(u.contains("client_id=cid"));
         assert!(u.contains("code_challenge_method=S256"));

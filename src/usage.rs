@@ -110,7 +110,10 @@ struct WindowJson {
 }
 
 pub fn now_secs() -> i64 {
-    SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_secs() as i64
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap()
+        .as_secs() as i64
 }
 
 fn parse_window(w: &Option<WindowJson>) -> Window {
@@ -142,7 +145,8 @@ fn parse_limit(l: &Option<LimitJson>) -> Limit {
 }
 
 pub fn parse(body: &[u8]) -> Result<Report, String> {
-    let raw: UsagePayload = serde_json::from_slice(body).map_err(|e| format!("usage payload: {e}"))?;
+    let raw: UsagePayload =
+        serde_json::from_slice(body).map_err(|e| format!("usage payload: {e}"))?;
     let mut report = Report {
         plan_type: raw.plan_type,
         main: parse_limit(&raw.rate_limit),
@@ -169,7 +173,11 @@ pub fn parse(body: &[u8]) -> Result<Report, String> {
     Ok(report)
 }
 
-fn headers(token: &str, account_id: &str, defaults: &std::collections::HashMap<String, String>) -> reqwest::header::HeaderMap {
+fn headers(
+    token: &str,
+    account_id: &str,
+    defaults: &std::collections::HashMap<String, String>,
+) -> reqwest::header::HeaderMap {
     let mut h = reqwest::header::HeaderMap::new();
     if let Ok(v) = format!("Bearer {token}").parse() {
         h.insert("Authorization", v);
@@ -270,6 +278,12 @@ fn truncate(s: &str) -> String {
     s.chars().take(200).collect()
 }
 
+/// Normalizes an additional limit name to a model key:
+/// "GPT-5.3-Codex-Spark" -> "gpt-5.3-codex-spark".
+pub fn model_key(limit_name: &str) -> String {
+    limit_name.trim().to_lowercase().replace(' ', "-")
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -300,10 +314,4 @@ mod tests {
     fn model_key_normalizes_limit_name() {
         assert_eq!(model_key("GPT-5.3-Codex-Spark"), "gpt-5.3-codex-spark");
     }
-}
-
-/// Normalizes an additional limit name to a model key:
-/// "GPT-5.3-Codex-Spark" -> "gpt-5.3-codex-spark".
-pub fn model_key(limit_name: &str) -> String {
-    limit_name.trim().to_lowercase().replace(' ', "-")
 }

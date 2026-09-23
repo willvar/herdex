@@ -69,7 +69,7 @@ struct PoolInner {
 
 impl Pool {
     pub fn new(st: Store) -> Self {
-        Pool::with_now(st, Box::new(|| crate::store::now_secs()))
+        Pool::with_now(st, Box::new(crate::store::now_secs))
     }
 
     pub fn with_now(st: Store, now: Now) -> Self {
@@ -91,15 +91,28 @@ impl Pool {
         let mut inner = self.shared.state.lock().unwrap_or_else(|e| e.into_inner());
         let mut q = q;
         q.observed_at = (self.shared.now)();
-        inner.quota.insert((acc_id.to_string(), model.to_string()), q);
+        inner
+            .quota
+            .insert((acc_id.to_string(), model.to_string()), q);
     }
 
     pub fn observation(&self, acc_id: &str, model: &str) -> Option<Quota> {
-        self.shared.state.lock().unwrap_or_else(|e| e.into_inner()).quota.get(&(acc_id.to_string(), model.to_string())).copied()
+        self.shared
+            .state
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .quota
+            .get(&(acc_id.to_string(), model.to_string()))
+            .copied()
     }
 
     pub fn mark_used(&self, acc_id: &str) {
-        self.shared.state.lock().unwrap_or_else(|e| e.into_inner()).last_used.insert(acc_id.to_string(), (self.shared.now)());
+        self.shared
+            .state
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .last_used
+            .insert(acc_id.to_string(), (self.shared.now)());
     }
 
     /// Cools the account+model pair for the configured TTL. With zero TTL
@@ -123,7 +136,11 @@ impl Pool {
     /// Returns accounts eligible for `model`, best first. Never returns an
     /// empty list while any enabled eligible account exists.
     pub fn candidates(&self, model: &str) -> Result<Vec<Account>, String> {
-        Ok(self.scored_candidates(model)?.into_iter().map(|s| s.acc).collect())
+        Ok(self
+            .scored_candidates(model)?
+            .into_iter()
+            .map(|s| s.acc)
+            .collect())
     }
 
     /// Ordered candidates for a request, with session affinity: the session's
@@ -173,7 +190,10 @@ impl Pool {
             // "default" observation (main quota window) always participates —
             // a 0% model window must not mask an almost-exhausted account pool
             let qm = inner.quota.get(&key).copied();
-            let qd = inner.quota.get(&(a.id.clone(), "default".to_string())).copied();
+            let qd = inner
+                .quota
+                .get(&(a.id.clone(), "default".to_string()))
+                .copied();
             let primary = match (qm, qd) {
                 (Some(m), Some(d)) => m.primary_pct.max(d.primary_pct),
                 (Some(m), None) => m.primary_pct,
@@ -239,7 +259,11 @@ impl Pool {
         let now = (self.shared.now)();
         inner.affinity.insert(
             session_key.to_string(),
-            Pin { acc_id: acc_id.to_string(), model: model.to_string(), until: now + AFFINITY_TTL },
+            Pin {
+                acc_id: acc_id.to_string(),
+                model: model.to_string(),
+                until: now + AFFINITY_TTL,
+            },
         );
         if inner.affinity.len() > AFFINITY_MAX {
             inner.affinity.retain(|_, p| p.until > now);
@@ -251,7 +275,9 @@ impl Pool {
         let inner = self.shared.state.lock().unwrap_or_else(|e| e.into_inner());
         let mut out: HashMap<String, HashMap<String, Quota>> = HashMap::new();
         for ((acc, model), q) in &inner.quota {
-            out.entry(acc.clone()).or_default().insert(model.clone(), *q);
+            out.entry(acc.clone())
+                .or_default()
+                .insert(model.clone(), *q);
         }
         out
     }
@@ -287,17 +313,13 @@ impl Scored {
 #[cfg(test)]
 mod tests {
     use super::*;
-    
+
     fn test_pool() -> Pool {
-        let dir = std::env::temp_dir().join(format!(
-            "herdex-pool-{}-{}",
-            std::process::id(),
-            {
-                let mut b = [0u8; 8];
-                rand::thread_rng().fill_bytes(&mut b);
-                u64::from_be_bytes(b)
-            }
-        ));
+        let dir = std::env::temp_dir().join(format!("herdex-pool-{}-{}", std::process::id(), {
+            let mut b = [0u8; 8];
+            rand::thread_rng().fill_bytes(&mut b);
+            u64::from_be_bytes(b)
+        }));
         let st = Store::open(dir.to_str().unwrap()).unwrap();
         Pool::new(st)
     }
@@ -325,10 +347,26 @@ mod tests {
     #[test]
     fn least_used_ordering() {
         let p = test_pool();
-        let st = st_of(&p);
+        let _st = st_of(&p);
         seed(&p, &["a1", "a2", "a3"]);
-        p.observe("a1", "gpt-5.5", Quota { primary_pct: 80.0, secondary_pct: 90.0, ..Default::default() });
-        p.observe("a2", "gpt-5.5", Quota { primary_pct: 10.0, secondary_pct: 20.0, ..Default::default() });
+        p.observe(
+            "a1",
+            "gpt-5.5",
+            Quota {
+                primary_pct: 80.0,
+                secondary_pct: 90.0,
+                ..Default::default()
+            },
+        );
+        p.observe(
+            "a2",
+            "gpt-5.5",
+            Quota {
+                primary_pct: 10.0,
+                secondary_pct: 20.0,
+                ..Default::default()
+            },
+        );
 
         let got = p.candidates("gpt-5.5").unwrap();
         let ids: Vec<&str> = got.iter().map(|a| a.id.as_str()).collect();
@@ -341,7 +379,10 @@ mod tests {
         let st = Store::open(dir.to_str().unwrap()).unwrap();
         let now_cell = std::sync::Arc::new(std::sync::atomic::AtomicI64::new(1000));
         let now_ref = now_cell.clone();
-        let p = Pool::with_now(st.clone(), Box::new(move || now_ref.load(std::sync::atomic::Ordering::SeqCst)));
+        let p = Pool::with_now(
+            st.clone(),
+            Box::new(move || now_ref.load(std::sync::atomic::Ordering::SeqCst)),
+        );
         seed(&p, &["a1", "a2"]);
 
         p.mark_failure("a1", "gpt-5.5");
@@ -351,8 +392,18 @@ mod tests {
         assert_eq!(got.len(), 2);
 
         // TTL expiry restores normal ordering (now advances past cooldown)
-        now_cell.store(now_cell.load(std::sync::atomic::Ordering::SeqCst) + 7200, std::sync::atomic::Ordering::SeqCst);
-        p.observe("a1", "gpt-5.5", Quota { primary_pct: 5.0, ..Default::default() });
+        now_cell.store(
+            now_cell.load(std::sync::atomic::Ordering::SeqCst) + 7200,
+            std::sync::atomic::Ordering::SeqCst,
+        );
+        p.observe(
+            "a1",
+            "gpt-5.5",
+            Quota {
+                primary_pct: 5.0,
+                ..Default::default()
+            },
+        );
         let got = p.candidates("gpt-5.5").unwrap();
         assert_eq!(got.len(), 2);
         assert_eq!(got[0].id, "a2");
@@ -371,7 +422,7 @@ mod tests {
     #[test]
     fn unknown_model_allowed_everywhere() {
         let p = test_pool();
-        let st = st_of(&p);
+        let _st = st_of(&p);
         seed(&p, &["plus1"]);
         assert_eq!(p.candidates("gpt-brand-new-model").unwrap().len(), 1);
     }
@@ -382,7 +433,10 @@ mod tests {
         let st = Store::open(dir.to_str().unwrap()).unwrap();
         let now_cell = std::sync::Arc::new(std::sync::atomic::AtomicI64::new(1000));
         let now_ref = now_cell.clone();
-        let p = Pool::with_now(st, Box::new(move || now_ref.load(std::sync::atomic::Ordering::SeqCst)));
+        let p = Pool::with_now(
+            st,
+            Box::new(move || now_ref.load(std::sync::atomic::Ordering::SeqCst)),
+        );
         seed(&p, &["a1"]);
 
         p.pin("sess-1", "a1", "gpt-5.5");
@@ -391,17 +445,34 @@ mod tests {
         assert!(p.pinned("sess-1", "gpt-6-astra").is_none());
         // expiry drops the pin
         p.pin("sess-2", "a1", "gpt-5.5");
-        now_cell.store(now_cell.load(std::sync::atomic::Ordering::SeqCst) + 7200, std::sync::atomic::Ordering::SeqCst);
+        now_cell.store(
+            now_cell.load(std::sync::atomic::Ordering::SeqCst) + 7200,
+            std::sync::atomic::Ordering::SeqCst,
+        );
         assert!(p.pinned("sess-2", "gpt-5.5").is_none());
     }
 
     #[test]
     fn default_observation_fallback_in_ordering() {
         let p = test_pool();
-        let st = st_of(&p);
+        let _st = st_of(&p);
         seed(&p, &["a1", "a2"]);
-        p.observe("a1", "default", Quota { primary_pct: 90.0, ..Default::default() });
-        p.observe("a2", "default", Quota { primary_pct: 5.0, ..Default::default() });
+        p.observe(
+            "a1",
+            "default",
+            Quota {
+                primary_pct: 90.0,
+                ..Default::default()
+            },
+        );
+        p.observe(
+            "a2",
+            "default",
+            Quota {
+                primary_pct: 5.0,
+                ..Default::default()
+            },
+        );
         let got = p.candidates("gpt-5.6-sol").unwrap();
         assert_eq!(got[0].id, "a2");
     }
@@ -409,29 +480,81 @@ mod tests {
     #[test]
     fn model_obs_does_not_mask_account_pool() {
         let p = test_pool();
-        let st = st_of(&p);
+        let _st = st_of(&p);
         seed(&p, &["a1", "a2"]);
         // a1: fresh model window (0%) but account pool almost exhausted
-        p.observe("a1", "gpt-6-astra", Quota { primary_pct: 0.0, ..Default::default() });
-        p.observe("a1", "default", Quota { primary_pct: 93.0, ..Default::default() });
-        p.observe("a2", "default", Quota { primary_pct: 11.0, ..Default::default() });
+        p.observe(
+            "a1",
+            "gpt-6-astra",
+            Quota {
+                primary_pct: 0.0,
+                ..Default::default()
+            },
+        );
+        p.observe(
+            "a1",
+            "default",
+            Quota {
+                primary_pct: 93.0,
+                ..Default::default()
+            },
+        );
+        p.observe(
+            "a2",
+            "default",
+            Quota {
+                primary_pct: 11.0,
+                ..Default::default()
+            },
+        );
         let got = p.select("gpt-6-astra", "").unwrap();
-        assert_eq!(got[0].id, "a2", "0% model window must not hide 93% weekly usage");
+        assert_eq!(
+            got[0].id, "a2",
+            "0% model window must not hide 93% weekly usage"
+        );
     }
 
     #[test]
     fn pin_holds_while_close_yields_when_far() {
         let p = test_pool();
-        let st = st_of(&p);
+        let _st = st_of(&p);
         seed(&p, &["a1", "a2", "a3"]);
         p.pin("sess", "a1", "m");
         // close: pinned account within 20pp of best -> stays first
-        p.observe("a1", "default", Quota { primary_pct: 30.0, ..Default::default() });
-        p.observe("a2", "default", Quota { primary_pct: 10.0, ..Default::default() });
-        p.observe("a3", "default", Quota { primary_pct: 12.0, ..Default::default() });
+        p.observe(
+            "a1",
+            "default",
+            Quota {
+                primary_pct: 30.0,
+                ..Default::default()
+            },
+        );
+        p.observe(
+            "a2",
+            "default",
+            Quota {
+                primary_pct: 10.0,
+                ..Default::default()
+            },
+        );
+        p.observe(
+            "a3",
+            "default",
+            Quota {
+                primary_pct: 12.0,
+                ..Default::default()
+            },
+        );
         assert_eq!(p.select("m", "sess").unwrap()[0].id, "a1");
         // far: pinned account lags best by >20pp -> yields
-        p.observe("a1", "default", Quota { primary_pct: 93.0, ..Default::default() });
+        p.observe(
+            "a1",
+            "default",
+            Quota {
+                primary_pct: 93.0,
+                ..Default::default()
+            },
+        );
         assert_eq!(p.select("m", "sess").unwrap()[0].id, "a2");
     }
 }
