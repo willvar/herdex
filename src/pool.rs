@@ -65,6 +65,10 @@ struct PoolInner {
     failures: HashMap<(String, String), Failure>,
     last_used: HashMap<String, i64>,
     affinity: HashMap<String, Pin>,
+    /// Per-account model catalogs discovered from upstream /models. An
+    /// account that provably lacks a model is skipped for it instead of
+    /// wasting a request on a guaranteed upstream rejection.
+    models: HashMap<String, std::collections::HashSet<String>>,
     /// Shadow ledger: tokens attributed locally since the account's last
     /// quota snapshot, bucketed per model. Upstream wham reports lag heavy
     /// sessions; without this the scheduler chases stale "least used"
@@ -113,6 +117,28 @@ impl Pool {
         // would double-count it
         inner.pending.remove(acc_id);
         inner.rates.remove(acc_id);
+    }
+
+    /// Sets one account's discovered model slugs (empty = clear knowledge).
+    pub fn set_account_models(&self, acc_id: &str, slugs: &[String]) {
+        let mut inner = self.shared.state.lock().unwrap_or_else(|e| e.into_inner());
+        inner
+            .models
+            .insert(acc_id.to_string(), slugs.iter().cloned().collect());
+    }
+
+    /// Models servable by EVERY enabled account with a known catalog.
+    pub fn common_models(&self) -> Vec<String> {
+        let inner = self.shared.state.lock().unwrap_or_else(|e| e.into_inner());
+        let mut sets: Vec<&std::collections::HashSet<String>> =
+            inner.models.values().filter(|s| !s.is_empty()).collect();
+        if sets.is_empty() {
+            return Vec::new();
+        }
+        sets.sort_by_key(|s| std::cmp::Reverse(s.len()));
+        let mut out = sets[0].clone();
+        out.retain(|m| sets[1..].iter().all(|s| s.contains(m)));
+        out.into_iter().collect()
     }
 
     /// Records tokens a completed request attributed to this account
@@ -269,6 +295,13 @@ impl Pool {
                 (None, Some(d)) => d.secondary_pct,
                 (None, None) => 0.0,
             };
+            // model entitlement: an account whose discovered catalog
+            // provably lacks the requested model is skipped up front
+            if let Some(set) = inner.models.get(&a.id) {
+                if !set.is_empty() && !set.contains(&model.to_string()) {
+                    continue;
+                }
+            }
             let f = inner.failures.get(&key).copied().unwrap_or_default();
             // shadow ledger: the snapshot may be minutes stale during heavy
             // sessions — add the locally-attributed, not-yet-reported burn

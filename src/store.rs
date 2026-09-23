@@ -194,6 +194,11 @@ CREATE TABLE IF NOT EXISTS request_log (
 	output_tokens INTEGER NOT NULL DEFAULT 0,
 	error  TEXT NOT NULL DEFAULT ''
 );
+CREATE TABLE IF NOT EXISTS account_models (
+	account_id TEXT NOT NULL,
+	slug       TEXT NOT NULL,
+	PRIMARY KEY (account_id, slug)
+);
 CREATE TABLE IF NOT EXISTS usage_probes (
 	seq        INTEGER PRIMARY KEY AUTOINCREMENT,
 	account_id TEXT NOT NULL,
@@ -768,6 +773,60 @@ impl Store {
             rusqlite::params![cutoff],
         )
         .map_err(|e| e.to_string())
+    }
+
+    /// Replaces one account's discovered model slug set (upstream /models
+    /// endpoint). Empty input keeps whatever is stored — a failed fetch
+    /// must not erase a known-good catalog.
+    pub fn set_account_models(&self, account_id: &str, slugs: &[String]) -> Result<(), String> {
+        if slugs.is_empty() {
+            return Ok(());
+        }
+        let mut conn = self.conn.lock().unwrap_or_else(|e| e.into_inner());
+        let tx = conn.transaction().map_err(|e| e.to_string())?;
+        tx.execute(
+            "DELETE FROM account_models WHERE account_id=?1",
+            [account_id],
+        )
+        .map_err(|e| e.to_string())?;
+        for slug in slugs {
+            tx.execute(
+                "INSERT OR IGNORE INTO account_models (account_id, slug) VALUES (?1, ?2)",
+                rusqlite::params![account_id, slug],
+            )
+            .map_err(|e| e.to_string())?;
+        }
+        tx.commit().map_err(|e| e.to_string())
+    }
+
+    /// Models discovered for one account; empty when nothing fetched yet.
+    pub fn account_models(&self, account_id: &str) -> Result<Vec<String>, String> {
+        let conn = self.conn.lock().unwrap_or_else(|e| e.into_inner());
+        let mut stmt = conn
+            .prepare("SELECT slug FROM account_models WHERE account_id=?1")
+            .map_err(|e| e.to_string())?;
+        let rows = stmt
+            .query_map([account_id], |r| r.get(0))
+            .map_err(|e| e.to_string())?;
+        rows.collect::<Result<Vec<_>, _>>()
+            .map_err(|e| e.to_string())
+    }
+
+    /// Intersection across accounts that have discovered catalogs — a model
+    /// every account can serve. Accounts without a known set are ignored.
+    pub fn common_models(&self) -> Result<Vec<String>, String> {
+        let conn = self.conn.lock().unwrap_or_else(|e| e.into_inner());
+        let mut stmt = conn
+            .prepare(
+                r#"SELECT slug FROM account_models GROUP BY slug
+                   HAVING COUNT(DISTINCT account_id) = (SELECT COUNT(DISTINCT account_id) FROM account_models)"#,
+            )
+            .map_err(|e| e.to_string())?;
+        let rows = stmt
+            .query_map([], |r| r.get(0))
+            .map_err(|e| e.to_string())?;
+        rows.collect::<Result<Vec<_>, _>>()
+            .map_err(|e| e.to_string())
     }
 
     /// Latest probe snapshot per account (for hydrating the pool's
