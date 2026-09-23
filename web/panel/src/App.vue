@@ -52,6 +52,7 @@ onUnmounted(() => clearInterval(timer))
           @focus="e => e.target?.select?.()"
         />
         <span :class="{ ok: conn === 'ok', err: conn !== 'ok' && conn !== '输入 manage key', muted: conn === '输入 manage key' }">{{ conn === 'ok' ? '已连接' : conn }}</span>
+        <a href="/ca.pem" download="herdex-ca.pem" class="muted" style="font-size:12px">下载 CA 证书</a>
       </header>
       <main v-if="mk">
         <n-tabs
