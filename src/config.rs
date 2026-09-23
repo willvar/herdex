@@ -95,9 +95,19 @@ impl Default for TlsCfg {
 }
 
 impl TlsCfg {
+    /// Empty `hosts` = zero-config: every local non-loopback IP plus the
+    /// machine hostname is covered automatically. An explicit list is
+    /// honored verbatim (localhost/127.0.0.1 always included).
     pub fn enabled_hosts(&self) -> Vec<String> {
-        let mut hosts = self.hosts.clone();
-        hosts.retain(|h| !h.trim().is_empty());
+        let mut hosts = if self.hosts.is_empty() {
+            crate::tls::auto_hosts()
+        } else {
+            self.hosts
+                .iter()
+                .map(|h| h.trim().to_string())
+                .filter(|h| !h.is_empty())
+                .collect()
+        };
         if !hosts.contains(&"localhost".to_string()) {
             hosts.push("localhost".into());
         }
