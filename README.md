@@ -87,10 +87,11 @@ systemd 部署样例见 `deploy/herdex.service`（含完整沙箱加固）。
 
 ## CLI 接入（PAT 虚拟账号模式）
 
-Codex 0.156.1 启动时会发现工作区，并要求工作区后端 origin 使用 HTTPS。先在 herdex
-前配置 HTTPS 反代（例如 Caddy，转发到 `127.0.0.1:8088`）；下列三个入口必须指向
-同一个 HTTPS 网关。使用内部 CA 时，通过可信渠道取得其根证书，保存为
-`~/.codex/herdex-ca.pem`，只让 Codex 额外信任它，不关闭证书校验。
+Codex 0.156.1 起的工作区路由要求 HTTPS 后端。herdex 内建 TLS：在配置中启用
+`[tls]` 后首次启动会自动生成私有 CA 并签发叶子证书（SAN 覆盖配置的 hosts，
+支持 IP 地址，无需域名）。CA 通过 `http://<host>:8088/ca.pem` 分发（无需认证），
+客户端让 Codex 显式额外信任该 CA（`CODEX_CA_CERTIFICATE`），不必安装到系统
+信任库，也不关闭证书校验。已有公网域名反代的用户可继续沿用，不必改私有 CA。
 
 codex 端三处配置如下，`/status` 显示池子聚合：
 
@@ -116,6 +117,15 @@ codex() {
   CODEX_AUTHAPI_BASE_URL="https://<herdex-host>:8443" \
   CODEX_CA_CERTIFICATE="$HOME/.codex/herdex-ca.pem" command codex "$@"
 }
+```
+
+`/etc/herdex/herdex.toml` 中启用（默认关闭，纯 HTTP 部署不受影响）：
+
+```toml
+[tls]
+enabled = true
+port = 8443
+hosts = ["192.168.168.254"]   # 叶子证书 SAN：IP 或域名均可
 ```
 
 函数放入 `~/.bashrc` 后，在已有终端执行 `source ~/.bashrc`。若使用系统已信任的

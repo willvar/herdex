@@ -22,3 +22,8 @@ beta-features = "multi_agent"
 
 [log]
 level = "info"
+
+# [tls]
+# enabled = true
+# port = 8443
+# hosts = ["192.168.168.254"]
