@@ -119,8 +119,9 @@ codex() {
 }
 ```
 
-`/etc/herdex/herdex.toml` 中启用（默认关闭，纯 HTTP 部署不受影响；启用后
-`listen` 端口即为 HTTPS-only，无明文通道，CA 通过服务器文件拷贝分发）：
+HTTPS 是唯一形态——herdex 服务的是 codex，而 codex 0.156+ 只接受 HTTPS
+后端（工作区路由拒绝明文 HTTP）。无需配置段，`listen` 端口即 HTTPS-only；
+`[tls]` 段仅用于自定义证书 SAN：
 
 ```toml
 [tls]
