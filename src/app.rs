@@ -393,7 +393,18 @@ pub fn build_router(app: AppHandle) -> axum::Router {
 pub fn spawn_refresh_loop(app: AppHandle) {
     tokio::spawn(async move {
         loop {
-            tokio::time::sleep(Duration::from_secs(120)).await;
+            // work first, then wait: a fresh start must populate the quota
+            // map (capacity panel) without waiting a full first cycle, and
+            // every cycle refreshes usage so scheduling sees live pct even
+            // with no CLI client polling
+            {
+                let accounts = app.store.list_accounts().unwrap_or_default();
+                for a in accounts.iter().filter(|a| !a.disabled) {
+                    if let Err(e) = app.fetch_usage(a).await {
+                        log::warn!("usage poll: {} {e}", a.email);
+                    }
+                }
+            }
             // daily request_log prune (retention-days, 0 = keep forever)
             let days = app.cfg.retention_days();
             if days > 0 {
@@ -428,6 +439,7 @@ pub fn spawn_refresh_loop(app: AppHandle) {
                     log::warn!("proactive refresh failed for {}: {e}", a.email);
                 }
             }
+            tokio::time::sleep(Duration::from_secs(120)).await;
         }
     });
 }
