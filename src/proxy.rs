@@ -46,6 +46,14 @@ pub fn router() -> axum::Router<AppHandle> {
             axum::routing::get(whoami),
         )
         .route("/user-auth-credential/whoami", axum::routing::get(whoami))
+        .route(
+            "/api/codex/accounts/check",
+            axum::routing::get(accounts_check),
+        )
+        .route(
+            "/backend-api/wham/accounts/check",
+            axum::routing::get(accounts_check),
+        )
         // apps MCP: forwarded with pool-account credentials (the same auth
         // shape /responses uses) because the CLI's own OAuth forwarded from
         // behind the gateway gets Cloudflare-challenged
@@ -238,6 +246,28 @@ async fn whoami() -> Response {
         body.to_string(),
     )
         .into_response()
+}
+
+/// The pool is one virtual workspace, matching the PAT whoami identity.
+/// Codex resolves NO_CONSTRAINT to its configured HTTPS bootstrap origin,
+/// keeping gateway credentials and model traffic on this gateway.
+async fn accounts_check(State(app): State<AppHandle>, headers: HeaderMap) -> Response {
+    if let Err(response) = auth_check(&app, &headers) {
+        return response;
+    }
+    axum::Json(serde_json::json!({
+        "accounts": [{
+            "id": POOL_IDENTITY.account_id,
+            "name": "herdex",
+            "plan_type": "pro",
+            "structure": "personal",
+            "workspace_backend_origin": "NO_CONSTRAINT",
+            "account_routing_override": "NO_CONSTRAINT",
+        }],
+        "account_ordering": [POOL_IDENTITY.account_id],
+        "default_account_id": POOL_IDENTITY.account_id,
+    }))
+    .into_response()
 }
 
 /// Serves the CLI's account usage poll: zero-cost probe of every enabled
