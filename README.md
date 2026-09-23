@@ -87,16 +87,21 @@ systemd 部署样例见 `deploy/herdex.service`（含完整沙箱加固）。
 
 ## CLI 接入（PAT 虚拟账号模式）
 
-codex 端三处配置，即可让整个 CLI 无 OAuth 地跑在池子上，`/status` 显示池子聚合：
+Codex 0.156.1 启动时会发现工作区，并要求工作区后端 origin 使用 HTTPS。先在 herdex
+前配置 HTTPS 反代（例如 Caddy，转发到 `127.0.0.1:8088`）；下列三个入口必须指向
+同一个 HTTPS 网关。使用内部 CA 时，通过可信渠道取得其根证书，保存为
+`~/.codex/herdex-ca.pem`，只让 Codex 额外信任它，不关闭证书校验。
+
+codex 端三处配置如下，`/status` 显示池子聚合：
 
 ```toml
 # ~/.codex/config.toml（片段）
 model_provider = "herdex"
-chatgpt_base_url = "http://<herdex-host>:8088"
+chatgpt_base_url = "https://<herdex-host>:8443"
 
 [model_providers.herdex]
 name = "herdex"
-base_url = "http://<herdex-host>:8088/v1"
+base_url = "https://<herdex-host>:8443/v1"
 wire_api = "responses"
 requires_openai_auth = true
 experimental_bearer_token = "<herdex API key>"
@@ -107,14 +112,21 @@ experimental_bearer_token = "<herdex API key>"
 {"auth_mode": "personalAccessToken", "personal_access_token": "<herdex API key>"}
 
 # PAT 的 whoami 校验端点重定向到网关（env 变量，无 config 入口）
-alias codex='CODEX_AUTHAPI_BASE_URL="http://<herdex-host>:8088" codex'
+codex() {
+  CODEX_AUTHAPI_BASE_URL="https://<herdex-host>:8443" \
+  CODEX_CA_CERTIFICATE="$HOME/.codex/herdex-ca.pem" command codex "$@"
+}
 ```
 
+函数放入 `~/.bashrc` 后，在已有终端执行 `source ~/.bashrc`。若使用系统已信任的
+公有 CA 证书，可省略 `CODEX_CA_CERTIFICATE`。
+
 工作原理：codex 启动时向 `CODEX_AUTHAPI_BASE_URL/v1/user-auth-credential/whoami`
-校验 PAT；herdex 应答一个虚拟身份（`pool@herdex.local`）。此后 codex 认为自己是
-ChatGPT 账号会话（`/status` 限流卡片解锁），而所有后端流量——usage 轮询、
-whoami、模型请求——全部落在 herdex 上，凭据始终是 herdex API key，
-无任何真实 OAuth。
+获取虚拟身份（`pool@herdex.local`），再经 `/api/codex/accounts/check` 验证 API key
+并发现同一个虚拟工作区。发现响应的 `NO_CONSTRAINT` 让 CLI 继续使用配置中的
+HTTPS 后端 origin，不暴露池内真实账号。此后 codex 认为自己是 ChatGPT 账号会话
+（`/status` 限流卡片解锁），usage 轮询、工作区发现、whoami、模型请求均落在
+herdex 上，凭据始终是 herdex API key，无客户端 OAuth。
 
 接口总览（Bearer 认证用 manage 面板里创建的 API key）：
 
@@ -122,10 +134,12 @@ whoami、模型请求——全部落在 herdex 上，凭据始终是 herdex API 
 - `GET  /v1/models`
 - `GET  /api/codex/usage`（及 `/v1/api/codex/usage`、`/wham/usage`）—— 池子聚合用量
 - `GET  /v1/user-auth-credential/whoami` —— PAT 虚拟身份
+- `GET  /api/codex/accounts/check`（及 `/backend-api/wham/accounts/check`）—— 认证后的虚拟工作区发现
 - `*    /backend-api/*`（其余路径）—— 上游后端反代
 - `POST /api/codex/ps/mcp` —— apps MCP 代理
 
-注意：herdex 是 CLI 的认证依赖——网关不可达时 codex 启动会因 whoami 失败拒绝认证（fail-closed）。
+注意：herdex 是 CLI 的认证依赖；网关不可达、API key 无效或禁用、HTTPS 证书不受
+信任时，codex 会在身份获取或工作区发现阶段拒绝启动（fail-closed）。
 
 ## 测试
 
