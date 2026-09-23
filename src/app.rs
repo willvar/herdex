@@ -356,6 +356,15 @@ pub fn build_router(app: AppHandle) -> axum::Router {
     Router::new()
         .merge(client)
         .merge(manage_router)
+        // stop the browser console noise: a tiny icon instead of falling
+        // through to the chatgpt.com fallback proxy
+        .route("/favicon.ico", axum::routing::get(|| async {
+            const SVG: &str = "<svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 32 32'><rect width='32' height='32' rx='7' fill='#201f29'/><circle cx='16' cy='16' r='7' fill='#7c6cf0'/></svg>";
+            (
+                [(axum::http::header::CONTENT_TYPE, "image/svg+xml")],
+                SVG,
+            )
+        }))
         // the CA certificate is public bootstrap material: served unauthenticated
         // so a fresh client can fetch it over plain HTTP before switching to HTTPS
         .route("/ca.pem", axum::routing::get(ca_pem))
