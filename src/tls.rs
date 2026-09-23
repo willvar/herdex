@@ -98,6 +98,44 @@ fn hosts_cn(cfg: &TlsCfg) -> String {
     cfg.enabled_hosts().first().cloned().unwrap_or_default()
 }
 
+/// With no configured hosts, discover the machine's own non-loopback
+/// addresses and hostname so a plain `enabled = true` covers IP access on
+/// any LAN — other users must not need to know their IPs up front.
+pub fn auto_hosts() -> Vec<String> {
+    let mut out = Vec::new();
+    if let Ok(addrs) = get_if_addrs::get_if_addrs() {
+        for iface in addrs {
+            if let get_if_addrs::IfAddr::V4(a) = iface.addr {
+                let ip = std::net::IpAddr::V4(a.ip);
+                if !ip.is_loopback() {
+                    out.push(ip.to_string());
+                }
+            }
+        }
+    }
+    if let Ok(h) = std::env::var("HERDEX_HOSTNAME") {
+        if !h.trim().is_empty() {
+            out.push(h.trim().to_string());
+        }
+    } else if let Ok(h) = hostname() {
+        out.push(h);
+    }
+    out
+}
+
+fn hostname() -> Result<String, String> {
+    let h = std::fs::read_to_string("/etc/hostname")
+        .map_err(|e| e.to_string())?
+        .trim()
+        .trim_end_matches('.')
+        .to_string();
+    if h.is_empty() {
+        Err("no hostname".into())
+    } else {
+        Ok(h)
+    }
+}
+
 /// The CA key must be persisted separately from the CA certificate: the
 /// .pem holds the cert (public material, served at /ca.pem) while the key
 /// must outlive restarts so every leaf stays signed by the same CA.
