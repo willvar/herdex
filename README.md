@@ -36,8 +36,12 @@ codex 专用账号池网关（Rust）。把多个 ChatGPT 账号聚合成一个 
 ## 构建
 
 ```bash
+cd web/panel && npm ci && npm run build && cd -   # 面板产物嵌入二进制（dist/ 随源码保存）
 cargo build --release   # 需要 cmake（aws-lc-rs 构建）
 ```
+
+面板开发：`cd web/panel && npm run dev`（热重载，/manage/api 代理到网关）。
+改动 web/panel/src 后需 `npm run build` 再 `cargo build` 才会进入二进制。
 
 ## 配置
 
@@ -78,7 +82,8 @@ systemd 部署样例见 `deploy/herdex.service`（含完整沙箱加固）。
 数据库启动时自动迁移，升级前应备份。新探针记录请求日志序号，按观察顺序归属
 已完成请求，不再依赖同一秒内的时间比较；未知套餐不会作为套餐变更处理。
 旧探针保留秒级估算，新旧顺序边界不混算；旧日志若缺少账号 ID 且邮箱对应多个账号，
-不会强行分摊到容量校准中。容量及触顶时间仍是估算，上游额度更新可能有延迟。
+不会强行分摊到容量校准中。容量及触顶时间仍是估算，上游额度更新可能有延迟；
+面板日均消耗按所选的滚动 7/30 天计算，包含空闲日。
 
 ## CLI 接入（PAT 虚拟账号模式）
 
@@ -128,9 +133,11 @@ whoami、模型请求——全部落在 herdex 上，凭据始终是 herdex API 
 cargo fmt --check
 cargo clippy --all-targets --locked -- -D warnings
 cargo test --locked   # 单测 + HTTP 集成：假上游 + 真实 axum 链路
+cd web/panel && npm ci && npm run lint && npm test && npm run build
 ```
 
-后端回归覆盖慢速 SSE 分块、前缀预算、同秒请求归属、
+前端回归覆盖设置保存与轮询的并发、额度查询失败/重试、同邮箱账号容量隔离、
+空闲日预测和图表卸载；后端覆盖慢速 SSE 分块、前缀预算、同秒请求归属、
 未知套餐、旧数据库迁移、断连收尾，以及历史清理后的容量统计。
 
 核心语义不变式（逐条测试锁定）：
