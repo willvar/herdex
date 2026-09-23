@@ -155,6 +155,9 @@ async fn calibration(State(app): State<AppHandle>, headers: HeaderMap) -> Respon
             "account_id": a.id, "email": a.email, "plan_type": a.plan_type,
             "tokens_per_pct": if is_calibrated { serde_json::json!(tpp) } else { serde_json::Value::Null },
             "samples": samples,
+            // era-mix-aware: the per-model rates let the panel (and the
+            // scheduler later) price the CURRENT mix instead of a blend
+            "per_model": cal.per_model,
 
             "used_pct": pct,
             "remaining_tokens": if is_calibrated { serde_json::json!(remaining_tokens) } else { serde_json::Value::Null },

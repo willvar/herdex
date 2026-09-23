@@ -3,6 +3,7 @@
 
 use rusqlite::{Connection, OptionalExtension};
 use serde::{Deserialize, Serialize};
+use std::collections::BTreeMap;
 use std::sync::{Arc, Mutex};
 use std::time::{SystemTime, UNIX_EPOCH};
 
@@ -12,10 +13,16 @@ use std::time::{SystemTime, UNIX_EPOCH};
 /// events (window rollover, banked-credit refunds, plan changes) invalidate
 /// their interval; intervals with no attributed tokens are discarded
 /// (external burn / metering drift is not a tokens/pp datapoint).
-#[derive(Clone, Debug, Default)]
+#[derive(Clone, Debug, Default, Serialize)]
 pub struct Calibration {
     pub tokens_per_pct: f64,
     pub samples: i64,
+    /// Per-model tokens-per-pp from near-pure intervals. Model mix shifts
+    /// (a newer model draining the window at a different rate) make the
+    /// long-run blended value stale; per-model rates let consumers project
+    /// cost under the CURRENT mix.
+    #[serde(skip_serializing_if = "BTreeMap::is_empty")]
+    pub per_model: BTreeMap<String, f64>,
 }
 
 #[derive(Clone)]
@@ -838,7 +845,7 @@ impl Store {
         // Fetch each ordering domain once. Legacy samples were migrated in
         // timestamp order; new samples use the global completed-log sequence.
         // IDs own tagged logs even if their email matches another account.
-        let legacy_logs: Vec<(i64, i64)> = if probes[0].log_seq.is_none() {
+        let legacy_logs: Vec<(i64, String, i64)> = if probes[0].log_seq.is_none() {
             let last = probes
                 .iter()
                 .take_while(|p| p.log_seq.is_none())
@@ -846,7 +853,7 @@ impl Store {
                 .unwrap();
             let mut stmt = conn
                 .prepare(
-                    "SELECT ts, input_tokens+output_tokens FROM request_log
+                    "SELECT ts, model, input_tokens+output_tokens FROM request_log
                  WHERE status=200 AND ts>=?1 AND ts<?2 AND seq<=?3 AND
                    (account_id=?4 OR (account_id='' AND ?5 AND account_email=?6))
                  ORDER BY ts",
@@ -862,36 +869,40 @@ impl Store {
                         unique_email,
                         email
                     ],
-                    |r| Ok((r.get(0)?, r.get(1)?)),
+                    |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)),
                 )
                 .map_err(|e| e.to_string())?;
             rows.collect::<Result<_, _>>().map_err(|e| e.to_string())?
         } else {
             Vec::new()
         };
-        let ordered_logs: Vec<(i64, i64)> = if let Some(end) = probes.last().and_then(|p| p.log_seq)
-        {
-            let mut stmt = conn
-                .prepare(
-                    "SELECT seq, input_tokens+output_tokens FROM request_log
+        let ordered_logs: Vec<(i64, String, i64)> =
+            if let Some(end) = probes.last().and_then(|p| p.log_seq) {
+                let mut stmt = conn
+                    .prepare(
+                        "SELECT seq, model, input_tokens+output_tokens FROM request_log
                  WHERE status=200 AND seq>?1 AND seq<=?2 AND
                    (account_id=?3 OR (account_id='' AND ?4 AND account_email=?5))
                  ORDER BY seq",
-                )
-                .map_err(|e| e.to_string())?;
-            let rows = stmt
-                .query_map(
-                    rusqlite::params![legacy_end, end, account_id, unique_email, email],
-                    |r| Ok((r.get(0)?, r.get(1)?)),
-                )
-                .map_err(|e| e.to_string())?;
-            rows.collect::<Result<_, _>>().map_err(|e| e.to_string())?
-        } else {
-            Vec::new()
-        };
+                    )
+                    .map_err(|e| e.to_string())?;
+                let rows = stmt
+                    .query_map(
+                        rusqlite::params![legacy_end, end, account_id, unique_email, email],
+                        |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)),
+                    )
+                    .map_err(|e| e.to_string())?;
+                rows.collect::<Result<_, _>>().map_err(|e| e.to_string())?
+            } else {
+                Vec::new()
+            };
         drop(conn);
         let mut legacy_pos = 0;
         let mut ordered_pos = 0;
+        // per-model accumulators over near-pure intervals; the blended sums
+        // stay untouched so existing weights keep their semantics
+        let mut sum_tokens_by_model: BTreeMap<String, f64> = BTreeMap::new();
+        let mut sum_pp_by_model: BTreeMap<String, f64> = BTreeMap::new();
 
         for i in 1..probes.len() {
             let p0 = &probes[i - 1];
@@ -899,26 +910,29 @@ impl Store {
             // Consume even invalidated intervals, so reset/plan transitions
             // cannot leave old tokens for a later interval to pick up.
             let mut tokens = 0i64;
+            let mut per_model_tokens: BTreeMap<String, f64> = BTreeMap::new();
             match (p0.log_seq, p1.log_seq) {
                 (Some(start), Some(end)) => {
-                    while let Some(&(seq, amount)) = ordered_logs.get(ordered_pos) {
+                    while let Some(&(seq, ref model, amount)) = ordered_logs.get(ordered_pos) {
                         if seq > end {
                             break;
                         }
                         ordered_pos += 1;
                         if seq > start {
                             tokens += amount;
+                            *per_model_tokens.entry(model.clone()).or_insert(0.0) += amount as f64;
                         }
                     }
                 }
                 (None, None) => {
-                    while let Some(&(ts, amount)) = legacy_logs.get(legacy_pos) {
+                    while let Some(&(ts, ref model, amount)) = legacy_logs.get(legacy_pos) {
                         if ts >= p1.ts {
                             break;
                         }
                         legacy_pos += 1;
                         if ts >= p0.ts {
                             tokens += amount;
+                            *per_model_tokens.entry(model.clone()).or_insert(0.0) += amount as f64;
                         }
                     }
                 }
@@ -955,6 +969,20 @@ impl Store {
                         sum_tokens += total;
                         sum_pp += crossed;
                         samples += 1;
+                        // near-pure intervals teach a per-model rate: one
+                        // model carrying ≥98% of the interval's tokens owns
+                        // the pp movement, so the mixed-interval ambiguity
+                        // (which model moved how many pp) never arises
+                        let dominant = per_model_tokens.values().copied().fold(0.0, f64::max);
+                        if let Some((m, _mtok)) = per_model_tokens
+                            .iter()
+                            .find(|(_, t)| **t >= dominant * 0.98)
+                        {
+                            let e = sum_tokens_by_model.entry(m.clone()).or_insert(0.0);
+                            *e += total;
+                            let p = sum_pp_by_model.entry(m.clone()).or_insert(0.0);
+                            *p += crossed;
+                        }
                         accum = 0.0; // sub-pp remainder discarded (≤1pp bound)
                     } else {
                         accum = total; // moved <1pp: keep accumulating
@@ -974,9 +1002,21 @@ impl Store {
             return Ok(None);
         }
         let blended = sum_tokens / sum_pp;
+        let per_model = sum_pp_by_model
+            .iter()
+            .filter_map(|(m, pp)| {
+                let t = *sum_tokens_by_model.get(m)?;
+                if *pp > 0.0 {
+                    Some((m.clone(), t / *pp))
+                } else {
+                    None
+                }
+            })
+            .collect();
         Ok(Some(Calibration {
             tokens_per_pct: blended,
             samples,
+            per_model,
         }))
     }
 
