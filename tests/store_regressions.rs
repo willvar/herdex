@@ -118,6 +118,46 @@ fn log(store: &Store, ts: i64, input: i64, cached: i64, output: i64) {
     });
 }
 
+fn log_model(store: &Store, ts: i64, model: &str, input: i64, output: i64) {
+    store.add_log(&LogEntry {
+        ts,
+        account_id: "a".into(),
+        account_email: "a@example.test".into(),
+        model: model.into(),
+        status: 200,
+        input_tokens: input,
+        cached_tokens: 0,
+        output_tokens: output,
+        ..Default::default()
+    });
+}
+
+#[test]
+fn near_pure_intervals_yield_per_model_rates_and_blend_stays_untouched() {
+    // sol era costs 100 tok/pp; the astra era only 20. The long-run blend
+    // mixes both eras, per-model rates must expose the difference so
+    // consumers can price the CURRENT mix instead of a stale blend.
+    let db = TestStore::new();
+    db.account("a");
+    let t = now_secs() - 120;
+    db.store.add_probe("a", t, 0.0, 100, "pro");
+    // pure sol crossing: 100 tokens -> +1pp
+    log_model(&db.store, t + 5, "gpt-5.5", 100, 0);
+    db.store.add_probe("a", t + 10, 1.0, 100, "pro");
+    // pure astra crossing: 80 tokens -> +4pp (20 tok/pp)
+    log_model(&db.store, t + 15, "astra", 80, 0);
+    db.store.add_probe("a", t + 20, 5.0, 100, "pro");
+    // pure astra crossing: 20 tokens -> +1pp
+    log_model(&db.store, t + 25, "astra", 20, 0);
+    db.store.add_probe("a", t + 30, 6.0, 100, "pro");
+
+    let cal = db.store.calibration("a").unwrap().unwrap();
+    assert_eq!(*cal.per_model.get("gpt-5.5").unwrap(), 100.0);
+    assert_eq!(*cal.per_model.get("astra").unwrap(), 20.0);
+    // blended = (100+80+20)/(1+4+1) = 33.3 — era mixing is visible there
+    assert!((cal.tokens_per_pct - (200.0 / 6.0)).abs() < 1e-6);
+}
+
 #[test]
 fn same_second_completed_log_is_counted_before_the_observation() {
     let db = TestStore::new();
