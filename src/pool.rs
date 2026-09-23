@@ -12,7 +12,7 @@
 use crate::store::{Account, Store};
 #[cfg(test)]
 use rand::RngCore;
-use std::collections::HashMap;
+use std::collections::{BTreeMap, HashMap};
 use std::sync::{Arc, Mutex};
 
 #[derive(Clone, Copy, Default, serde::Serialize)]
@@ -65,6 +65,20 @@ struct PoolInner {
     failures: HashMap<(String, String), Failure>,
     last_used: HashMap<String, i64>,
     affinity: HashMap<String, Pin>,
+    /// Shadow ledger: tokens attributed locally since the account's last
+    /// quota snapshot, bucketed per model. Upstream wham reports lag heavy
+    /// sessions; without this the scheduler chases stale "least used"
+    /// numbers and overloads the account that is actually burning fastest.
+    pending: HashMap<String, HashMap<String, f64>>,
+    /// Calibration cache (per-model tok/pp), refreshed lazily — the replay
+    /// is too heavy for the per-request path.
+    rates: HashMap<String, (i64, RateSet)>,
+}
+
+#[derive(Clone)]
+struct RateSet {
+    blended: f64,
+    per_model: BTreeMap<String, f64>,
 }
 
 impl Pool {
@@ -94,6 +108,55 @@ impl Pool {
         inner
             .quota
             .insert((acc_id.to_string(), model.to_string()), q);
+        // reconcile: the fresh snapshot already includes whatever we burned
+        // since the previous one — holding the shadow estimate any longer
+        // would double-count it
+        inner.pending.remove(acc_id);
+        inner.rates.remove(acc_id);
+    }
+
+    /// Records tokens a completed request attributed to this account
+    /// (shadow ledger). The pool's quota snapshots only refresh on the
+    /// usage poll; between polls these tokens are invisible to scheduling
+    /// unless priced in here.
+    pub fn accrue(&self, acc_id: &str, model: &str, tokens: i64) {
+        if tokens <= 0 {
+            return;
+        }
+        let mut inner = self.shared.state.lock().unwrap_or_else(|e| e.into_inner());
+        let bucket = inner.pending.entry(acc_id.to_string()).or_default();
+        *bucket.entry(model.to_string()).or_insert(0.0) += tokens as f64;
+    }
+
+    /// Unburned pp implied by locally-attributed tokens not yet reflected
+    /// in the account's quota snapshot (capped at 100).
+    fn pending_pp(store: &Store, inner: &mut PoolInner, acc_id: &str, now: i64) -> f64 {
+        let Some(bucket) = inner.pending.get(acc_id).cloned() else {
+            return 0.0;
+        };
+        let rate = Self::rate(store, inner, acc_id, now);
+        let Some(rate) = rate else { return 0.0 };
+        let pp: f64 = bucket
+            .iter()
+            .map(|(m, tokens)| tokens / rate.per_model.get(m).copied().unwrap_or(rate.blended))
+            .sum();
+        pp.min(100.0)
+    }
+
+    fn rate(store: &Store, inner: &mut PoolInner, acc_id: &str, now: i64) -> Option<RateSet> {
+        const TTL: i64 = 60;
+        if let Some((fetched, rate)) = inner.rates.get(acc_id) {
+            if now - *fetched < TTL {
+                return Some(rate.clone());
+            }
+        }
+        let cal = store.calibration(acc_id).ok().flatten()?;
+        let entry = RateSet {
+            blended: cal.tokens_per_pct,
+            per_model: cal.per_model.clone(),
+        };
+        inner.rates.insert(acc_id.to_string(), (now, entry.clone()));
+        Some(entry)
     }
 
     pub fn observation(&self, acc_id: &str, model: &str) -> Option<Quota> {
@@ -177,7 +240,7 @@ impl Pool {
     fn scored_candidates(&self, model: &str) -> Result<Vec<Scored>, String> {
         let accounts = self.shared.st.list_accounts()?;
         let now = (self.shared.now)();
-        let inner = self.shared.state.lock().unwrap_or_else(|e| e.into_inner());
+        let mut inner = self.shared.state.lock().unwrap_or_else(|e| e.into_inner());
 
         let mut active: Vec<Scored> = Vec::new();
         let mut cooled: Vec<Scored> = Vec::new();
@@ -207,9 +270,15 @@ impl Pool {
                 (None, None) => 0.0,
             };
             let f = inner.failures.get(&key).copied().unwrap_or_default();
+            // shadow ledger: the snapshot may be minutes stale during heavy
+            // sessions — add the locally-attributed, not-yet-reported burn
+            // so "least used" reflects reality, then never lower what the
+            // snapshot says (only upward correction, per the reconciliation
+            // contract with observe())
+            let burn = Pool::pending_pp(&self.shared.st, &mut inner, &a.id, now);
             let s = Scored {
                 acc: a.clone(),
-                primary,
+                primary: primary + burn,
                 secondary,
                 last_used: inner.last_used.get(&a.id).copied().unwrap_or(0),
                 last_failed: f.last_fail,
@@ -556,5 +625,83 @@ mod tests {
             },
         );
         assert_eq!(p.select("m", "sess").unwrap()[0].id, "a2");
+    }
+
+    #[test]
+    fn shadow_ledger_penalizes_unreported_burn_and_reconciles_on_snapshot() {
+        // a1 has 10% observed; a2 has 30%. a1 should win — but a1 has just
+        // served 50 tokens locally that upstream has not yet reported, and
+        // its calibrated rate is 10 tok/pp (astra): pending = 4pp.
+        // effective: a1 14 vs a2 30 -> still a1, but above the raw snapshot;
+        // a bigger unreported burn flips the order before any snapshot lands.
+        let p = test_pool();
+        seed(&p, &["a1", "a2"]);
+        let now = p.now_secs();
+        p.observe(
+            "a1",
+            "default",
+            Quota {
+                primary_pct: 10.0,
+                secondary_pct: 10.0,
+                primary_reset_at: 100,
+                secondary_reset_at: 100,
+                primary_window_secs: 0,
+                secondary_window_secs: 0,
+                observed_at: 0,
+            },
+        );
+        p.observe(
+            "a2",
+            "default",
+            Quota {
+                primary_pct: 20.0,
+                secondary_pct: 20.0,
+                ..Default::default()
+            },
+        );
+
+        // calibrate a1 at 10 tok/pp via a probe sequence: snapshot 0% -> 1% with 10 tokens
+        let st = st_of(&p);
+        st.add_probe("a1", now - 100, 0.0, 100, "pro");
+        st.add_log(&crate::store::LogEntry {
+            ts: now - 5,
+            account_id: "a1".into(),
+            account_email: "a1@x".into(),
+            model: "gpt-x".into(),
+            status: 200,
+            input_tokens: 10,
+            cached_tokens: 0,
+            output_tokens: 0,
+            ..Default::default()
+        });
+        st.add_probe("a1", now - 4, 1.0, 100, "pro");
+
+        // a1 locally burns 200 more tokens (20pp at its rate) — unreported
+        // yet; raw snapshot still favors a1 (10 < 20) but shadow makes it 30
+        p.accrue("a1", "gpt-x", 200);
+        let c = p.candidates("gpt-5.5").unwrap();
+        // shadow pushes a1 to 30 => a2 (20%) first
+        assert_eq!(
+            c[0].id,
+            "a2",
+            "unreported burn must demote a1; got {:?}",
+            c.iter().map(|x| x.id.clone()).collect::<Vec<_>>()
+        );
+
+        // snapshot arrives: reconcile clears the shadow, raw ordering returns
+        p.observe(
+            "a1",
+            "default",
+            Quota {
+                primary_pct: 12.0,
+                secondary_pct: 12.0,
+                ..Default::default()
+            },
+        );
+        let c = p.candidates("gpt-5.5").unwrap();
+        assert_eq!(
+            c[0].id, "a1",
+            "12% beats 20% once the snapshot reports reality"
+        );
     }
 }
