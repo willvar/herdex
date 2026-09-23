@@ -6,6 +6,10 @@ description = "codex-only account pool gateway (Rust port of herdex-go)"
 
 [dependencies]
 tokio = { version = "1", features = ["full"] }
+tokio-rustls = { version = "0.26", default-features = false, features = ["aws_lc_rs"] }
+hyper-util = { version = "0.1", features = ["server", "server-auto", "tokio"] }
+rcgen = { version = "0.14", default-features = false, features = ["aws_lc_rs", "pem"] }
+rustls-pemfile = "2"
 axum = { version = "0.8", default-features = false, features = ["http1", "tokio", "json", "query"] }
 rust-embed = { version = "8", features = ["interpolate-folder-path"] }
 # TLS 指纹同源：与 codex-rs Cargo.lock 逐版本一致

@@ -52,6 +52,8 @@ pub struct Config {
     /// request_log retention in days; missing -> 730 (2 years), 0 -> keep forever
     #[serde(default)]
     pub retention_days: Option<i64>,
+    #[serde(default)]
+    pub tls: TlsCfg,
 }
 
 /// Loads config with env interpolation (`env: NAME` mapping/scalar and
@@ -65,6 +67,45 @@ pub fn load(path: &str) -> Result<Config, String> {
     cfg.apply_defaults();
     cfg.validate()?;
     Ok(cfg)
+}
+
+/// Native TLS termination: a locally-generated private CA signs a leaf for
+/// the configured hosts (IP SANs allowed), so codex can talk to a
+/// domain-less LAN gateway over HTTPS with `CODEX_CA_CERTIFICATE`.
+#[derive(Clone, Deserialize)]
+pub struct TlsCfg {
+    /// default off — pure-HTTP deployments keep working as before
+    #[serde(default)]
+    pub enabled: bool,
+    #[serde(default)]
+    pub port: u16,
+    /// DNS names / IPs the leaf certificate must cover
+    #[serde(default)]
+    pub hosts: Vec<String>,
+}
+
+impl Default for TlsCfg {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            port: 8443,
+            hosts: Vec::new(),
+        }
+    }
+}
+
+impl TlsCfg {
+    pub fn enabled_hosts(&self) -> Vec<String> {
+        let mut hosts = self.hosts.clone();
+        hosts.retain(|h| !h.trim().is_empty());
+        if !hosts.contains(&"localhost".to_string()) {
+            hosts.push("localhost".into());
+        }
+        if !hosts.iter().any(|h| h == "127.0.0.1") {
+            hosts.push("127.0.0.1".into());
+        }
+        hosts
+    }
 }
 
 impl Config {

@@ -329,6 +329,25 @@ pub fn build_http_client() -> reqwest::Client {
 /// Assembles the complete router (client + manage + panel redirect +
 /// chatgpt-backend fallback proxy).
 /// Extracted so tests can catch route conflicts without starting a server.
+async fn ca_pem(
+    axum::extract::State(app): axum::extract::State<AppHandle>,
+) -> axum::response::Response {
+    use axum::response::IntoResponse;
+    let path = std::path::Path::new(&app.cfg.state_root).join("herdex-ca.pem");
+    match std::fs::read_to_string(&path) {
+        Ok(pem) => (
+            [(axum::http::header::CONTENT_TYPE, "application/x-pem-file")],
+            pem,
+        )
+            .into_response(),
+        Err(_) => (
+            axum::http::StatusCode::NOT_FOUND,
+            "tls not enabled or CA not generated yet",
+        )
+            .into_response(),
+    }
+}
+
 pub fn build_router(app: AppHandle) -> axum::Router {
     // axum defaults to 2MB request bodies, which a single base64 image in a
     // codex request would blow through; local/LAN only, so be generous
@@ -337,6 +356,9 @@ pub fn build_router(app: AppHandle) -> axum::Router {
     Router::new()
         .merge(client)
         .merge(manage_router)
+        // the CA certificate is public bootstrap material: served unauthenticated
+        // so a fresh client can fetch it over plain HTTP before switching to HTTPS
+        .route("/ca.pem", axum::routing::get(ca_pem))
         .route(
             "/manage",
             axum::routing::get(|| async { axum::response::Redirect::temporary("/manage/panel/") }),
