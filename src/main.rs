@@ -92,6 +92,29 @@ async fn async_main(cfg: config::Config) {
         cfg.listen,
         cfg.state_root
     );
+    let tls_acceptor = if cfg.tls.enabled {
+        match herdex::tls::server_config(&cfg.state_root, &cfg.tls) {
+            Ok(server) => {
+                // single port: `listen` itself serves TLS — no separate
+                // plaintext port, no reverse proxy needed
+                log::info!(
+                    "herdex TLS enabled: {} serves HTTPS (CA: {}/herdex-ca.pem)",
+                    cfg.listen,
+                    cfg.state_root
+                );
+                Some(tokio_rustls::TlsAcceptor::from(server))
+            }
+            Err(e) => {
+                // misconfigured TLS is a deployment failure — silently
+                // serving plain HTTP behind an intended-HTTPS setup would
+                // leak credentials
+                log::error!("tls: {e}");
+                std::process::exit(1);
+            }
+        }
+    } else {
+        None
+    };
     let listener = match tokio::net::TcpListener::bind(&cfg.listen).await {
         Ok(l) => l,
         Err(e) => {
@@ -99,57 +122,30 @@ async fn async_main(cfg: config::Config) {
             std::process::exit(1);
         }
     };
-    if cfg.tls.enabled {
-        // native HTTPS for the domain-less LAN: self-signed CA + leaf with
-        // IP SANs, clients load the CA via CODEX_CA_CERTIFICATE
-        match herdex::tls::server_config(&cfg.state_root, &cfg.tls) {
-            Ok(server) => {
-                let port = if cfg.tls.port == 0 {
-                    8443
-                } else {
-                    cfg.tls.port
+    if let Some(acceptor) = tls_acceptor {
+        let app = hyper_util::service::TowerToHyperService::new(root.clone().into_service());
+        loop {
+            let (tcp, _) = match listener.accept().await {
+                Ok(x) => x,
+                Err(e) => {
+                    log::error!("accept: {e}");
+                    continue;
+                }
+            };
+            let acceptor = acceptor.clone();
+            let app = app.clone();
+            tokio::spawn(async move {
+                let Ok(tls) = acceptor.accept(tcp).await else {
+                    return;
                 };
-                let bind = match cfg.listen.rsplit_once(':') {
-                    Some((host, _)) => format!("{host}:{port}"),
-                    None => format!("0.0.0.0:{port}"),
-                };
-                let tls_app = root.clone();
-                tokio::spawn(async move {
-                    let acceptor = tokio_rustls::TlsAcceptor::from(server);
-                    let listener = match tokio::net::TcpListener::bind(&bind).await {
-                        Ok(l) => l,
-                        Err(e) => {
-                            log::error!("tls bind {bind}: {e}");
-                            return;
-                        }
-                    };
-                    log::info!("herdex listening on https://{bind}");
-                    loop {
-                        let (tcp, _) = match listener.accept().await {
-                            Ok(x) => x,
-                            Err(_) => continue,
-                        };
-                        let acceptor = acceptor.clone();
-                        let app = hyper_util::service::TowerToHyperService::new(
-                            tls_app.clone().into_service(),
-                        );
-                        tokio::spawn(async move {
-                            let Ok(tls) = acceptor.accept(tcp).await else {
-                                return;
-                            };
-                            let _ = hyper_util::server::conn::auto::Builder::new(
-                                hyper_util::rt::TokioExecutor::new(),
-                            )
-                            .serve_connection_with_upgrades(hyper_util::rt::TokioIo::new(tls), app)
-                            .await;
-                        });
-                    }
-                });
-            }
-            Err(e) => log::warn!("tls disabled: {e}"),
+                let _ = hyper_util::server::conn::auto::Builder::new(
+                    hyper_util::rt::TokioExecutor::new(),
+                )
+                .serve_connection_with_upgrades(hyper_util::rt::TokioIo::new(tls), app)
+                .await;
+            });
         }
-    }
-    if let Err(e) = axum::serve(listener, root).await {
+    } else if let Err(e) = axum::serve(listener, root).await {
         log::error!("serve: {e}");
         std::process::exit(1);
     }

@@ -25,5 +25,4 @@ level = "info"
 
 # [tls]
 # enabled = true
-# port = 8443
-# hosts = ["192.168.168.254"]
+# hosts = []   # 留空自动探测本机 IP 与主机名；启用后 listen 端口即 HTTPS-only

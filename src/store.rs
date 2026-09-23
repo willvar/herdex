@@ -770,6 +770,26 @@ impl Store {
         .map_err(|e| e.to_string())
     }
 
+    /// Latest probe snapshot per account (for hydrating the pool's
+    /// in-memory quota map after a restart — the panel would otherwise
+    /// show empty capacity until the first usage poll).
+    pub fn latest_probes(&self) -> Result<Vec<(String, f64, i64, i64)>, String> {
+        let conn = self.conn.lock().unwrap_or_else(|e| e.into_inner());
+        let mut stmt = conn
+            .prepare(
+                r#"SELECT p.account_id, p.used_pct, p.reset_at, p.ts
+                   FROM usage_probes p
+                   JOIN (SELECT account_id, MAX(ts) mts FROM usage_probes GROUP BY account_id) m
+                     ON m.account_id = p.account_id AND m.mts = p.ts"#,
+            )
+            .map_err(|e| e.to_string())?;
+        let rows = stmt
+            .query_map([], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?)))
+            .map_err(|e| e.to_string())?;
+        rows.collect::<Result<Vec<_>, _>>()
+            .map_err(|e| e.to_string())
+    }
+
     /// Empirical capacity calibration for one account, by replaying the probe
     /// sequence against request_log. Pure replay — stateless and
     /// deterministic. Reset-type events (window rollover, banked-credit

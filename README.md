@@ -98,11 +98,11 @@ codex 端三处配置如下，`/status` 显示池子聚合：
 ```toml
 # ~/.codex/config.toml（片段）
 model_provider = "herdex"
-chatgpt_base_url = "https://<herdex-host>:8443"
+chatgpt_base_url = "https://<herdex-host>:<listen 端口，默认同 8088>"
 
 [model_providers.herdex]
 name = "herdex"
-base_url = "https://<herdex-host>:8443/v1"
+base_url = "https://<herdex-host>:<listen 端口，默认同 8088>/v1"
 wire_api = "responses"
 requires_openai_auth = true
 experimental_bearer_token = "<herdex API key>"
@@ -114,12 +114,13 @@ experimental_bearer_token = "<herdex API key>"
 
 # PAT 的 whoami 校验端点重定向到网关（env 变量，无 config 入口）
 codex() {
-  CODEX_AUTHAPI_BASE_URL="https://<herdex-host>:8443" \
+  CODEX_AUTHAPI_BASE_URL="https://<herdex-host>:<listen 端口，默认同 8088>" \
   CODEX_CA_CERTIFICATE="$HOME/.codex/herdex-ca.pem" command codex "$@"
 }
 ```
 
-`/etc/herdex/herdex.toml` 中启用（默认关闭，纯 HTTP 部署不受影响）：
+`/etc/herdex/herdex.toml` 中启用（默认关闭，纯 HTTP 部署不受影响；启用后
+`listen` 端口即为 HTTPS-only，无明文通道，CA 通过服务器文件拷贝分发）：
 
 ```toml
 [tls]

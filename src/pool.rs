@@ -296,6 +296,37 @@ impl Pool {
         Ok(active)
     }
 
+    /// Hydrates the in-memory quota map from the latest persisted probes —
+    /// a restart would otherwise blank the capacity panel until the first
+    /// upstream usage poll. Stale values are corrected by the next poll.
+    pub fn hydrate_from_store(&self) {
+        let Ok(latest) = self.shared.st.latest_probes() else {
+            return;
+        };
+        let mut inner = self.shared.state.lock().unwrap_or_else(|e| e.into_inner());
+        let now = (self.shared.now)();
+        for (acc_id, pct, reset_at, ts) in latest {
+            let key = (acc_id.clone(), "default".to_string());
+            if let Some(existing) = inner.quota.get(&key) {
+                if existing.observed_at >= now - 60 {
+                    continue; // a fresh poll already superseded the probe
+                }
+            }
+            inner.quota.insert(
+                key,
+                Quota {
+                    primary_pct: pct,
+                    secondary_pct: pct,
+                    primary_reset_at: reset_at,
+                    secondary_reset_at: reset_at,
+                    primary_window_secs: 0,
+                    secondary_window_secs: 0,
+                    observed_at: ts,
+                },
+            );
+        }
+    }
+
     /// Session affinity: the account a session is sticky to, if the pin is
     /// fresh and was made for the same model. Refreshes the sliding TTL.
     pub fn pinned(&self, session_key: &str, model: &str) -> Option<String> {
