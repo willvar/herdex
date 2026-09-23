@@ -24,5 +24,5 @@ beta-features = "multi_agent"
 level = "info"
 
 # [tls]
-# enabled = true
-# hosts = []   # 留空自动探测本机 IP 与主机名；启用后 listen 端口即 HTTPS-only
+# hosts = []   # 可选；留空自动探测本机 IP 与主机名作为 SAN。
+               # TLS 无条件启用：listen 端口即 HTTPS-only（codex 0.156+ 只吃 HTTPS）

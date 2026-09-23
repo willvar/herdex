@@ -92,29 +92,20 @@ async fn async_main(cfg: config::Config) {
         cfg.listen,
         cfg.state_root
     );
-    let tls_acceptor = if cfg.tls.enabled {
-        match herdex::tls::server_config(&cfg.state_root, &cfg.tls) {
-            Ok(server) => {
-                // single port: `listen` itself serves TLS — no separate
-                // plaintext port, no reverse proxy needed
-                log::info!(
-                    "herdex TLS enabled: {} serves HTTPS (CA: {}/herdex-ca.pem)",
-                    cfg.listen,
-                    cfg.state_root
-                );
-                Some(tokio_rustls::TlsAcceptor::from(server))
-            }
-            Err(e) => {
-                // misconfigured TLS is a deployment failure — silently
-                // serving plain HTTP behind an intended-HTTPS setup would
-                // leak credentials
-                log::error!("tls: {e}");
-                std::process::exit(1);
-            }
+    // TLS is unconditional: herdex serves codex, and codex 0.156+ only
+    // accepts HTTPS backends (workspace routing rejects plain HTTP)
+    let acceptor = match herdex::tls::server_config(&cfg.state_root, &cfg.tls) {
+        Ok(server) => tokio_rustls::TlsAcceptor::from(server),
+        Err(e) => {
+            log::error!("tls: {e}");
+            std::process::exit(1);
         }
-    } else {
-        None
     };
+    log::info!(
+        "herdex serving HTTPS on {} (CA: {}/herdex-ca.pem)",
+        cfg.listen,
+        cfg.state_root
+    );
     let listener = match tokio::net::TcpListener::bind(&cfg.listen).await {
         Ok(l) => l,
         Err(e) => {
@@ -122,31 +113,25 @@ async fn async_main(cfg: config::Config) {
             std::process::exit(1);
         }
     };
-    if let Some(acceptor) = tls_acceptor {
-        let app = hyper_util::service::TowerToHyperService::new(root.clone().into_service());
-        loop {
-            let (tcp, _) = match listener.accept().await {
-                Ok(x) => x,
-                Err(e) => {
-                    log::error!("accept: {e}");
-                    continue;
-                }
+    let app = hyper_util::service::TowerToHyperService::new(root.into_service());
+    loop {
+        let (tcp, _) = match listener.accept().await {
+            Ok(x) => x,
+            Err(e) => {
+                log::error!("accept: {e}");
+                continue;
+            }
+        };
+        let acceptor = acceptor.clone();
+        let app = app.clone();
+        tokio::spawn(async move {
+            let Ok(tls) = acceptor.accept(tcp).await else {
+                return;
             };
-            let acceptor = acceptor.clone();
-            let app = app.clone();
-            tokio::spawn(async move {
-                let Ok(tls) = acceptor.accept(tcp).await else {
-                    return;
-                };
-                let _ = hyper_util::server::conn::auto::Builder::new(
-                    hyper_util::rt::TokioExecutor::new(),
-                )
-                .serve_connection_with_upgrades(hyper_util::rt::TokioIo::new(tls), app)
-                .await;
-            });
-        }
-    } else if let Err(e) = axum::serve(listener, root).await {
-        log::error!("serve: {e}");
-        std::process::exit(1);
+            let _ =
+                hyper_util::server::conn::auto::Builder::new(hyper_util::rt::TokioExecutor::new())
+                    .serve_connection_with_upgrades(hyper_util::rt::TokioIo::new(tls), app)
+                    .await;
+        });
     }
 }

@@ -72,26 +72,14 @@ pub fn load(path: &str) -> Result<Config, String> {
 /// Native TLS termination: a locally-generated private CA signs a leaf for
 /// the configured hosts (IP SANs allowed), so codex can talk to a
 /// domain-less LAN gateway over HTTPS with `CODEX_CA_CERTIFICATE`.
-#[derive(Clone, Deserialize)]
+#[derive(Clone, Deserialize, Default)]
 pub struct TlsCfg {
-    /// default off — pure-HTTP deployments keep working as before
-    #[serde(default)]
-    pub enabled: bool,
-    #[serde(default)]
-    pub port: u16,
-    /// DNS names / IPs the leaf certificate must cover
+    /// DNS names / IPs the leaf certificate must cover; empty = auto
+    /// (all local non-loopback IPs + hostname). TLS is unconditional:
+    /// herdex serves codex, and codex 0.156+ only speaks HTTPS to its
+    /// backend.
     #[serde(default)]
     pub hosts: Vec<String>,
-}
-
-impl Default for TlsCfg {
-    fn default() -> Self {
-        Self {
-            enabled: false,
-            port: 8443,
-            hosts: Vec::new(),
-        }
-    }
 }
 
 impl TlsCfg {
