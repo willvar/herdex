@@ -139,17 +139,6 @@ struct CalibrationProbe {
     log_seq: Option<i64>,
 }
 
-/// Model catalog served to clients; single source of truth for the proxy
-/// /v1/models list and the panel's excluded-model checkboxes.
-pub const MODEL_CATALOG: [&str; 6] = [
-    "gpt-5.5",
-    "gpt-5.6-sol",
-    "gpt-5.6-terra",
-    "gpt-5.6-luna",
-    "gpt-6-astra",
-    "gpt-5.3-codex-spark",
-];
-
 pub fn now_secs() -> i64 {
     SystemTime::now()
         .duration_since(UNIX_EPOCH)

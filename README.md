@@ -87,12 +87,15 @@ systemd 部署样例见 `deploy/herdex.service`（含完整沙箱加固）。
 
 ## CLI 接入（PAT 虚拟账号模式）
 
-Codex 0.156.1 起的工作区路由要求 HTTPS 后端。herdex 内建 TLS：在配置中启用
-`[tls]` 后首次启动会自动生成私有 CA 并签发叶子证书（SAN 覆盖配置的 hosts，
-支持 IP 地址，无需域名）。CA 通过面板头部「下载 CA 证书」或
-`https://<host>:<listen 端口>/ca.pem` 直链分发；首次访问会提示证书不受信任——
-点「高级→继续访问」进面板下载 CA 即可，属预期流程。客户端让 Codex 显式额外
-信任该 CA（`CODEX_CA_CERTIFICATE`），不必安装到系统信任库，也不关闭证书校验。
+Codex 0.156.1 起的工作区路由要求 HTTPS 后端。herdex 内建 TLS：首次启动自动生成
+私有 CA 并签发叶子证书（SAN 自动覆盖本机全部非回环 IP 与主机名，或由 `[tls]`
+配置指定，支持 IP 地址，无需域名）。CA 通过面板头部「下载 CA 证书」或
+`http://<host>:<listen 端口>/ca.pem` 直链分发（该端口同时说 HTTP 和 HTTPS，
+见下）。客户端让 Codex 显式额外信任该 CA（`CODEX_CA_CERTIFICATE`），不必安装到
+系统信任库，也不关闭证书校验。
+
+**同一端口双协议**：codex 是唯一强制 HTTPS 的客户端；opencode、curl 等直接
+用 `http://` 访问同一端口即可，**完全不需要任何证书操作**。
 
 codex 端三处配置如下，`/status` 显示池子聚合：
 
@@ -120,15 +123,18 @@ codex() {
 }
 ```
 
-HTTPS 是唯一形态——herdex 服务的是 codex，而 codex 0.156+ 只接受 HTTPS
-后端（工作区路由拒绝明文 HTTP）。无需配置段，`listen` 端口即 HTTPS-only；
+其它客户端（opencode 等，无 HTTPS 强制）：
+
+```jsonc
+// ~/.config/opencode/opencode.json（片段）
+{ "baseURL": "http://<herdex-host>:<listen 端口>/v1" }   // 无需 CODEX_CA_CERTIFICATE
+```
+
 `[tls]` 段仅用于自定义证书 SAN：
 
 ```toml
 [tls]
-enabled = true
-port = 8443
-hosts = ["192.168.168.254"]   # 叶子证书 SAN：IP 或域名均可
+hosts = ["192.168.168.254"]   # 叶子证书 SAN：IP 或域名均可；留空自动探测
 ```
 
 函数放入 `~/.bashrc` 后，在已有终端执行 `source ~/.bashrc`。若使用系统已信任的
