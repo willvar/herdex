@@ -430,6 +430,9 @@ pub fn spawn_refresh_loop(app: AppHandle) {
                     if let Err(e) = app.fetch_usage(a).await {
                         log::warn!("usage poll: {} {e}", a.email);
                     }
+                    // per-account model catalog: feeds the entitlement filter
+                    // and the /v1/models intersection
+                    app.refresh_models(a).await;
                 }
             }
             // daily request_log prune (retention-days, 0 = keep forever)

@@ -92,8 +92,10 @@ async fn async_main(cfg: config::Config) {
         cfg.listen,
         cfg.state_root
     );
-    // TLS is unconditional: herdex serves codex, and codex 0.156+ only
-    // accepts HTTPS backends (workspace routing rejects plain HTTP)
+    // codex's workspace routing demands HTTPS; other clients (opencode,
+    // curl) speak plain HTTP on the same port. peek() is non-destructive:
+    // TLS ClientHello starts with 0x16, HTTP methods are ASCII — mutually
+    // exclusive, so the first byte decides the protocol.
     let acceptor = match herdex::tls::server_config(&cfg.state_root, &cfg.tls) {
         Ok(server) => tokio_rustls::TlsAcceptor::from(server),
         Err(e) => {
@@ -102,7 +104,7 @@ async fn async_main(cfg: config::Config) {
         }
     };
     log::info!(
-        "herdex serving HTTPS on {} (CA: {}/herdex-ca.pem)",
+        "herdex serving HTTPS + HTTP on {} (CA: {}/herdex-ca.pem)",
         cfg.listen,
         cfg.state_root
     );
@@ -113,7 +115,6 @@ async fn async_main(cfg: config::Config) {
             std::process::exit(1);
         }
     };
-    let app = hyper_util::service::TowerToHyperService::new(root.into_service());
     loop {
         let (tcp, _) = match listener.accept().await {
             Ok(x) => x,
@@ -123,15 +124,30 @@ async fn async_main(cfg: config::Config) {
             }
         };
         let acceptor = acceptor.clone();
-        let app = app.clone();
+        let tls_app = root.clone();
+        let http_app = root.clone();
         tokio::spawn(async move {
-            let Ok(tls) = acceptor.accept(tcp).await else {
-                return;
-            };
-            let _ =
-                hyper_util::server::conn::auto::Builder::new(hyper_util::rt::TokioExecutor::new())
-                    .serve_connection_with_upgrades(hyper_util::rt::TokioIo::new(tls), app)
-                    .await;
+            let mut probe = [0u8; 1];
+            let n = tcp.peek(&mut probe).await.unwrap_or(0);
+            let is_tls = n == 1 && probe[0] == 0x16;
+            if is_tls {
+                let Ok(tls) = acceptor.accept(tcp).await else {
+                    return;
+                };
+                let app = hyper_util::service::TowerToHyperService::new(tls_app.into_service());
+                let _ = hyper_util::server::conn::auto::Builder::new(
+                    hyper_util::rt::TokioExecutor::new(),
+                )
+                .serve_connection_with_upgrades(hyper_util::rt::TokioIo::new(tls), app)
+                .await;
+            } else {
+                let app = hyper_util::service::TowerToHyperService::new(http_app.into_service());
+                let _ = hyper_util::server::conn::auto::Builder::new(
+                    hyper_util::rt::TokioExecutor::new(),
+                )
+                .serve_connection_with_upgrades(hyper_util::rt::TokioIo::new(tcp), app)
+                .await;
+            }
         });
     }
 }
