@@ -89,18 +89,13 @@ async fn models(State(app): State<AppHandle>, headers: HeaderMap) -> Response {
     }
     // priority: config override > upstream-discovered intersection > builtin
     let configured = app.cfg.models.clone();
+    // no hardcoded fallback: an empty list is honest ("discovery pending").
+    // The background loop refreshes per-account catalogs on start and every
+    // cycle, so this only shows empty in the first seconds after boot.
     let slugs: Vec<String> = if !configured.is_empty() {
         configured
     } else {
-        let common = app.pool.common_models();
-        if common.is_empty() {
-            crate::store::MODEL_CATALOG
-                .iter()
-                .map(|m| m.to_string())
-                .collect()
-        } else {
-            common
-        }
+        app.pool.common_models()
     };
     let data: Vec<serde_json::Value> = slugs
         .iter()
