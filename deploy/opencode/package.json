@@ -1,0 +1,9 @@
+{
+  "name": "herdex-models",
+  "private": true,
+  "type": "module",
+  "main": "index.js",
+  "dependencies": {
+    "@opencode/plugin": "2.0.16"
+  }
+}
