@@ -40,14 +40,16 @@ cd web/panel && npm ci && npm run build && cd -   # 面板产物嵌入二进制�
 cargo build --release   # 需要 cmake（aws-lc-rs 构建）
 ```
 
-面板开发：`cd web/panel && npm run dev`（热重载，/manage/api 代理到网关）。
+面板开发：`cd web/panel && npm run dev`（热重载，/manage/api 默认代理到
+`http://127.0.0.1:8317`）。远程网关或自定义端口通过启动环境变量指定：
+`HERDEX_DEV_PROXY="http://<herdex-host>:<listen 端口>" npm run dev`。
 改动 web/panel/src 后需 `npm run build` 再 `cargo build` 才会进入二进制。
 
 ## 配置
 
 ```toml
 # /etc/herdex/herdex.toml
-listen = "127.0.0.1:8319"
+listen = "127.0.0.1:8317"
 state-root = "/var/lib/herdex"        # SQLite 状态库目录
 retention-days = 730                  # 请求日志保留天数；缺省 730，0 = 永久
 
@@ -123,18 +125,13 @@ codex() {
 }
 ```
 
-其它客户端（opencode 等，无 HTTPS 强制）：
-
-```jsonc
-// ~/.config/opencode/opencode.json（片段）
-{ "baseURL": "http://<herdex-host>:<listen 端口>/v1" }   // 无需 CODEX_CA_CERTIFICATE
-```
+OpenCode v2 的动态模型接入见下方[安装说明](#opencode-v2-接入)。
 
 `[tls]` 段仅用于自定义证书 SAN：
 
 ```toml
 [tls]
-hosts = ["127.0.0.1"]   # 叶子证书 SAN：IP 或域名均可；留空自动探测
+hosts = []   # 自动探测本机 IP 与主机名；也可显式指定服务器的 IP 或域名
 ```
 
 函数放入 `~/.bashrc` 后，在已有终端执行 `source ~/.bashrc`。若使用系统已信任的
@@ -159,6 +156,13 @@ herdex 上，凭据始终是 herdex API key，无客户端 OAuth。
 
 注意：herdex 是 CLI 的认证依赖；网关不可达、API key 无效或禁用、HTTPS 证书不受
 信任时，codex 会在身份获取或工作区发现阶段拒绝启动（fail-closed）。
+
+## OpenCode v2 接入
+
+配套插件位于 [`deploy/opencode/`](deploy/opencode/README.md)：
+启动时从 herdex 拉取模型清单，每分钟刷新，继承 OpenCode 目录中的同名模型显示名、
+推理强度、能力与限制。使用 Responses API，可通过 `http://<herdex-host>:<listen 端口>/v1`
+连接，无需证书配置或手动维护模型列表。安装与配置步骤见插件目录的 README。
 
 ## 测试
 

@@ -254,7 +254,7 @@ mod tests {
     #[test]
     fn full_overrides() {
         let cfg = load(&write_tmp(
-            "listen = \"127.0.0.1:8317\"\nheader-defaults = { originator = \"codex_cli_rs\" }\n[manage]\nkey = \"cpm-x\"\n[oauth]\nissuer = \"https://fake.invalid\"\ncallback-port = 1456\n",
+            "listen = \"192.0.2.10:8317\"\nheader-defaults = { originator = \"codex_cli_rs\" }\n[manage]\nkey = \"cpm-x\"\n[oauth]\nissuer = \"https://fake.invalid\"\ncallback-port = 1456\n",
         ))
         .unwrap();
         assert_eq!(cfg.oauth.issuer, "https://fake.invalid");
