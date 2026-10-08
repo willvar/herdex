@@ -34,11 +34,12 @@ const FAST_SERVICE_TIER: &str = "priority";
 
 pub fn router() -> axum::Router<AppHandle> {
     axum::Router::new()
-        // model discovery: codex CLI reads {chatgpt_base_url}/models, other
-        // clients read /v1/models — both serve the enabled-account union;
-        // per-request routing filters by each account's catalog
+        // model discovery: codex CLI reads {chatgpt_base_url}/models and gets
+        // the raw enabled-account union; other clients read /v1/models and
+        // also get the server-side Fast aliases. Per-request routing filters
+        // by each account's catalog.
         .route("/models", axum::routing::get(models))
-        .route("/v1/models", axum::routing::get(models))
+        .route("/v1/models", axum::routing::get(v1_models))
         .route("/v1/responses", axum::routing::post(responses))
         .route(
             "/backend-api/codex/responses",
@@ -89,11 +90,21 @@ fn auth_check(app: &App, headers: &HeaderMap) -> Result<String, Response> {
     }
 }
 
-/// Model discovery: the union of existing, enabled accounts' discovered
-/// catalogs (or the config override), plus server-side Fast aliases for GPT
-/// models. Requests skip accounts whose known catalogs lack the requested
-/// model; alias requests are normalized before selection.
+/// Codex model discovery: the raw union of existing, enabled accounts'
+/// discovered catalogs (or the config override). Requests skip accounts whose
+/// known catalogs lack the requested model; alias requests are normalized
+/// before selection.
 async fn models(State(app): State<AppHandle>, headers: HeaderMap) -> Response {
+    model_list(app, headers, false).await
+}
+
+/// OpenAI-compatible model discovery: the enabled-account union plus
+/// server-side Fast aliases for GPT models.
+async fn v1_models(State(app): State<AppHandle>, headers: HeaderMap) -> Response {
+    model_list(app, headers, true).await
+}
+
+async fn model_list(app: AppHandle, headers: HeaderMap, include_fast_aliases: bool) -> Response {
     if auth_check(&app, &headers).is_err() {
         return (StatusCode::UNAUTHORIZED, "invalid api key").into_response();
     }
@@ -116,7 +127,12 @@ async fn models(State(app): State<AppHandle>, headers: HeaderMap) -> Response {
     } else {
         app.cfg.models.clone()
     };
-    let data: Vec<serde_json::Value> = advertised_model_ids(&slugs)
+    let model_ids = if include_fast_aliases {
+        advertised_model_ids(&slugs)
+    } else {
+        slugs
+    };
+    let data: Vec<serde_json::Value> = model_ids
         .iter()
         .map(|m| serde_json::json!({"id": m, "object": "model", "owned_by": "openai"}))
         .collect();
