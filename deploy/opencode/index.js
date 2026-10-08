@@ -61,17 +61,26 @@ export default Plugin.define({
           for (const field of METADATA) {
             if (catalog[field] !== undefined) model[field] = structuredClone(catalog[field])
           }
-          // Inherit reasoning choices, never another provider's routing/auth overrides.
-          model.variants = (catalog.variants ?? []).map((variant) => {
-            const settings = {}
-            for (const field of ["reasoningEffort", "reasoningSummary", "include"]) {
-              if (variant.settings?.[field] !== undefined) {
-                settings[field] = structuredClone(variant.settings[field])
-              }
-            }
-            return { id: variant.id, settings }
-          })
         }
+        // Inherit selected semantic choices, never another provider's routing/auth overrides.
+        const variants = (catalog?.variants ?? []).map((variant) => {
+          const settings = {}
+          for (const field of ["reasoningEffort", "reasoningSummary", "include", "serviceTier"]) {
+            if (variant.settings?.[field] !== undefined) {
+              settings[field] = structuredClone(variant.settings[field])
+            }
+          }
+          return { id: variant.id, settings }
+        })
+        if (/^gpt-/i.test(entry.id)) {
+          const fast = variants.find((variant) => variant.id === "fast")
+          if (fast) {
+            fast.settings = { ...fast.settings, serviceTier: "priority" }
+          } else {
+            variants.push({ id: "fast", settings: { serviceTier: "priority" } })
+          }
+        }
+        model.variants = variants
         model.name = catalog?.name || entry.name || prettyName(entry.id)
         return model
       })
