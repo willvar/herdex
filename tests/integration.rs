@@ -21,6 +21,7 @@ type StreamChunk = Result<Bytes, std::io::Error>;
 #[derive(Clone)]
 struct FakeUp {
     calls: Arc<Mutex<Vec<String>>>, // chatgpt-account-id seen per call
+    bodies: Arc<Mutex<Vec<String>>>,
     behavior: Arc<Mutex<Behavior>>,
     usage: Arc<Mutex<HashMap<String, (StatusCode, Value)>>>,
     response_headers: Arc<Mutex<HeaderMap>>,
@@ -71,6 +72,7 @@ impl FakeUp {
                     .unwrap_or("")
                     .to_string();
                 self.calls.lock().unwrap().push(acct);
+                self.bodies.lock().unwrap().push(body.clone());
                 let behavior = self.behavior.lock().unwrap().clone();
                 let n = self.calls.lock().unwrap().len();
                 if let Behavior::HttpErrorFirst(status, text, count) = &behavior {
@@ -219,6 +221,7 @@ async fn harness(accounts: &[&str]) -> Harness {
 
     let upstream = FakeUp {
         calls: Arc::new(Mutex::new(Vec::new())),
+        bodies: Arc::new(Mutex::new(Vec::new())),
         behavior: Arc::new(Mutex::new(Behavior::Ok)),
         usage: Default::default(),
         response_headers: Default::default(),
@@ -955,6 +958,37 @@ async fn fast_tier_survives_stream_failover_on_every_logged_attempt() {
         logs[0].diagnostics.as_ref().unwrap().request_id
     );
     assert!(logs[0].error.is_empty());
+}
+
+#[tokio::test]
+async fn fast_model_alias_rewrites_model_and_forces_priority() {
+    let h = harness(&["a1"]).await;
+    let response = reqwest::Client::new()
+        .post(format!("{}/v1/responses", h.proxy_url))
+        .bearer_auth("sk-test")
+        .json(&json!({
+            "model": "gpt-5.5-fast",
+            "input": "hi",
+            "service_tier": "default"
+        }))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(response.status(), 200);
+    response.text().await.unwrap();
+
+    let bodies = h.upstream.bodies.lock().unwrap();
+    assert_eq!(bodies.len(), 1);
+    let forwarded: Value = serde_json::from_str(&bodies[0]).unwrap();
+    assert_eq!(forwarded["model"], "gpt-5.5");
+    assert_eq!(forwarded["service_tier"], "priority");
+    assert_eq!(forwarded["input"], "hi");
+    drop(bodies);
+
+    let logs = h.store.recent_logs(5).unwrap();
+    assert_eq!(logs.len(), 1);
+    assert_eq!(logs[0].model, "gpt-5.5");
+    assert_eq!(logs[0].service_tier.as_deref(), Some("priority"));
 }
 
 #[tokio::test]
