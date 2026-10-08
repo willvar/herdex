@@ -187,8 +187,8 @@ herdex 上，凭据始终是 herdex API key，无客户端 OAuth。
 
 配套插件位于 [`deploy/opencode/`](deploy/opencode/README.md)：
 启动时从 herdex 拉取模型清单，每分钟刷新，继承 OpenCode 目录中的同名模型显示名、
-推理强度、能力与限制；`gpt-*` 模型额外提供 `#fast`，映射为
-`service_tier: "priority"`。使用 Responses API，可通过
+推理强度、能力与限制；`gpt-*` 模型额外提供 `#fast` 及与推理档位组合的
+`#max-fast` 等选项，映射为 `service_tier: "priority"`。使用 Responses API，可通过
 `http://<herdex-host>:<listen 端口>/v1` 连接，无需证书配置或手动维护模型列表。
 安装与配置步骤见插件目录的 README。
 

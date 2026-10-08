@@ -79,6 +79,16 @@ export default Plugin.define({
           } else {
             variants.push({ id: "fast", settings: { serviceTier: "priority" } })
           }
+          for (const variant of [...variants]) {
+            if (variant.id === "fast" || variant.id.endsWith("-fast")) continue
+            if (variant.settings?.reasoningEffort === undefined) continue
+            const id = `${variant.id}-fast`
+            if (variants.some((candidate) => candidate.id === id)) continue
+            variants.push({
+              id,
+              settings: { ...variant.settings, serviceTier: "priority" },
+            })
+          }
         }
         model.variants = variants
         model.name = catalog?.name || entry.name || prettyName(entry.id)
