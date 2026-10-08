@@ -2,6 +2,7 @@
 //! driven through real HTTP requests (mirrors the Go proxy integration tests).
 
 use axum::body::{Body, Bytes};
+use axum::http::{HeaderMap, StatusCode};
 use axum::response::IntoResponse;
 use axum::Router;
 use herdex::app::App;
@@ -9,6 +10,7 @@ use herdex::config::Config;
 use herdex::pool::Pool;
 use herdex::proxy;
 use herdex::store::{Account, LogEntry, Store, UsageDim};
+use serde_json::{json, Value};
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
@@ -20,6 +22,8 @@ type StreamChunk = Result<Bytes, std::io::Error>;
 struct FakeUp {
     calls: Arc<Mutex<Vec<String>>>, // chatgpt-account-id seen per call
     behavior: Arc<Mutex<Behavior>>,
+    usage: Arc<Mutex<HashMap<String, (StatusCode, Value)>>>,
+    response_headers: Arc<Mutex<HeaderMap>>,
 }
 
 #[derive(Clone)]
@@ -33,12 +37,32 @@ enum Behavior {
     BomStreamErrorFirst(u32),
     ChunkedErrorFirst(usize),
     JsonResponse(String),
-    Streaming(Arc<tokio::sync::Mutex<Option<mpsc::Receiver<StreamChunk>>>>),
+    HttpErrorFirst(u16, String, usize),
+    Streaming {
+        status: u16,
+        receiver: Arc<tokio::sync::Mutex<Option<mpsc::Receiver<StreamChunk>>>>,
+    },
 }
 
 impl FakeUp {
     fn router(self) -> Router {
+        let usage = self.usage.clone();
         Router::new().route(
+            "/backend-api/wham/usage",
+            axum::routing::get(move |headers: HeaderMap| async move {
+                let id = headers
+                    .get("Chatgpt-Account-Id")
+                    .and_then(|v| v.to_str().ok())
+                    .unwrap_or("");
+                let (status, body) = usage
+                    .lock()
+                    .unwrap()
+                    .get(id)
+                    .cloned()
+                    .unwrap_or((StatusCode::BAD_GATEWAY, json!({"error": "probe unavailable"})));
+                (status, axum::Json(body)).into_response()
+            }),
+        ).route(
             "/responses",
             axum::routing::post(move |headers: axum::http::HeaderMap, body: String| async move {
                 let acct = headers
@@ -49,6 +73,13 @@ impl FakeUp {
                 self.calls.lock().unwrap().push(acct);
                 let behavior = self.behavior.lock().unwrap().clone();
                 let n = self.calls.lock().unwrap().len();
+                if let Behavior::HttpErrorFirst(status, text, count) = &behavior {
+                    if n <= *count {
+                        let mut response = (StatusCode::from_u16(*status).unwrap(), text.clone()).into_response();
+                        response.headers_mut().extend(self.response_headers.lock().unwrap().clone());
+                        return response;
+                    }
+                }
                 if let Behavior::JsonResponse(response) = &behavior {
                     return (
                         [(axum::http::header::CONTENT_TYPE, "application/json; charset=utf-8")],
@@ -56,7 +87,7 @@ impl FakeUp {
                     )
                         .into_response();
                 }
-                if let Behavior::Streaming(receiver) = &behavior {
+                if let Behavior::Streaming { status, receiver } = &behavior {
                     let mut receiver = receiver
                         .lock()
                         .await
@@ -67,11 +98,14 @@ impl FakeUp {
                             yield chunk;
                         }
                     };
-                    return (
+                    let mut response = (
+                        StatusCode::from_u16(*status).unwrap(),
                         [(axum::http::header::CONTENT_TYPE, "text/event-stream")],
                         Body::from_stream(stream),
                     )
                         .into_response();
+                    response.headers_mut().extend(self.response_headers.lock().unwrap().clone());
+                    return response;
                 }
                 if let Behavior::ChunkedErrorFirst(size) = behavior {
                     if n == 1 {
@@ -94,7 +128,7 @@ impl FakeUp {
                     }
                 }
                 let fail = match behavior {
-                    Behavior::Ok | Behavior::ChunkedErrorFirst(_) => false,
+                    Behavior::Ok | Behavior::ChunkedErrorFirst(_) | Behavior::HttpErrorFirst(..) => false,
                     Behavior::FailFirst(k) => n <= k as usize,
                     Behavior::AlwaysFail(_) => true,
                     // the stream-error case is a "successful" 200 whose body
@@ -102,7 +136,7 @@ impl FakeUp {
                     Behavior::StreamErrorFirst(k) | Behavior::BomStreamErrorFirst(k) => {
                         n <= k as usize
                     }
-                    Behavior::Streaming(_) | Behavior::JsonResponse(_) => unreachable!(),
+                    Behavior::Streaming { .. } | Behavior::JsonResponse(_) => unreachable!(),
                 };
                 if fail {
                     let status = match behavior {
@@ -133,13 +167,17 @@ impl FakeUp {
                     )
                         .into_response();
                 }
-                (
+                let mut response = (
                     axum::http::StatusCode::OK,
                     format!(
                         "data: {{\"type\":\"response.in_progress\"}}\n\ndata: {{\"type\": \"response.completed\", \"response\": {{\"body\": {body}, \"usage\": {{\"input_tokens\": 120, \"input_tokens_details\": {{\"cached_tokens\": 80}}, \"output_tokens\": 45}}}}}}\n\n"
                     ),
                 )
-                    .into_response()
+                    .into_response();
+                response
+                    .headers_mut()
+                    .extend(self.response_headers.lock().unwrap().clone());
+                response
             }),
         )
     }
@@ -150,6 +188,8 @@ struct Harness {
     upstream: FakeUp,
     store: Store,
     pool: Pool,
+    app: Arc<App>,
+    upstream_task: tokio::task::JoinHandle<()>,
     tmp: String,
 }
 
@@ -180,11 +220,14 @@ async fn harness(accounts: &[&str]) -> Harness {
     let upstream = FakeUp {
         calls: Arc::new(Mutex::new(Vec::new())),
         behavior: Arc::new(Mutex::new(Behavior::Ok)),
+        usage: Default::default(),
+        response_headers: Default::default(),
     };
     let up_router = upstream.clone().router();
     let up_listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
     let up_addr = up_listener.local_addr().unwrap();
-    tokio::spawn(async move { axum::serve(up_listener, up_router).await.unwrap() });
+    let upstream_task =
+        tokio::spawn(async move { axum::serve(up_listener, up_router).await.unwrap() });
 
     let cfg = Config {
         manage: herdex::config::ManageCfg {
@@ -206,13 +249,15 @@ async fn harness(accounts: &[&str]) -> Harness {
         store: store.clone(),
         pool: pool.clone(),
         http: reqwest::Client::new(),
-        usage_root: "https://chatgpt.com".into(),
+        model_version: std::sync::RwLock::new(None),
+        usage_root: format!("http://{up_addr}"),
         pending: Mutex::new(Default::default()),
         last_prune_day: std::sync::atomic::AtomicI64::new(0),
         learned_strips: std::sync::Mutex::new(std::collections::HashSet::new()),
         refresh_guards: tokio::sync::Mutex::new(HashMap::new()),
+        reset_guards: tokio::sync::Mutex::new(HashMap::new()),
     });
-    let pr = proxy::router().with_state(app);
+    let pr = proxy::router().with_state(app.clone());
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
     let proxy_addr = listener.local_addr().unwrap();
     tokio::spawn(async move { axum::serve(listener, pr).await.unwrap() });
@@ -222,12 +267,15 @@ async fn harness(accounts: &[&str]) -> Harness {
         upstream,
         store,
         pool,
+        app,
+        upstream_task,
         tmp: tmp.to_string_lossy().to_string(),
     }
 }
 
 impl Drop for Harness {
     fn drop(&mut self) {
+        self.upstream_task.abort();
         let _ = std::fs::remove_dir_all(&self.tmp);
     }
 }
@@ -245,9 +293,54 @@ async fn send_post(h: &Harness, model: &str, sid: &str) -> reqwest::Response {
 
 fn streaming_upstream(h: &Harness) -> mpsc::Sender<StreamChunk> {
     let (sender, receiver) = mpsc::channel(4);
-    *h.upstream.behavior.lock().unwrap() =
-        Behavior::Streaming(Arc::new(tokio::sync::Mutex::new(Some(receiver))));
+    *h.upstream.behavior.lock().unwrap() = Behavior::Streaming {
+        status: 200,
+        receiver: Arc::new(tokio::sync::Mutex::new(Some(receiver))),
+    };
     sender
+}
+
+fn usage_window(pct: i64, seconds: i64, reset: i64) -> Value {
+    json!({"used_percent": pct, "limit_window_seconds": seconds, "reset_at": reset})
+}
+
+fn account_usage(plan: &str, primary: Value, secondary: Value) -> Value {
+    json!({"plan_type": plan, "rate_limit": {
+        "allowed": true, "limit_reached": false,
+        "primary_window": primary, "secondary_window": secondary,
+    }})
+}
+
+fn set_usage(h: &Harness, id: &str, payload: Value) {
+    h.upstream
+        .usage
+        .lock()
+        .unwrap()
+        .insert(format!("chat-{id}"), (StatusCode::OK, payload));
+}
+
+async fn get_pool_usage(h: &Harness, path: &str) -> reqwest::Response {
+    reqwest::Client::new()
+        .get(format!("{}{path}", h.proxy_url))
+        .bearer_auth("sk-test")
+        .send()
+        .await
+        .unwrap()
+}
+
+fn seed_weight(h: &Harness, id: &str, plan: &str, pct: f64, reset: i64, tokens: i64) {
+    let now = herdex::store::now_secs();
+    h.store.add_probe(id, now - 2, pct - 1.0, reset, plan);
+    h.store.add_log(&LogEntry {
+        account_id: id.into(),
+        account_email: format!("{id}@x"),
+        ts: now - 1,
+        model: "gpt-5.5".into(),
+        status: 200,
+        input_tokens: tokens,
+        ..Default::default()
+    });
+    h.store.add_probe(id, now, pct, reset, plan);
 }
 
 #[tokio::test]
@@ -263,7 +356,7 @@ async fn json_response_preserves_bytes_and_records_usage() {
     let response = reqwest::Client::new()
         .post(format!("{}/v1/responses", h.proxy_url))
         .bearer_auth("sk-test")
-        .json(&serde_json::json!({"model": "gpt-5.5", "input": "hi", "stream": false}))
+        .json(&serde_json::json!({"model": "gpt-5.5", "input": "hi", "stream": false, "service_tier": "priority"}))
         .send()
         .await
         .unwrap();
@@ -283,6 +376,7 @@ async fn json_response_preserves_bytes_and_records_usage() {
         (120, 80, 45)
     );
     assert!(log.error.is_empty());
+    assert_eq!(log.service_tier.as_deref(), Some("priority"));
     assert_eq!(h.upstream.calls.lock().unwrap().len(), 1);
 }
 
@@ -680,6 +774,24 @@ async fn upstream_disconnect_logs_and_cools_before_returning_body_error() {
             "transport failure must finalize exactly once"
         );
         assert_eq!(logs[0].error, "upstream_stream_error");
+        let diagnostics = logs[0].diagnostics.as_ref().unwrap();
+        assert_eq!(diagnostics.stage, "stream");
+        assert_eq!(diagnostics.attempt, 1);
+        assert_eq!(diagnostics.received_bytes, prefix.len() as u64);
+        assert!(diagnostics.content_seen);
+        assert_eq!(diagnostics.completed, last_event == "response.completed");
+        assert!(
+            diagnostics.error_detail.contains("error reading a body"),
+            "{}",
+            diagnostics.error_detail
+        );
+        assert!(
+            diagnostics.error_detail.contains("unexpected EOF"),
+            "must retain hyper's underlying transport cause: {}",
+            diagnostics.error_detail
+        );
+        assert!(diagnostics.attempt_ms <= diagnostics.elapsed_ms);
+        assert!(!diagnostics.error_detail.contains("http://"));
         assert_eq!(
             (
                 logs[0].input_tokens,
@@ -765,6 +877,87 @@ async fn passthrough_swaps_auth_and_preserves_body() {
 }
 
 #[tokio::test]
+async fn request_tiers_are_recorded_without_mutating_the_body_or_tokens() {
+    let h = harness(&["a1"]).await;
+    let client = reqwest::Client::new();
+    for (path, tier) in [
+        ("/v1/responses", None),
+        ("/v1/responses", Some(serde_json::Value::Null)),
+        ("/v1/responses", Some(serde_json::json!("default"))),
+        ("/v1/responses", Some(serde_json::json!("priority"))),
+        ("/v1/responses", Some(serde_json::json!(true))),
+        (
+            "/backend-api/codex/responses",
+            Some(serde_json::json!("flex")),
+        ),
+    ] {
+        let mut body = serde_json::json!({"model": "gpt-5.5", "input": "hi"});
+        if let Some(tier) = tier {
+            body["service_tier"] = tier;
+        }
+        let expected = match body.get("service_tier") {
+            None | Some(serde_json::Value::Null) => Some(""),
+            Some(value) => value.as_str(),
+        };
+        let response = client
+            .post(format!("{}{path}", h.proxy_url))
+            .bearer_auth("sk-test")
+            .json(&body)
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(response.status(), 200);
+        let bytes = response.text().await.unwrap();
+        let completed: serde_json::Value = bytes
+            .lines()
+            .filter_map(|line| line.strip_prefix("data: "))
+            .filter_map(|data| serde_json::from_str::<serde_json::Value>(data).ok())
+            .find(|event| event["type"] == "response.completed")
+            .unwrap();
+        assert_eq!(completed["response"]["body"], body);
+        let logs = h.store.recent_logs(1).unwrap();
+        assert_eq!(logs[0].service_tier.as_deref(), expected);
+        assert_eq!(
+            (
+                logs[0].input_tokens,
+                logs[0].cached_tokens,
+                logs[0].output_tokens
+            ),
+            (120, 80, 45)
+        );
+    }
+}
+
+#[tokio::test]
+async fn fast_tier_survives_stream_failover_on_every_logged_attempt() {
+    let h = harness(&["a1", "a2"]).await;
+    *h.upstream.behavior.lock().unwrap() = Behavior::StreamErrorFirst(1);
+    let response = reqwest::Client::new()
+        .post(format!("{}/v1/responses", h.proxy_url))
+        .bearer_auth("sk-test")
+        .json(&serde_json::json!({"model":"gpt-5.5", "input":"hi", "service_tier":"priority"}))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(response.status(), 200);
+    response.bytes().await.unwrap();
+    let logs = h.store.recent_logs(5).unwrap();
+    assert_eq!(logs.len(), 2);
+    assert!(logs
+        .iter()
+        .all(|l| l.service_tier.as_deref() == Some("priority")));
+    assert_eq!(logs[1].error, "server_is_overloaded");
+    assert_eq!(logs[1].diagnostics.as_ref().unwrap().stage, "prefix");
+    assert_eq!(logs[1].diagnostics.as_ref().unwrap().attempt, 1);
+    assert_eq!(logs[0].diagnostics.as_ref().unwrap().attempt, 2);
+    assert_eq!(
+        logs[1].diagnostics.as_ref().unwrap().request_id,
+        logs[0].diagnostics.as_ref().unwrap().request_id
+    );
+    assert!(logs[0].error.is_empty());
+}
+
+#[tokio::test]
 async fn failover_covers_all_candidates() {
     let h = harness(&["a1", "a2", "a3", "a4"]).await;
     *h.upstream.behavior.lock().unwrap() = Behavior::FailFirst(3);
@@ -811,6 +1004,184 @@ async fn all_fail_surfaces_real_upstream_error() {
 }
 
 #[tokio::test]
+async fn failed_http_attempts_are_logged_and_linked_without_recording_error_bodies() {
+    for status in [400, 401, 429, 503] {
+        let h = harness(&["a1", "a2"]).await;
+        let error = json!({"error": {"code": "test_upstream_error", "message": "private request content at-a1 sk-test"}}).to_string();
+        *h.upstream.behavior.lock().unwrap() = Behavior::HttpErrorFirst(status, error.clone(), 1);
+        h.upstream
+            .response_headers
+            .lock()
+            .unwrap()
+            .insert("x-request-id", "upstream-test-123".parse().unwrap());
+        let response = send_post(&h, "gpt-5.5", "http-errors").await;
+        assert_eq!(response.status(), if status == 400 { 400 } else { 200 });
+        let request_id = response.headers()["x-herdex-request-id"]
+            .to_str()
+            .unwrap()
+            .to_owned();
+        let body = response.text().await.unwrap();
+        if status == 400 {
+            assert_eq!(body, error);
+        }
+        let logs = h.store.recent_logs(10).unwrap();
+        assert_eq!(logs.len(), if status == 400 { 1 } else { 2 });
+        let failed = logs.last().unwrap();
+        assert_eq!(failed.status, status as i64);
+        assert_eq!(failed.error, "test_upstream_error");
+        let diagnostics = failed.diagnostics.as_ref().unwrap();
+        assert_eq!(diagnostics.attempt, 1);
+        assert_eq!(diagnostics.stage, "http_body");
+        assert_eq!(
+            diagnostics.upstream_request_id.as_deref(),
+            Some("upstream-test-123")
+        );
+        let serialized = serde_json::to_string(diagnostics).unwrap();
+        for secret in ["private request content", "at-a1", "sk-test"] {
+            assert!(!serialized.contains(secret));
+        }
+        assert!(logs
+            .iter()
+            .all(|row| row.diagnostics.as_ref().unwrap().request_id == request_id));
+        if status != 400 {
+            assert_eq!(logs[0].diagnostics.as_ref().unwrap().attempt, 2);
+            assert!(logs[0].error.is_empty());
+        }
+        assert_eq!((failed.input_tokens, failed.output_tokens), (0, 0));
+    }
+}
+
+#[tokio::test]
+async fn connection_failures_keep_the_underlying_cause_and_all_attempts() {
+    let mut h = harness(&["a1", "a2"]).await;
+    h.upstream_task.abort();
+    assert!((&mut h.upstream_task).await.unwrap_err().is_cancelled());
+    let response = send_post(&h, "gpt-5.5", "connect-error").await;
+    assert_eq!(response.status(), 502);
+    let request_id = response.headers()["x-herdex-request-id"]
+        .to_str()
+        .unwrap()
+        .to_owned();
+    response.bytes().await.unwrap();
+    let logs = h.store.recent_logs(5).unwrap();
+    assert_eq!(logs.len(), 2);
+    for (i, row) in logs.iter().rev().enumerate() {
+        assert_eq!(row.status, 0, "no HTTP response was received");
+        assert_eq!(row.error, "upstream_request_error");
+        let diagnostics = row.diagnostics.as_ref().unwrap();
+        assert_eq!(diagnostics.request_id, request_id);
+        assert_eq!(diagnostics.attempt, i as u32 + 1);
+        assert_eq!(diagnostics.stage, "connect");
+        assert!(diagnostics
+            .error_detail
+            .to_lowercase()
+            .contains("connection refused"));
+        assert!(!diagnostics.error_detail.contains("http://"));
+        assert!(!diagnostics.error_detail.contains("at-a"));
+    }
+}
+
+#[tokio::test]
+async fn parameter_retry_has_its_own_attempt_number_and_preserves_fast_tier() {
+    let h = harness(&["a1"]).await;
+    *h.upstream.behavior.lock().unwrap() = Behavior::HttpErrorFirst(
+        400,
+        json!({"detail":"Unsupported parameter: max_output_tokens"}).to_string(),
+        1,
+    );
+    let response = reqwest::Client::new().post(format!("{}/v1/responses", h.proxy_url))
+        .bearer_auth("sk-test")
+        .json(&json!({"model":"gpt-5.5","input":"hi","max_output_tokens":10,"service_tier":"priority"}))
+        .send().await.unwrap();
+    assert_eq!(response.status(), 200);
+    response.bytes().await.unwrap();
+    let logs = h.store.recent_logs(5).unwrap();
+    assert_eq!(logs.len(), 2);
+    assert_eq!(logs[1].status, 400);
+    assert_eq!(logs[1].error, "http_400");
+    assert_eq!(logs[0].status, 200);
+    assert_eq!(logs[0].diagnostics.as_ref().unwrap().attempt, 2);
+    assert_eq!(logs[1].diagnostics.as_ref().unwrap().attempt, 1);
+    assert_eq!(
+        logs[0].diagnostics.as_ref().unwrap().request_id,
+        logs[1].diagnostics.as_ref().unwrap().request_id
+    );
+    assert!(logs
+        .iter()
+        .all(|row| row.service_tier.as_deref() == Some("priority")));
+}
+
+#[tokio::test]
+async fn disconnects_before_content_and_during_http_error_bodies_are_recorded_once() {
+    for status in [200, 503] {
+        let h = harness(&["a1"]).await;
+        let sender = streaming_upstream(&h);
+        if let Behavior::Streaming { status: code, .. } = &mut *h.upstream.behavior.lock().unwrap()
+        {
+            *code = status;
+        }
+        // A quota observation confirms the proxy has received these headers,
+        // so the disconnect cannot race into the request-header phase.
+        h.upstream.response_headers.lock().unwrap().insert(
+            "x-codex-bengalfox-primary-used-percent",
+            "12".parse().unwrap(),
+        );
+        let prefix = b"data:{\"type\":\"response.in_progress\"}\n\n";
+        sender.send(Ok(Bytes::from_static(prefix))).await.unwrap();
+        let response = tokio::time::timeout(Duration::from_secs(3), async {
+            let read = send_post(&h, "gpt-5.5", "prefix-disconnect");
+            let disconnect = async {
+                while h.pool.observation("a1", "gpt-5.5").is_none() {
+                    tokio::task::yield_now().await;
+                }
+                sender
+                    .send(Err(std::io::Error::new(
+                        std::io::ErrorKind::ConnectionReset,
+                        "test disconnect",
+                    )))
+                    .await
+                    .unwrap();
+            };
+            tokio::join!(read, disconnect).0
+        })
+        .await
+        .expect("disconnect must terminate the attempt");
+        assert_eq!(response.status(), if status == 200 { 502 } else { 503 });
+        let request_id = response.headers()["x-herdex-request-id"]
+            .to_str()
+            .unwrap()
+            .to_owned();
+        response.bytes().await.unwrap();
+        let logs = h.store.recent_logs(5).unwrap();
+        assert_eq!(logs.len(), 1);
+        assert_eq!(logs[0].status, status as i64);
+        assert_eq!(
+            logs[0].error,
+            if status == 200 {
+                "upstream_stream_error"
+            } else {
+                "upstream_error_body_error"
+            }
+        );
+        let diagnostics = logs[0].diagnostics.as_ref().unwrap();
+        assert_eq!(diagnostics.request_id, request_id);
+        assert_eq!(
+            diagnostics.stage,
+            if status == 200 { "prefix" } else { "http_body" }
+        );
+        assert_eq!(diagnostics.attempt, 1);
+        assert_eq!(diagnostics.received_bytes, prefix.len() as u64);
+        assert!(!diagnostics.content_seen);
+        assert!(!diagnostics.completed);
+        assert!(
+            diagnostics.error_detail.contains("error reading a body"),
+            "{}",
+            diagnostics.error_detail
+        );
+    }
+}
+
+#[tokio::test]
 async fn session_affinity_and_failover_repin() {
     let h = harness(&["a1", "a2"]).await;
     // first request: least-used tie -> a1; session pins to a1
@@ -835,6 +1206,403 @@ async fn quota_headers_recorded() {
     assert_eq!(res.status(), 200);
     // no quota headers in fake upstream -> observation falls back to defaults (absent)
     assert!(h.pool.observation("a1", "gpt-5.5").is_none());
+}
+
+#[tokio::test]
+async fn pool_usage_separates_weekly_and_monthly_weights_and_resets() {
+    let h = harness(&["a1", "a2", "a3"]).await;
+    let now = herdex::store::now_secs();
+    let week_reset = now + 2 * 86400;
+    let month_reset = now + 20 * 86400;
+    for (id, plan, pct, seconds, reset, tokens) in [
+        ("a1", "pro", 20, 604800, week_reset, 300),
+        ("a2", "prolite", 40, 604800, now + 4 * 86400, 100),
+        ("a3", "free", 11, 2592000, month_reset, 10000),
+    ] {
+        seed_weight(&h, id, plan, pct as f64, reset, tokens);
+        set_usage(
+            &h,
+            id,
+            account_usage(plan, usage_window(pct, seconds, reset), Value::Null),
+        );
+    }
+    for path in ["/api/codex/usage", "/v1/api/codex/usage", "/wham/usage"] {
+        let response = get_pool_usage(&h, path).await;
+        assert_eq!(response.status(), 200);
+        let body: Value = response.json().await.unwrap();
+        let p = &body["rate_limit"]["primary_window"];
+        let s = &body["rate_limit"]["secondary_window"];
+        assert_eq!(p["limit_window_seconds"], 604800);
+        assert_eq!(p["used_percent"], 25); // 20*300 + 40*100, monthly weight excluded
+        assert_eq!(p["reset_at"], week_reset);
+        assert_eq!(s["limit_window_seconds"], 2592000);
+        assert_eq!(s["used_percent"], 11);
+        assert_eq!(s["reset_at"], month_reset);
+        assert_eq!(body["plan_type"], "pro"); // same virtual plan as whoami
+        assert_eq!(body["account_id"], proxy::POOL_IDENTITY.account_id);
+        assert_eq!(body["user_id"], proxy::POOL_IDENTITY.user_id);
+        for window in [p, s] {
+            for key in [
+                "used_percent",
+                "limit_window_seconds",
+                "reset_at",
+                "reset_after_seconds",
+            ] {
+                assert!(i32::try_from(window[key].as_i64().unwrap()).is_ok());
+            }
+            let reset = window["reset_at"].as_i64().unwrap();
+            let after = window["reset_after_seconds"].as_i64().unwrap();
+            assert!((reset - herdex::store::now_secs() - after).abs() <= 1);
+        }
+    }
+}
+
+#[tokio::test]
+async fn pool_usage_preserves_secondary_windows_and_extra_periods() {
+    let h = harness(&["a1", "a2", "a3"]).await;
+    let reset = herdex::store::now_secs() + 86400;
+    set_usage(
+        &h,
+        "a1",
+        account_usage(
+            "pro",
+            usage_window(30, 18000, reset),
+            usage_window(70, 604800, reset + 1),
+        ),
+    );
+    set_usage(
+        &h,
+        "a2",
+        account_usage(
+            "prolite",
+            usage_window(50, 604800, reset + 2),
+            usage_window(10, 18000, reset + 3),
+        ),
+    );
+    set_usage(
+        &h,
+        "a3",
+        account_usage("free", usage_window(11, 2592000, reset + 4), Value::Null),
+    );
+    let body: Value = get_pool_usage(&h, "/api/codex/usage")
+        .await
+        .json()
+        .await
+        .unwrap();
+    assert_eq!(
+        body["rate_limit"]["primary_window"]["limit_window_seconds"],
+        18000
+    );
+    assert_eq!(body["rate_limit"]["primary_window"]["used_percent"], 20);
+    assert_eq!(
+        body["rate_limit"]["secondary_window"]["limit_window_seconds"],
+        604800
+    );
+    assert_eq!(body["rate_limit"]["secondary_window"]["used_percent"], 60);
+    let extra = body["additional_rate_limits"].as_array().unwrap();
+    assert_eq!(extra.len(), 1);
+    assert!(extra[0]["metered_feature"].as_str().is_some());
+    assert!(extra[0]["limit_name"].as_str().is_some());
+    assert_eq!(
+        extra[0]["rate_limit"]["primary_window"]["limit_window_seconds"],
+        2592000
+    );
+    assert_eq!(extra[0]["rate_limit"]["primary_window"]["used_percent"], 11);
+    h.upstream
+        .response_headers
+        .lock()
+        .unwrap()
+        .insert("x-codex-primary-used-percent", "30".parse().unwrap());
+    let response = send_post(&h, "gpt-5.5", "extra-periods").await;
+    assert_eq!(response.status(), 200);
+    for (prefix, window) in [
+        (
+            "x-codex-primary".to_owned(),
+            &body["rate_limit"]["primary_window"],
+        ),
+        (
+            "x-codex-secondary".to_owned(),
+            &body["rate_limit"]["secondary_window"],
+        ),
+        (
+            format!(
+                "x-{}-primary",
+                extra[0]["metered_feature"]
+                    .as_str()
+                    .unwrap()
+                    .replace('_', "-")
+            ),
+            &extra[0]["rate_limit"]["primary_window"],
+        ),
+    ] {
+        for (suffix, expected) in [
+            ("used-percent", window["used_percent"].as_i64().unwrap()),
+            (
+                "window-minutes",
+                window["limit_window_seconds"].as_i64().unwrap() / 60,
+            ),
+            ("reset-at", window["reset_at"].as_i64().unwrap()),
+        ] {
+            assert_eq!(
+                response.headers()[format!("{prefix}-{suffix}")]
+                    .to_str()
+                    .unwrap()
+                    .parse::<i64>()
+                    .unwrap(),
+                expected,
+            );
+        }
+    }
+    response.bytes().await.unwrap();
+}
+
+#[tokio::test]
+async fn pool_usage_secondary_only_window_matches_the_response_headers() {
+    let h = harness(&["a1"]).await;
+    let reset = herdex::store::now_secs() + 86400;
+    set_usage(
+        &h,
+        "a1",
+        account_usage("prolite", Value::Null, usage_window(40, 604800, reset)),
+    );
+    let body: Value = get_pool_usage(&h, "/api/codex/usage")
+        .await
+        .json()
+        .await
+        .unwrap();
+    assert_eq!(body["rate_limit"]["primary_window"]["used_percent"], 40);
+    h.upstream
+        .response_headers
+        .lock()
+        .unwrap()
+        .insert("x-codex-secondary-used-percent", "40".parse().unwrap());
+    let response = send_post(&h, "gpt-5.5", "secondary-only").await;
+    assert_eq!(response.status(), 200);
+    assert_eq!(response.headers()["x-codex-primary-used-percent"], "40");
+    assert_eq!(
+        response.headers()["x-codex-primary-window-minutes"],
+        "10080"
+    );
+    assert!(!response
+        .headers()
+        .contains_key("x-codex-secondary-used-percent"));
+    response.bytes().await.unwrap();
+}
+
+#[tokio::test]
+async fn pool_usage_with_only_free_accounts_keeps_a_real_monthly_window() {
+    let h = harness(&["a1"]).await;
+    let reset = herdex::store::now_secs() + 86400;
+    set_usage(
+        &h,
+        "a1",
+        account_usage("free", usage_window(11, 2592000, reset), Value::Null),
+    );
+    let body: Value = get_pool_usage(&h, "/api/codex/usage")
+        .await
+        .json()
+        .await
+        .unwrap();
+    assert_eq!(
+        body["rate_limit"]["primary_window"]["limit_window_seconds"],
+        2592000
+    );
+    assert_eq!(body["rate_limit"]["primary_window"]["used_percent"], 11);
+    assert!(body["rate_limit"]["secondary_window"].is_null());
+}
+
+#[tokio::test]
+async fn pool_usage_does_not_turn_missing_windows_or_failed_probes_into_zero_usage() {
+    let h = harness(&["a1", "a2", "a3"]).await;
+    let reset = herdex::store::now_secs() + 86400;
+    set_usage(
+        &h,
+        "a1",
+        account_usage(
+            "pro",
+            json!({"limit_window_seconds": 604800, "reset_at": reset}),
+            Value::Null,
+        ),
+    );
+    set_usage(
+        &h,
+        "a2",
+        account_usage(
+            "free",
+            json!({"used_percent": 11, "reset_at": reset}),
+            Value::Null,
+        ),
+    );
+    assert_eq!(get_pool_usage(&h, "/api/codex/usage").await.status(), 502);
+    set_usage(
+        &h,
+        "a3",
+        account_usage("prolite", usage_window(40, 604800, reset), Value::Null),
+    );
+    let body: Value = get_pool_usage(&h, "/api/codex/usage")
+        .await
+        .json()
+        .await
+        .unwrap();
+    assert_eq!(body["rate_limit"]["primary_window"]["used_percent"], 40);
+    assert!(body["rate_limit"]["secondary_window"].is_null());
+    // A subsequent turn must not reintroduce missing percentages as 0% via
+    // the pool snapshots populated by these same partial probe responses.
+    h.upstream
+        .response_headers
+        .lock()
+        .unwrap()
+        .insert("x-codex-primary-used-percent", "40".parse().unwrap());
+    let response = send_post(&h, "gpt-5.5", "partial-usage").await;
+    assert_eq!(response.headers()["x-codex-primary-used-percent"], "40");
+    assert!(!response
+        .headers()
+        .contains_key("x-codex-secondary-used-percent"));
+    response.bytes().await.unwrap();
+    h.upstream.usage.lock().unwrap().remove("chat-a3");
+    assert_eq!(get_pool_usage(&h, "/api/codex/usage").await.status(), 502);
+}
+
+#[tokio::test]
+async fn pool_usage_remains_allowed_when_another_period_has_available_accounts() {
+    let h = harness(&["a1", "a2"]).await;
+    let reset = herdex::store::now_secs() + 86400;
+    let mut weekly = account_usage("pro", usage_window(100, 604800, reset), Value::Null);
+    weekly["rate_limit"]["allowed"] = json!(false);
+    weekly["rate_limit"]["limit_reached"] = json!(true);
+    set_usage(&h, "a1", weekly);
+    set_usage(
+        &h,
+        "a2",
+        account_usage("free", usage_window(11, 2592000, reset), Value::Null),
+    );
+    let body: Value = get_pool_usage(&h, "/api/codex/usage")
+        .await
+        .json()
+        .await
+        .unwrap();
+    assert_eq!(body["rate_limit"]["primary_window"]["used_percent"], 100);
+    assert_eq!(body["rate_limit"]["secondary_window"]["used_percent"], 11);
+    assert_eq!(body["rate_limit"]["allowed"], true);
+    assert_eq!(body["rate_limit"]["limit_reached"], false);
+}
+
+#[tokio::test]
+async fn pool_usage_headers_match_poll_periods_without_touching_model_limits_or_body() {
+    let h = harness(&["a1", "a2", "a3", "disabled", "deleted"]).await;
+    let now = herdex::store::now_secs();
+    let week_reset = now + 2 * 86400;
+    let month_reset = now + 20 * 86400;
+    for (id, plan, pct, seconds, reset) in [
+        ("a1", "pro", 20, 604800, week_reset),
+        ("a2", "prolite", 40, 604800, week_reset + 86400),
+        ("a3", "free", 11, 2592000, month_reset),
+        ("disabled", "free", 99, 2592000, now + 1),
+        ("deleted", "pro", 99, 604800, now + 1),
+    ] {
+        let report = account_usage(plan, usage_window(pct, seconds, reset), Value::Null);
+        h.app.observe_usage(
+            id,
+            &herdex::usage::parse(&serde_json::to_vec(&report).unwrap()).unwrap(),
+        );
+        set_usage(&h, id, report);
+    }
+    h.store.set_account_disabled("disabled", true).unwrap();
+    h.store.delete_account("deleted").unwrap();
+    let polled: Value = get_pool_usage(&h, "/api/codex/usage")
+        .await
+        .json()
+        .await
+        .unwrap();
+    {
+        let mut headers = h.upstream.response_headers.lock().unwrap();
+        for (name, value) in [
+            ("x-codex-primary-used-percent", "11".to_string()),
+            ("x-codex-primary-window-minutes", "43200".to_string()),
+            ("x-codex-primary-reset-at", month_reset.to_string()),
+            ("x-codex-primary-reset-after-seconds", "1".to_string()),
+            ("x-codex-secondary-used-percent", "99".to_string()),
+            ("x-codex-plan-type", "free".to_string()),
+            ("x-codex-bengalfox-primary-used-percent", "88".to_string()),
+            (
+                "x-codex-bengalfox-primary-window-minutes",
+                "300".to_string(),
+            ),
+        ] {
+            headers.insert(name, value.parse().unwrap());
+        }
+    }
+    h.pool.pin("period-headers", "a3", "gpt-5.5");
+    let response = send_post(&h, "gpt-5.5", "period-headers").await;
+    assert_eq!(response.status(), 200);
+    assert_eq!(h.upstream.calls.lock().unwrap()[0], "chat-a3");
+    for slot in ["primary", "secondary"] {
+        let window = &polled["rate_limit"][format!("{slot}_window")];
+        for (suffix, expected) in [
+            ("used-percent", window["used_percent"].as_i64().unwrap()),
+            (
+                "window-minutes",
+                window["limit_window_seconds"].as_i64().unwrap() / 60,
+            ),
+            ("reset-at", window["reset_at"].as_i64().unwrap()),
+        ] {
+            let name = format!("x-codex-{slot}-{suffix}");
+            assert_eq!(
+                response.headers()[&name]
+                    .to_str()
+                    .unwrap()
+                    .parse::<i64>()
+                    .unwrap(),
+                expected
+            );
+        }
+        let after = response.headers()[format!("x-codex-{slot}-reset-after-seconds")]
+            .to_str()
+            .unwrap()
+            .parse::<i64>()
+            .unwrap();
+        assert!(
+            (window["reset_at"].as_i64().unwrap() - herdex::store::now_secs() - after).abs() <= 1
+        );
+    }
+    assert_eq!(response.headers()["x-codex-plan-type"], "pro");
+    assert_eq!(
+        response.headers()["x-codex-bengalfox-primary-used-percent"],
+        "88"
+    );
+    assert!(response
+        .text()
+        .await
+        .unwrap()
+        .contains("\"body\": {\"input\":\"hi\",\"model\":\"gpt-5.5\"}"));
+}
+
+#[tokio::test]
+async fn pool_usage_headers_do_not_fall_back_to_a_single_account_when_unknown() {
+    let h = harness(&["a1"]).await;
+    h.upstream.response_headers.lock().unwrap().extend([
+        (
+            "x-codex-primary-used-percent"
+                .parse::<axum::http::HeaderName>()
+                .unwrap(),
+            "33".parse().unwrap(),
+        ),
+        (
+            "x-codex-primary-window-minutes"
+                .parse::<axum::http::HeaderName>()
+                .unwrap(),
+            "43200".parse().unwrap(),
+        ),
+    ]);
+    let response = send_post(&h, "gpt-5.5", "unknown-pool").await;
+    assert_eq!(response.status(), 200);
+    assert!(!response
+        .headers()
+        .contains_key("x-codex-primary-used-percent"));
+    assert!(!response
+        .headers()
+        .contains_key("x-codex-primary-window-minutes"));
+    response.bytes().await.unwrap();
 }
 
 #[tokio::test]
@@ -964,11 +1732,13 @@ async fn full_router_assembles_and_serves_panel() {
             store: h.store.clone(),
             pool: h.pool.clone(),
             http: reqwest::Client::new(),
+            model_version: Default::default(),
             usage_root: "https://chatgpt.com".into(),
             pending: Mutex::new(Default::default()),
             last_prune_day: std::sync::atomic::AtomicI64::new(0),
             learned_strips: std::sync::Mutex::new(std::collections::HashSet::new()),
             refresh_guards: tokio::sync::Mutex::new(HashMap::new()),
+            reset_guards: tokio::sync::Mutex::new(HashMap::new()),
         })
     });
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
@@ -1005,14 +1775,17 @@ async fn full_router_assembles_and_serves_panel() {
         .unwrap();
     assert_eq!(res.status(), 404);
 
-    // client routes still work through the same router
-    let res = reqwest::Client::new()
-        .get(format!("http://{addr}/v1/models"))
-        .bearer_auth("sk-test")
-        .send()
-        .await
-        .unwrap();
-    assert_eq!(res.status(), 200);
+    // Client routes still work through the same router; no release has been
+    // discovered in this fixture, so both discovery endpoints fail closed.
+    for path in ["/v1/models", "/models"] {
+        let res = reqwest::Client::new()
+            .get(format!("http://{addr}{path}"))
+            .bearer_auth("sk-test")
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(res.status(), 503);
+    }
 }
 
 #[test]
@@ -1035,12 +1808,14 @@ fn usage_aggregates_by_dimension() {
             account_email: acct.into(),
             api_key: key.into(),
             model: model.into(),
+            service_tier: None,
             status: 200,
             latency_ms: 1,
             input_tokens: inp,
             cached_tokens: 0,
             output_tokens: out,
             error: String::new(),
+            diagnostics: None,
         });
     }
     let by_acc = st.usage_by(UsageDim::Account, 7).unwrap();
@@ -1082,12 +1857,14 @@ fn prune_logs_respects_retention() {
             account_email: acct.into(),
             api_key: "k".into(),
             model: "m".into(),
+            service_tier: None,
             status: 200,
             latency_ms: 1,
             input_tokens: 1,
             cached_tokens: 0,
             output_tokens: 1,
             error: String::new(),
+            diagnostics: None,
         });
     }
     assert_eq!(st.prune_logs(730).unwrap(), 1); // only the 800-day-old row

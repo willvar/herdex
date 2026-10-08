@@ -65,7 +65,7 @@ async function consumeReset(a) {
     store.liveQuota[a.email] = r
     delete store.quotaErr[a.email]
     loadState()
-    message.success('已消耗一个重置积分')
+    message.success('已消耗最早过期的重置积分')
   } catch (e) { message.error(e.message) }
 }
 async function toggleAll() {
@@ -110,7 +110,7 @@ function renderQuota(row) {
         h(NButton, {
           size: 'tiny', disabled: live.credits.available < 1,
           onClick: () => consumeReset(row),
-        }, { default: () => '消耗一个立即重置' }),
+        }, { default: () => '消耗最早过期券并重置' }),
     ]),
   ])
 }

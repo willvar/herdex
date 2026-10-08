@@ -1,5 +1,5 @@
 use herdex::pool::Pool;
-use herdex::store::{now_secs, Account, LogEntry, Settings, Store};
+use herdex::store::{now_secs, Account, LogEntry, RequestDiagnostics, Settings, Store};
 use std::path::PathBuf;
 
 struct TestStore {
@@ -130,6 +130,124 @@ fn log_model(store: &Store, ts: i64, model: &str, input: i64, output: i64) {
         output_tokens: output,
         ..Default::default()
     });
+}
+
+#[test]
+fn request_tiers_roundtrip_without_changing_usage_or_calibration() {
+    let db = TestStore::new();
+    db.account("a");
+    let t = now_secs() - 60;
+    db.store.add_probe("a", t, 0.0, 100, "pro");
+    for (i, tier) in ["priority", "", "default", "flex"].into_iter().enumerate() {
+        db.store.add_log(&LogEntry {
+            ts: t + (i as i64 + 1) * 10,
+            account_id: "a".into(),
+            account_email: "a@example.test".into(),
+            model: "m".into(),
+            service_tier: Some(tier.into()),
+            status: 200,
+            input_tokens: 80,
+            cached_tokens: 60,
+            output_tokens: 20,
+            ..Default::default()
+        });
+        db.store
+            .add_probe("a", t + (i as i64 + 1) * 10, (i + 1) as f64, 100, "pro");
+    }
+    let reopened = Store::open(db.root.to_str().unwrap()).unwrap();
+    let logs = reopened.recent_logs(10).unwrap();
+    assert_eq!(
+        logs.iter()
+            .map(|l| l.service_tier.as_deref())
+            .collect::<Vec<_>>(),
+        [Some("flex"), Some("default"), Some(""), Some("priority")]
+    );
+    let payload = serde_json::to_value(&logs).unwrap();
+    assert_eq!(payload[2]["service_tier"], "");
+    assert_eq!(payload[3]["service_tier"], "priority");
+    let usage = reopened.usage_daily(1).unwrap();
+    assert_eq!(
+        (
+            usage[0].requests,
+            usage[0].input,
+            usage[0].cached,
+            usage[0].output
+        ),
+        (4, 320, 240, 80)
+    );
+    let cal = reopened.calibration("a").unwrap().unwrap();
+    assert_eq!((cal.tokens_per_pct, cal.samples), (100.0, 4));
+}
+
+#[test]
+fn tier_migration_keeps_legacy_requests_unknown_and_preserves_history() {
+    let (db, _) = TestStore::legacy(true);
+    db.account("a");
+    let before = db.store.calibration("a").unwrap().unwrap();
+    for _ in 0..2 {
+        let reopened = Store::open(db.root.to_str().unwrap()).unwrap();
+        let logs = reopened.recent_logs(10).unwrap();
+        assert_eq!(logs.len(), 2);
+        assert!(logs.iter().all(|l| l.service_tier.is_none()));
+        assert!(logs.iter().all(|l| l.diagnostics.is_none()));
+        assert!(serde_json::to_value(&logs).unwrap()[0]["service_tier"].is_null());
+        assert_eq!(
+            (
+                logs[0].input_tokens,
+                logs[0].cached_tokens,
+                logs[0].output_tokens
+            ),
+            (160, 120, 40)
+        );
+        assert_eq!(reopened.probe_history(1).unwrap().len(), 3);
+        let cal = reopened.calibration("a").unwrap().unwrap();
+        assert_eq!(
+            (cal.tokens_per_pct, cal.samples),
+            (before.tokens_per_pct, before.samples)
+        );
+    }
+}
+
+#[test]
+fn request_diagnostics_survive_reopening_without_changing_existing_usage() {
+    let (db, _) = TestStore::legacy(true);
+    let before = db.store.usage_daily(1).unwrap();
+    let diagnostics = RequestDiagnostics {
+        request_id: "test-request".into(),
+        attempt: 2,
+        stage: "stream".into(),
+        upstream_request_id: Some("upstream-test".into()),
+        elapsed_ms: 1234,
+        attempt_ms: 1000,
+        received_bytes: 456,
+        content_seen: true,
+        completed: false,
+        error_detail: "connection reset by peer".into(),
+    };
+    db.store.add_log(&LogEntry {
+        ts: now_secs(),
+        model: "m".into(),
+        status: 200,
+        error: "upstream_stream_error".into(),
+        diagnostics: Some(diagnostics.clone()),
+        ..Default::default()
+    });
+    for _ in 0..2 {
+        let reopened = Store::open(db.root.to_str().unwrap()).unwrap();
+        let logs = reopened.recent_logs(10).unwrap();
+        assert_eq!(logs.len(), 3);
+        assert_eq!(
+            serde_json::to_value(&logs[0].diagnostics).unwrap(),
+            serde_json::to_value(&diagnostics).unwrap()
+        );
+        assert!(logs[1..].iter().all(|row| row.diagnostics.is_none()));
+        let usage = reopened.usage_daily(1).unwrap();
+        assert_eq!(usage[0].requests, before[0].requests + 1);
+        assert_eq!(
+            (usage[0].input, usage[0].cached, usage[0].output),
+            (before[0].input, before[0].cached, before[0].output)
+        );
+    }
 }
 
 #[test]

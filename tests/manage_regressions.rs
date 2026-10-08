@@ -30,9 +30,11 @@ impl Server {
             store: store.clone(),
             pool: Pool::new(store.clone()),
             http: reqwest::Client::new(),
+            model_version: Default::default(),
             usage_root: "http://127.0.0.1:1".into(),
             pending: Default::default(),
             refresh_guards: Default::default(),
+            reset_guards: Default::default(),
             last_prune_day: Default::default(),
             learned_strips: Default::default(),
         });

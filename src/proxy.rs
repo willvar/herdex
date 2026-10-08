@@ -4,11 +4,13 @@
 
 use crate::app::{App, AppHandle};
 use crate::pool;
-use crate::store::{Account, LogEntry, Store};
+use crate::store::{Account, LogEntry, RequestDiagnostics, Store};
+use crate::usage::{Limit, Window};
 use axum::body::{Body, Bytes};
 use axum::extract::State;
 use axum::http::{HeaderMap, Method, StatusCode, Uri};
 use axum::response::{IntoResponse, Response};
+use std::collections::BTreeMap;
 use std::time::Instant;
 
 const HOP_HEADERS: [&str; 9] = [
@@ -29,9 +31,10 @@ const MAX_OBSERVATION_BYTES: usize = 8 * 1024 * 1024;
 
 pub fn router() -> axum::Router<AppHandle> {
     axum::Router::new()
-        // codex's own discovery path: {chatgpt_base_url}/models — proxy the
-        // upstream catalog with pool credentials so clients see live lists
-        .route("/models", axum::routing::get(catalog))
+        // model discovery: codex CLI reads {chatgpt_base_url}/models, other
+        // clients read /v1/models — both serve the enabled-account union;
+        // per-request routing filters by each account's catalog
+        .route("/models", axum::routing::get(models))
         .route("/v1/models", axum::routing::get(models))
         .route("/v1/responses", axum::routing::post(responses))
         .route(
@@ -83,19 +86,31 @@ fn auth_check(app: &App, headers: &HeaderMap) -> Result<String, Response> {
     }
 }
 
+/// Model discovery: the union of existing, enabled accounts' discovered
+/// catalogs (or the config override). Requests skip accounts whose known
+/// catalogs lack the requested model.
 async fn models(State(app): State<AppHandle>, headers: HeaderMap) -> Response {
     if auth_check(&app, &headers).is_err() {
         return (StatusCode::UNAUTHORIZED, "invalid api key").into_response();
     }
-    // priority: config override > upstream-discovered intersection > builtin
-    let configured = app.cfg.models.clone();
-    // no hardcoded fallback: an empty list is honest ("discovery pending").
-    // The background loop refreshes per-account catalogs on start and every
-    // cycle, so this only shows empty in the first seconds after boot.
-    let slugs: Vec<String> = if !configured.is_empty() {
-        configured
+    if app.model_version().is_none() {
+        return (
+            StatusCode::SERVICE_UNAVAILABLE,
+            "Codex release version unavailable",
+        )
+            .into_response();
+    }
+    // priority: config override > upstream-discovered union
+    // No hardcoded fallback: return an empty list when no enabled account
+    // has a known catalog. The background loop collects catalogs on startup
+    // and each cycle.
+    let slugs: Vec<String> = if app.cfg.models.is_empty() {
+        match app.pool.union_models() {
+            Ok(models) => models,
+            Err(e) => return (StatusCode::INTERNAL_SERVER_ERROR, e).into_response(),
+        }
     } else {
-        app.pool.common_models()
+        app.cfg.models.clone()
     };
     let data: Vec<serde_json::Value> = slugs
         .iter()
@@ -104,14 +119,113 @@ async fn models(State(app): State<AppHandle>, headers: HeaderMap) -> Response {
     axum::Json(serde_json::json!({"object": "list", "data": data})).into_response()
 }
 
-/// Pool-aggregate usage poll ("池子总量"): probes every enabled account and
-/// reports the pool as ONE virtual account — used% is the capacity-weighted
-/// mean of per-account usage, so it stays within 0-100 even when accounts
-/// differ by plan. Weights come from the empirical tokens-per-1% calibration;
-/// uncalibrated accounts fall back to the mean calibrated weight (or equal
-/// weight when nothing is calibrated yet). reset_at = earliest window reset.
+#[derive(Clone, Copy)]
+struct PoolUsageWindow {
+    seconds: i64,
+    pct: f64,
+    reset_at: Option<i64>,
+}
+
+impl PoolUsageWindow {
+    fn from_window(window: &Window) -> Option<Self> {
+        let pct = window.used_pct.filter(|p| p.is_finite())?;
+        let seconds = window
+            .window_seconds
+            .filter(|s| *s > 0 && i32::try_from(*s).is_ok())?;
+        Some(Self {
+            seconds,
+            pct: pct.clamp(0.0, 100.0),
+            reset_at: window
+                .reset_at
+                .filter(|at| *at > 0 && i32::try_from(*at).is_ok()),
+        })
+    }
+
+    fn payload(self, now: i64) -> serde_json::Value {
+        // Codex deserializes all four fields as i32, including percentages.
+        serde_json::json!({
+            "used_percent": self.pct.round() as i64,
+            "limit_window_seconds": self.seconds,
+            "reset_at": self.reset_at.unwrap_or(0),
+            "reset_after_seconds": self.reset_at.map(|at| (at - now).clamp(0, i32::MAX as i64)).unwrap_or(0),
+        })
+    }
+}
+
+/// Group by the actual duration, not by upstream primary/secondary position.
+/// Historical calibration describes the primary window only; secondary
+/// windows use the existing unknown-capacity fallback within their own group.
+fn aggregate_usage_windows(entries: &[(Limit, Option<f64>)]) -> Vec<PoolUsageWindow> {
+    let mut groups: BTreeMap<i64, Vec<(PoolUsageWindow, Option<f64>)>> = BTreeMap::new();
+    for (limit, weight) in entries {
+        let mut primary = PoolUsageWindow::from_window(&limit.primary);
+        let mut secondary = PoolUsageWindow::from_window(&limit.secondary);
+        if let (Some(p), Some(s)) = (primary, secondary) {
+            if p.seconds == s.seconds {
+                // One account contributes once per duration, retaining the
+                // tighter observation if both slots describe the same period.
+                primary = Some(if s.pct > p.pct { s } else { p });
+                secondary = None;
+            }
+        }
+        for (window, weight) in [(primary, *weight), (secondary, None)] {
+            if let Some(window) = window {
+                groups
+                    .entry(window.seconds)
+                    .or_default()
+                    .push((window, weight));
+            }
+        }
+    }
+    groups
+        .into_iter()
+        .map(|(seconds, samples)| PoolUsageWindow {
+            seconds,
+            pct: weighted_used(
+                &samples
+                    .iter()
+                    .map(|(w, weight)| (w.pct, *weight))
+                    .collect::<Vec<_>>(),
+            ),
+            reset_at: samples.iter().filter_map(|(w, _)| w.reset_at).min(),
+        })
+        .collect()
+}
+
+fn pool_usage_payload(windows: &[PoolUsageWindow], allowed: bool, now: i64) -> serde_json::Value {
+    serde_json::json!({
+        // This is the virtual workspace's plan, matching whoami/accounts/check,
+        // not whichever real account currently has the lowest used percentage.
+        "plan_type": "pro",
+        "rate_limit": {
+            "allowed": allowed,
+            "limit_reached": !allowed,
+            "primary_window": windows.first().map(|w| w.payload(now)),
+            "secondary_window": windows.get(1).map(|w| w.payload(now)),
+        },
+        // Preserve further durations without mixing or silently dropping them.
+        "additional_rate_limits": windows.iter().skip(2).map(|w| serde_json::json!({
+            "limit_name": "herdex pool",
+            "metered_feature": format!("herdex_pool_{}", w.seconds),
+            "rate_limit": {
+                "allowed": w.pct < 100.0,
+                "limit_reached": w.pct >= 100.0,
+                "primary_window": w.payload(now),
+            },
+        })).collect::<Vec<_>>(),
+        "rate_limit_reset_credits": { "available_count": 0 },
+        "account_id": POOL_IDENTITY.account_id,
+        "user_id": POOL_IDENTITY.user_id,
+    })
+}
+
+/// Probe enabled accounts and aggregate each duration independently. Percentages,
+/// calibration weights and the earliest reset all belong to the same group.
 async fn codex_usage_pool(app: &App) -> Response {
-    let accounts = app.store.list_accounts().unwrap_or_default();
+    let accounts = match app.store.list_accounts() {
+        Ok(accounts) => accounts,
+        Err(e) => return (StatusCode::INTERNAL_SERVER_ERROR, e).into_response(),
+    };
     let mut collected: Vec<(Account, crate::usage::Report)> = Vec::new();
     for a in accounts.iter().filter(|a| !a.disabled) {
         let body = match crate::usage::fetch_raw(
@@ -150,79 +264,27 @@ async fn codex_usage_pool(app: &App) -> Response {
         return (StatusCode::BAD_GATEWAY, "no account usage probe succeeded").into_response();
     }
 
-    // weight = calibrated capacity (tokens per 1%); unknown → fallback weight
-    struct Entry {
-        weight: Option<f64>,
-        pct: f64,
-        reset_at: i64,
-        win_secs: i64,
-        plan: String,
-    }
-    let mut entries: Vec<Entry> = Vec::new();
+    let mut entries = Vec::new();
     for (a, rep) in &collected {
-        let pct = rep
-            .main
-            .primary
-            .used_pct
-            .unwrap_or(0.0)
-            .max(rep.main.secondary.used_pct.unwrap_or(0.0));
         let weight = app
             .store
             .calibration(&a.id)
             .ok()
             .flatten()
             .map(|c| c.tokens_per_pct);
-        entries.push(Entry {
-            weight,
-            pct,
-            reset_at: rep.main.primary.reset_at.unwrap_or(0),
-            win_secs: rep.main.primary.window_seconds.unwrap_or(604800),
-            plan: rep.plan_type.clone(),
-        });
+        entries.push((rep.main.clone(), weight));
     }
-    let used = weighted_used(
-        &entries
-            .iter()
-            .map(|e| (e.pct, e.weight))
-            .collect::<Vec<_>>(),
-    );
-    let mut min_reset = i64::MAX;
-    let mut win = 604800i64;
-    let mut plan = "pro".to_string();
-    let mut best_pct = f64::MAX;
-    for e in &entries {
-        if e.reset_at > 0 {
-            min_reset = min_reset.min(e.reset_at);
-        }
-        if e.win_secs > win {
-            win = e.win_secs;
-        }
-        if e.pct < best_pct {
-            best_pct = e.pct;
-            plan = e.plan.clone();
-        }
+    let windows = aggregate_usage_windows(&entries);
+    if windows.is_empty() {
+        return (StatusCode::BAD_GATEWAY, "no known account usage window").into_response();
     }
-    let now = crate::store::now_secs();
-    // Shape must match the CLI's RateLimitStatusPayload exactly: used_percent
-    // and window fields deserialize as i32 (floats fail the whole response),
-    // and account_id/user_id must equal the PAT whoami identity or the TUI
-    // filters ordinary_usage_allowed out of the /status card.
-    let payload = serde_json::json!({
-        "plan_type": plan,
-        "rate_limit": {
-            "allowed": true,
-            "limit_reached": used >= 99.9,
-            "primary_window": {
-                "used_percent": used.round() as i64,
-                "limit_window_seconds": win,
-                "reset_at": if min_reset == i64::MAX { 0 } else { min_reset },
-                "reset_after_seconds": if min_reset == i64::MAX { 0 } else { (min_reset - now).max(0) },
-            },
-        },
-        "rate_limit_reset_credits": { "available_count": 0 },
-        "account_id": POOL_IDENTITY.account_id,
-        "user_id": POOL_IDENTITY.user_id,
+    let allowed = entries.iter().any(|(limit, _)| {
+        limit.allowed
+            && !limit.limit_reached
+            && (PoolUsageWindow::from_window(&limit.primary).is_some()
+                || PoolUsageWindow::from_window(&limit.secondary).is_some())
     });
+    let payload = pool_usage_payload(&windows, allowed, crate::store::now_secs());
     (
         [(axum::http::header::CONTENT_TYPE, "application/json")],
         payload.to_string(),
@@ -283,51 +345,13 @@ async fn accounts_check(State(app): State<AppHandle>, headers: HeaderMap) -> Res
     .into_response()
 }
 
-/// codex's model discovery: GET {chatgpt_base_url}/models. Proxy the
-/// upstream per-account catalog with pool credentials — the client gets the
-/// entitlement list of the account that serves it, without hardcoding.
-async fn catalog(State(app): State<AppHandle>, headers: HeaderMap) -> Response {
-    if auth_check(&app, &headers).is_err() {
-        return (StatusCode::UNAUTHORIZED, "invalid api key").into_response();
-    }
-    let Some(acc) = app
-        .store
-        .list_accounts()
-        .unwrap_or_default()
-        .into_iter()
-        .find(|a| !a.disabled)
-    else {
-        return (StatusCode::SERVICE_UNAVAILABLE, "no enabled account").into_response();
-    };
-    match crate::usage::fetch_model_slugs(
-        &app.http,
-        &app.cfg.upstream.base_url,
-        &acc.access_token,
-        &acc.account_id,
-        &app.cfg.header_defaults,
-        app.cfg.client_version(),
-    )
-    .await
-    {
-        Ok(slugs) if !slugs.is_empty() => {
-            let data: Vec<serde_json::Value> = slugs
-                .iter()
-                .map(|m| serde_json::json!({"id": m, "object": "model", "owned_by": "openai"}))
-                .collect();
-            axum::Json(serde_json::json!({"object": "list", "data": data})).into_response()
-        }
-        _ => (StatusCode::BAD_GATEWAY, "models catalog unavailable").into_response(),
-    }
-}
-
 /// Serves the CLI's account usage poll: zero-cost probe of every enabled
 /// account; observations feed back into the pool.
 /// Auth note: when the CLI's chatgpt_base_url points here, the poll carries
 /// the CLI's own ChatGPT OAuth token instead of a herdex API key — accept any
 /// bearer on this LAN-only route (exposes usage percentages only).
-/// The CLI's statusline data source: the pool as ONE virtual account —
-/// used% is the capacity-weighted mean of per-account usage (token-calibrated
-/// weights), so it always lands in 0-100.
+/// The CLI's statusline data source: one virtual account, with independently
+/// aggregated windows for each actual duration.
 async fn codex_usage(State(app): State<AppHandle>, headers: HeaderMap) -> Response {
     let has_bearer = headers
         .get("Authorization")
@@ -370,11 +394,16 @@ async fn responses(State(app): State<AppHandle>, headers: HeaderMap, body: Bytes
         Err(res) => return res,
     };
     let probe: Result<serde_json::Value, _> = serde_json::from_slice(&body);
-    let model = match probe
-        .ok()
-        .and_then(|v| v.get("model").and_then(|m| m.as_str()).map(String::from))
-    {
-        Some(m) => m,
+    let (model, service_tier) = match probe.ok().and_then(|v| {
+        let model = v.get("model")?.as_str()?.to_owned();
+        let tier = match v.get("service_tier") {
+            None | Some(serde_json::Value::Null) => Some(String::new()),
+            Some(serde_json::Value::String(tier)) => Some(tier.clone()),
+            _ => None,
+        };
+        Some((model, tier))
+    }) {
+        Some(metadata) => metadata,
         None => return (
             StatusCode::BAD_REQUEST,
             r#"{"error":{"message":"missing \"model\" in request body","type":"server_error"}}"#,
@@ -404,14 +433,30 @@ async fn responses(State(app): State<AppHandle>, headers: HeaderMap, body: Bytes
 
     let mut last_status: u16 = 0;
     let mut last_err = String::new();
-    let start = Instant::now();
+    let request_id = uuid::Uuid::new_v4().to_string();
+    let mut request_log = RequestLog {
+        entry: LogEntry {
+            api_key,
+            model: model.clone(),
+            service_tier,
+            diagnostics: Some(RequestDiagnostics {
+                request_id: request_id.clone(),
+                ..Default::default()
+            }),
+            ..Default::default()
+        },
+        started: Instant::now(),
+        attempts: 0,
+    };
     for attempt in 0..attempts {
         let mut acc = candidates[attempt % candidates.len()].clone();
+        let mut observed = request_log.begin(&app, &acc);
         if (acc.expires_at - crate::store::now_secs()) < 300 {
-            if let Err(e) = app.refresh_expired(&mut acc).await {
-                app.pool.mark_failure(&acc.id, &model);
+            observed.diagnostics().stage = "refresh".into();
+            if app.refresh_expired(&mut acc).await.is_err() {
+                observed.record(Some("token_refresh_failed"), true);
                 last_status = 401;
-                last_err = format!("token refresh failed for {}: {e}", acc.email);
+                last_err = format!("token refresh failed for {}", acc.email);
                 continue;
             }
         }
@@ -420,14 +465,17 @@ async fn responses(State(app): State<AppHandle>, headers: HeaderMap, body: Bytes
             &headers,
             &body,
             &acc,
-            &model,
-            start,
             &session_key,
-            &api_key,
+            &mut request_log,
+            observed,
         )
         .await
         {
-            Ok(resp) => return resp,
+            Ok(mut resp) => {
+                resp.headers_mut()
+                    .insert("x-herdex-request-id", request_id.parse().unwrap());
+                return resp;
+            }
             Err((status, msg)) => {
                 last_status = status;
                 last_err = msg;
@@ -440,22 +488,25 @@ async fn responses(State(app): State<AppHandle>, headers: HeaderMap, body: Bytes
     let body = serde_json::json!({
         "error": {"message": format!("all pool attempts failed; last: {last_err}"), "type": "server_error"}
     });
-    (upstream_status(last_status), axum::Json(body)).into_response()
+    let mut response = (upstream_status(last_status), axum::Json(body)).into_response();
+    response
+        .headers_mut()
+        .insert("x-herdex-request-id", request_id.parse().unwrap());
+    response
 }
 
 type AttemptResult = Result<Response, (u16, String)>;
 
-#[allow(clippy::too_many_arguments)] // the pipeline stages are all distinct inputs
 async fn attempt_once(
     app: &App,
     client_headers: &HeaderMap,
     body: &[u8],
     acc: &Account,
-    model: &str,
-    start: Instant,
     session_key: &str,
-    api_key: &str,
+    request_log: &mut RequestLog,
+    mut observed: StreamLog,
 ) -> AttemptResult {
+    let model = request_log.entry.model.clone();
     let url = format!(
         "{}/responses",
         app.cfg.upstream.base_url.trim_end_matches('/')
@@ -476,6 +527,7 @@ async fn attempt_once(
         }
     }
     let mut res = loop {
+        observed.diagnostics().stage = "request_headers".into();
         let rb = app
             .http
             .post(&url)
@@ -497,141 +549,171 @@ async fn attempt_once(
             .header("Chatgpt-Account-Id", &acc.account_id);
         let rb = app.apply_identity(rb, client_headers);
         let res = rb.body(body.clone()).send().await;
-        let res = match res {
+        let mut res = match res {
             Ok(r) => r,
             Err(e) => {
-                app.pool.mark_failure(&acc.id, model);
-                return Err((0, format!("{}: {e}", acc.email)));
+                if e.is_connect() {
+                    observed.diagnostics().stage = "connect".into();
+                }
+                observed.diagnostics().error_detail = transport_detail(e);
+                observed.record(Some("upstream_request_error"), true);
+                return Err((0, format!("{}: upstream request error", acc.email)));
             }
         };
-        if res.status().as_u16() == 400 {
-            let headers = res.headers().clone();
-            let text = res.text().await.unwrap_or_default();
-            if let Some(param) = rejected_param(&text) {
-                if let Some(nb) = remove_param(&body, &param) {
-                    log::info!("stripping rejected param {param} and retrying");
-                    if !codex_client {
-                        app.learn_strip(param.clone());
+        let status = res.status().as_u16();
+        let entry = observed.entry.as_mut().unwrap();
+        entry.status = status as i64;
+        entry.latency_ms = request_log.started.elapsed().as_millis() as i64;
+        observed.diagnostics().upstream_request_id = ["x-request-id", "openai-request-id"]
+            .into_iter()
+            .filter_map(|name| res.headers().get(name)?.to_str().ok())
+            .find(|id| {
+                !id.is_empty()
+                    && id.len() <= 128
+                    && id
+                        .bytes()
+                        .all(|c| c.is_ascii_alphanumeric() || b"-_.".contains(&c))
+            })
+            .map(str::to_owned);
+
+        // full rate-limit header observability: log every limit-related response
+        // header verbatim (read-only; passthrough unaffected)
+        {
+            let mut rl = String::new();
+            for (k, v) in res.headers() {
+                let name = k.as_str();
+                if name.starts_with("x-codex")
+                    || name.contains("used-percent")
+                    || name.contains("window-minutes")
+                    || name.contains("reset-at")
+                    || name.contains("reset-after")
+                    || name.contains("rate-limit")
+                {
+                    if let Ok(vs) = v.to_str() {
+                        rl.push_str(&format!(" {}={}", name, vs));
                     }
-                    body = nb;
-                    continue;
                 }
             }
-            // genuine 400: rebuild the passthrough response so the normal
-            // status>=400 handling below sees it unchanged
-            let mut hr = http::Response::builder().status(axum::http::StatusCode::BAD_REQUEST);
-            for (k, v) in &headers {
-                hr = hr.header(k.as_str(), v.as_bytes());
+            if !rl.is_empty() {
+                log::info!(
+                    "rl-headers {} <- {} (status {}):{}",
+                    model,
+                    acc.email,
+                    res.status().as_u16(),
+                    rl
+                );
             }
-            let built = hr.body(text).map_err(|e| (500, e.to_string()))?;
-            break reqwest::Response::from(built);
+        }
+
+        // quota observation from upstream response headers
+        let pri = header_pct(res.headers(), "x-codex-bengalfox-primary-used-percent");
+        let sec = header_pct(res.headers(), "x-codex-bengalfox-secondary-used-percent");
+        let pri_reset = reset_epoch(
+            res.headers(),
+            "x-codex-bengalfox-primary-reset-at",
+            "x-codex-bengalfox-primary-reset-after-seconds",
+        );
+        let sec_reset = reset_epoch(
+            res.headers(),
+            "x-codex-bengalfox-secondary-reset-at",
+            "x-codex-bengalfox-secondary-reset-after-seconds",
+        );
+        let pri_secs = header_minutes(res.headers(), "x-codex-bengalfox-primary-window-minutes");
+        let sec_secs = header_minutes(res.headers(), "x-codex-bengalfox-secondary-window-minutes");
+        if pri.is_some() || sec.is_some() || pri_reset.is_some() || sec_reset.is_some() {
+            app.pool.observe(
+                &acc.id,
+                &model,
+                pool::Quota {
+                    primary_pct: pri.unwrap_or(0.0),
+                    secondary_pct: sec.unwrap_or(0.0),
+                    primary_reset_at: pri_reset.unwrap_or(0),
+                    secondary_reset_at: sec_reset.unwrap_or(0),
+                    primary_window_secs: pri_secs.unwrap_or(0),
+                    secondary_window_secs: sec_secs.unwrap_or(0),
+                    observed_at: crate::store::now_secs(),
+                },
+            );
+            // every successful response carries the main window's live usage —
+            // feed it to the probe sequence, deduplicating only when quota,
+            // metadata and the completed-log watermark are all unchanged.
+            // NOTE: main `x-codex-*` family, not bengalfox (spark window) above.
+            let main_pri = header_pct(res.headers(), "x-codex-primary-used-percent");
+            let main_reset = reset_epoch(
+                res.headers(),
+                "x-codex-primary-reset-at",
+                "x-codex-primary-reset-after-seconds",
+            );
+            if let (Some(p), Some(r)) = (main_pri, main_reset) {
+                let plan = headers_get(res.headers(), "x-codex-plan-type").unwrap_or_default();
+                app.store
+                    .add_probe(&acc.id, crate::store::now_secs(), p, r, &plan);
+            }
+        }
+
+        let resp_headers = res.headers().clone();
+        if status >= 400 {
+            observed.diagnostics().stage = "http_body".into();
+            let mut bytes = Vec::new();
+            loop {
+                match res.chunk().await {
+                    Ok(Some(chunk)) => {
+                        observed.diagnostics().received_bytes += chunk.len() as u64;
+                        bytes.extend_from_slice(&chunk);
+                    }
+                    Ok(None) => break,
+                    Err(error) => {
+                        observed.diagnostics().error_detail = transport_detail(error);
+                        observed
+                            .record(Some("upstream_error_body_error"), failoverable(status, ""));
+                        return Err((
+                            status,
+                            format!("{}: {status} upstream error body interrupted", acc.email),
+                        ));
+                    }
+                }
+            }
+            let snippet = String::from_utf8_lossy(&bytes);
+            let code = serde_json::from_slice::<serde_json::Value>(&bytes)
+                .ok()
+                .and_then(|v| {
+                    v.get("error")
+                        .unwrap_or(&v)
+                        .get("code")
+                        .and_then(|code| code.as_str())
+                        .and_then(error_code)
+                        .map(str::to_owned)
+                })
+                .unwrap_or_else(|| format!("http_{status}"));
+            observed.record(Some(&code), false);
+            if status == 400 {
+                if let Some(param) = rejected_param(&snippet) {
+                    if let Some(nb) = remove_param(&body, &param) {
+                        if !codex_client {
+                            app.learn_strip(param);
+                        }
+                        body = nb;
+                        observed = request_log.begin(app, acc);
+                        continue;
+                    }
+                }
+            }
+            if failoverable(status, &snippet) {
+                app.pool.mark_failure(&acc.id, &model);
+                return Err((status, format!("{}: {status} {snippet}", acc.email)));
+            }
+            // genuine client error: pass through untouched
+            let mut out = Response::builder()
+                .status(StatusCode::from_u16(status).unwrap_or(StatusCode::BAD_REQUEST));
+            copy_headers(out.headers_mut().unwrap(), &resp_headers);
+            return out
+                .body(Body::from(bytes))
+                .map_err(|e| (500, e.to_string()));
         }
         break res;
     };
-    let latency = start.elapsed().as_millis() as i64;
-
-    // full rate-limit header observability: log every limit-related response
-    // header verbatim (read-only; passthrough unaffected)
-    {
-        let mut rl = String::new();
-        for (k, v) in res.headers() {
-            let name = k.as_str();
-            if name.starts_with("x-codex")
-                || name.contains("used-percent")
-                || name.contains("window-minutes")
-                || name.contains("reset-at")
-                || name.contains("reset-after")
-                || name.contains("rate-limit")
-            {
-                if let Ok(vs) = v.to_str() {
-                    rl.push_str(&format!(" {}={}", name, vs));
-                }
-            }
-        }
-        if !rl.is_empty() {
-            log::info!(
-                "rl-headers {} <- {} (status {}):{}",
-                model,
-                acc.email,
-                res.status().as_u16(),
-                rl
-            );
-        }
-    }
-
-    // quota observation from upstream response headers
-    let pri = header_pct(res.headers(), "x-codex-bengalfox-primary-used-percent");
-    let sec = header_pct(res.headers(), "x-codex-bengalfox-secondary-used-percent");
-    let pri_reset = reset_epoch(
-        res.headers(),
-        "x-codex-bengalfox-primary-reset-at",
-        "x-codex-bengalfox-primary-reset-after-seconds",
-    );
-    let sec_reset = reset_epoch(
-        res.headers(),
-        "x-codex-bengalfox-secondary-reset-at",
-        "x-codex-bengalfox-secondary-reset-after-seconds",
-    );
-    let pri_secs = header_minutes(res.headers(), "x-codex-bengalfox-primary-window-minutes");
-    let sec_secs = header_minutes(res.headers(), "x-codex-bengalfox-secondary-window-minutes");
-    if pri.is_some() || sec.is_some() || pri_reset.is_some() || sec_reset.is_some() {
-        app.pool.observe(
-            &acc.id,
-            model,
-            pool::Quota {
-                primary_pct: pri.unwrap_or(0.0),
-                secondary_pct: sec.unwrap_or(0.0),
-                primary_reset_at: pri_reset.unwrap_or(0),
-                secondary_reset_at: sec_reset.unwrap_or(0),
-                primary_window_secs: pri_secs.unwrap_or(0),
-                secondary_window_secs: sec_secs.unwrap_or(0),
-                observed_at: crate::store::now_secs(),
-            },
-        );
-        // every successful response carries the main window's live usage —
-        // feed it to the probe sequence, deduplicating only when quota,
-        // metadata and the completed-log watermark are all unchanged.
-        // NOTE: main `x-codex-*` family, not bengalfox (spark window) above.
-        let main_pri = header_pct(res.headers(), "x-codex-primary-used-percent");
-        let main_reset = reset_epoch(
-            res.headers(),
-            "x-codex-primary-reset-at",
-            "x-codex-primary-reset-after-seconds",
-        );
-        if let (Some(p), Some(r)) = (main_pri, main_reset) {
-            let plan = headers_get(res.headers(), "x-codex-plan-type").unwrap_or_default();
-            app.store
-                .add_probe(&acc.id, crate::store::now_secs(), p, r, &plan);
-        }
-    }
-
     let status = res.status().as_u16();
     let resp_headers = res.headers().clone();
-    if status >= 400 {
-        let snippet = res.text().await.unwrap_or_default();
-        if failoverable(status, &snippet) {
-            app.pool.mark_failure(&acc.id, model);
-            log::info!(
-                "{model} -> {status} ({}ms) via {}: {}",
-                start.elapsed().as_millis(),
-                acc.email,
-                truncate(&snippet)
-            );
-            return Err((status, format!("{}: {status} {snippet}", acc.email)));
-        }
-        // genuine client error: pass through untouched
-        let mut out = Response::builder()
-            .status(StatusCode::from_u16(status).unwrap_or(StatusCode::BAD_REQUEST));
-        copy_headers(out.headers_mut().unwrap(), &resp_headers);
-        log::info!(
-            "{model} -> {status} ({}ms) via {}",
-            start.elapsed().as_millis(),
-            acc.email
-        );
-        return out
-            .body(Body::from(snippet))
-            .map_err(|e| (500, e.to_string()));
-    }
 
     // success status, BUT the upstream may carry in-stream error events
     // inside 200 streams (chatgpt.com sends server_is_overloaded/slow_down
@@ -642,31 +724,17 @@ async fn attempt_once(
     // bare lifecycle frames (created/in_progress) carry nothing.
     let mut buffered = Vec::new();
     let mut remainder = Bytes::new();
-    // Construct the guard before any await or response-body polling: dropping
-    // either the handler or the unpolled body must still finalize this attempt.
-    let mut observed = StreamLog {
-        stats: StreamStats::new(
-            resp_headers
-                .get("content-type")
-                .and_then(|v| v.to_str().ok())
-                .unwrap_or(""),
-        ),
-        store: app.store.clone(),
-        pool: app.pool.clone(),
-        account_id: acc.id.clone(),
-        entry: Some(LogEntry {
-            account_id: acc.id.clone(),
-            account_email: acc.email.clone(),
-            api_key: api_key.to_owned(),
-            model: model.to_owned(),
-            status: status as i64,
-            latency_ms: latency,
-            ..Default::default()
-        }),
-    };
+    observed.stats = StreamStats::new(
+        resp_headers
+            .get("content-type")
+            .and_then(|v| v.to_str().ok())
+            .unwrap_or(""),
+    );
+    observed.diagnostics().stage = "prefix".into();
     loop {
         let ended = match res.chunk().await {
             Ok(Some(c)) => {
+                observed.diagnostics().received_bytes += c.len() as u64;
                 // Apply the budget to bytes, not transport chunks. Observe
                 // only the bytes within it before deciding whether to commit.
                 let take = c.len().min(MAX_PREFIX_BYTES - buffered.len());
@@ -679,8 +747,8 @@ async fn attempt_once(
                 observed.eof();
                 true
             }
-            Err(_) => {
-                observed.transport_error();
+            Err(error) => {
+                observed.transport_error(error);
                 return Err((0, format!("{}: upstream stream error", acc.email)));
             }
         };
@@ -689,12 +757,6 @@ async fn attempt_once(
         // whether a coalesced content/error pair can still fail over.
         if let Some(code) = observed.stats.error_before_content.clone() {
             observed.record(None, false);
-            log::warn!(
-                "{} upstream error event before any content (code {:?}) via {} — failing over",
-                model,
-                code,
-                acc.email
-            );
             return Err((503, format!("{}: {code}", acc.email)));
         }
         if ended
@@ -725,21 +787,23 @@ async fn attempt_once(
     }
     // success: stream to client, log usage after the stream completes
     app.pool.mark_used(&acc.id);
-    app.pool.pin(session_key, &acc.id, model);
+    app.pool.pin(session_key, &acc.id, &model);
+    if observed.entry.is_some() {
+        observed.diagnostics().stage = "stream".into();
+    }
     let mut out =
         Response::builder().status(StatusCode::from_u16(status).unwrap_or(StatusCode::OK));
     copy_headers(out.headers_mut().unwrap(), &resp_headers);
-    // The CLI's statusline also updates from turn response headers, which
-    // would otherwise overwrite the poll's pool value with the single
-    // serving account's usage — rewrite to the pool aggregate for coherence.
-    if resp_headers.contains_key("x-codex-primary-used-percent") {
-        if let Some(p) = pool_used_pct(app) {
-            if let Ok(v) = axum::http::HeaderValue::from_str(&format!("{p:.1}")) {
-                out.headers_mut()
-                    .unwrap()
-                    .insert("x-codex-primary-used-percent", v);
-            }
-        }
+    // Rewrite every default-window field together, not just its percentage:
+    // a serving Free account's monthly duration must not relabel weekly usage.
+    if resp_headers.contains_key("x-codex-primary-used-percent")
+        || resp_headers.contains_key("x-codex-secondary-used-percent")
+    {
+        rewrite_pool_usage_headers(
+            out.headers_mut().unwrap(),
+            &pool_usage_windows(app).unwrap_or_default(),
+            crate::store::now_secs(),
+        );
     }
 
     let stream = async_stream::stream! {
@@ -753,14 +817,15 @@ async fn attempt_once(
         while let Some(chunk) = res.chunk().await.transpose() {
             match chunk {
                 Ok(c) => {
+                    observed.diagnostics().received_bytes += c.len() as u64;
                     observed.stats.push(&c);
                     yield Ok::<_, std::io::Error>(c);
                 }
                 Err(e) => {
                     // A body consumer may stop polling as soon as it receives
                     // Err, so finalize the upstream failure before yielding it.
-                    observed.transport_error();
-                    yield Err(std::io::Error::other(e));
+                    observed.transport_error(e);
+                    yield Err(std::io::Error::other("upstream stream error"));
                     return;
                 }
             }
@@ -771,6 +836,66 @@ async fn attempt_once(
         .map_err(|e| (500, e.to_string()))
 }
 
+struct RequestLog {
+    entry: LogEntry,
+    started: Instant,
+    attempts: u32,
+}
+
+impl RequestLog {
+    fn begin(&mut self, app: &App, acc: &Account) -> StreamLog {
+        self.attempts += 1;
+        let mut entry = self.entry.clone();
+        entry.account_id = acc.id.clone();
+        entry.account_email = acc.email.clone();
+        entry.diagnostics.as_mut().unwrap().attempt = self.attempts;
+        StreamLog {
+            stats: StreamStats::default(),
+            store: app.store.clone(),
+            pool: app.pool.clone(),
+            account_id: acc.id.clone(),
+            entry: Some(entry),
+            request_started: self.started,
+            attempt_started: Instant::now(),
+        }
+    }
+}
+
+// Only log a bounded transport cause chain; reqwest's URL can contain secrets.
+// HTTP/SSE error bodies and messages are deliberately not copied to diagnostics.
+fn transport_detail(error: reqwest::Error) -> String {
+    let error = error.without_url();
+    let mut detail = format!(
+        "timeout={} connect={} body={} decode={}",
+        error.is_timeout(),
+        error.is_connect(),
+        error.is_body(),
+        error.is_decode()
+    );
+    let mut cause: Option<&dyn std::error::Error> = Some(&error);
+    for _ in 0..8 {
+        let Some(current) = cause else { break };
+        detail.push_str(": ");
+        detail.push_str(
+            &current
+                .to_string()
+                .split_whitespace()
+                .map(|word| if word.contains("://") { "<url>" } else { word })
+                .collect::<Vec<_>>()
+                .join(" "),
+        );
+        cause = current.source();
+    }
+    detail.chars().take(2048).collect()
+}
+
+fn error_code(code: &str) -> Option<&str> {
+    (!code.is_empty()
+        && code.len() <= 80
+        && code.bytes().all(|c| c.is_ascii_alphanumeric() || c == b'_'))
+    .then_some(code)
+}
+
 /// Finalize once even when a response is dropped before its first poll or
 /// while suspended at a yield. User cancellation alone never cools an account.
 struct StreamLog {
@@ -779,15 +904,22 @@ struct StreamLog {
     pool: pool::Pool,
     account_id: String,
     entry: Option<LogEntry>,
+    request_started: Instant,
+    attempt_started: Instant,
 }
 
 impl StreamLog {
+    fn diagnostics(&mut self) -> &mut RequestDiagnostics {
+        self.entry.as_mut().unwrap().diagnostics.as_mut().unwrap()
+    }
+
     fn eof(&mut self) {
         self.stats.finish();
         self.record(None, false);
     }
 
-    fn transport_error(&mut self) {
+    fn transport_error(&mut self, error: reqwest::Error) {
+        self.diagnostics().error_detail = transport_detail(error);
         self.record(Some("upstream_stream_error"), true);
     }
 
@@ -799,6 +931,11 @@ impl StreamLog {
         entry.input_tokens = self.stats.input;
         entry.cached_tokens = self.stats.cached;
         entry.output_tokens = self.stats.output;
+        let diagnostics = entry.diagnostics.as_mut().unwrap();
+        diagnostics.elapsed_ms = self.request_started.elapsed().as_millis() as u64;
+        diagnostics.attempt_ms = self.attempt_started.elapsed().as_millis() as u64;
+        diagnostics.content_seen = self.stats.content_seen;
+        diagnostics.completed = self.stats.completed;
         entry.error = self
             .stats
             .error
@@ -813,13 +950,20 @@ impl StreamLog {
             .to_owned();
         if upstream_failed || self.stats.error.is_some() {
             self.pool.mark_failure(&self.account_id, &entry.model);
-            log::warn!(
-                "{} stream failed via {}: {}",
-                entry.model,
-                entry.account_email,
-                entry.error
-            );
         }
+        log::log!(
+            if entry.error.is_empty() {
+                log::Level::Info
+            } else {
+                log::Level::Warn
+            },
+            "request attempt: model={:?} account={:?} status={} error={:?} diagnostics={}",
+            entry.model,
+            entry.account_email,
+            entry.status,
+            entry.error,
+            serde_json::to_string(&entry.diagnostics).expect("request diagnostics")
+        );
         self.store.add_log(&entry);
     }
 }
@@ -1008,6 +1152,7 @@ impl StreamStats {
             let code = v
                 .get("code")
                 .and_then(|c| c.as_str())
+                .and_then(error_code)
                 .unwrap_or("unknown")
                 .to_owned();
             if !self.content_seen && self.error_before_content.is_none() {
@@ -1065,8 +1210,8 @@ fn reset_epoch(h: &reqwest::header::HeaderMap, at_key: &str, after_key: &str) ->
 
 /// Capacity-weighted pool usage: each account weighs by its calibrated
 /// tokens-per-1%; accounts without calibration share the mean of known
-/// weights (1.0 when nothing is calibrated yet). Shared by the usage poll
-/// and the outbound header rewrite so both CLI data sources agree.
+/// weights (1.0 when nothing is calibrated yet), independently within each
+/// duration group. Shared by the usage poll and outbound header rewrite.
 fn weighted_used(entries: &[(f64, Option<f64>)]) -> f64 {
     let known: Vec<f64> = entries.iter().filter_map(|(_, w)| *w).collect();
     let fallback = if known.is_empty() {
@@ -1088,27 +1233,88 @@ fn weighted_used(entries: &[(f64, Option<f64>)]) -> f64 {
     }
 }
 
-/// Pool-wide primary usage for the outbound header rewrite, sourced from the
-/// pool's latest "default" observations (refreshed by the usage poll and the
-/// per-request header observations). None when the pool has no data yet.
-fn pool_used_pct(app: &App) -> Option<f64> {
+/// Outbound headers use the latest account-level probe snapshots and the same
+/// duration grouping as the usage endpoint, ignoring disabled/deleted accounts.
+fn pool_usage_windows(app: &App) -> Option<Vec<PoolUsageWindow>> {
+    let accounts = app.store.list_accounts().ok()?;
     let snap = app.pool.snapshot();
-    let mut entries: Vec<(f64, Option<f64>)> = Vec::new();
-    for (acc, by_model) in &snap {
-        if let Some(q) = by_model.get("default") {
+    let mut entries = Vec::new();
+    for acc in accounts.into_iter().filter(|a| !a.disabled) {
+        if let Some(q) = snap.get(&acc.id).and_then(|m| m.get("default")) {
             let w = app
                 .store
-                .calibration(acc)
+                .calibration(&acc.id)
                 .ok()
                 .flatten()
                 .map(|c| c.tokens_per_pct);
-            entries.push((q.primary_pct, w));
+            entries.push((
+                Limit {
+                    primary: Window {
+                        used_pct: Some(q.primary_pct),
+                        window_seconds: Some(q.primary_window_secs),
+                        reset_at: Some(q.primary_reset_at),
+                    },
+                    secondary: Window {
+                        used_pct: Some(q.secondary_pct),
+                        window_seconds: Some(q.secondary_window_secs),
+                        reset_at: Some(q.secondary_reset_at),
+                    },
+                    ..Default::default()
+                },
+                w,
+            ));
         }
     }
-    if entries.is_empty() {
-        None
-    } else {
-        Some(weighted_used(&entries))
+    Some(aggregate_usage_windows(&entries))
+}
+
+fn rewrite_pool_usage_headers(headers: &mut HeaderMap, windows: &[PoolUsageWindow], now: i64) {
+    for slot in ["primary", "secondary"] {
+        for suffix in [
+            "used-percent",
+            "window-minutes",
+            "reset-at",
+            "reset-after-seconds",
+        ] {
+            headers.remove(format!("x-codex-{slot}-{suffix}"));
+        }
+    }
+    headers.insert(
+        "x-codex-plan-type",
+        axum::http::HeaderValue::from_static("pro"),
+    );
+    // No known pool window: omit the single account's quota instead of
+    // presenting it as a pool aggregate or manufacturing zero usage.
+    for (i, window) in windows.iter().enumerate() {
+        let prefix = match i {
+            0 => "x-codex-primary".to_string(),
+            1 => "x-codex-secondary".to_string(),
+            _ => format!("x-herdex-pool-{}-primary", window.seconds),
+        };
+        let mut fields = vec![
+            ("used-percent", window.pct.round() as i64),
+            ("window-minutes", window.seconds / 60),
+        ];
+        if let Some(at) = window.reset_at {
+            fields.push(("reset-at", at));
+            fields.push(("reset-after-seconds", (at - now).max(0)));
+        }
+        for (suffix, value) in fields {
+            headers.insert(
+                axum::http::HeaderName::from_bytes(format!("{prefix}-{suffix}").as_bytes())
+                    .unwrap(),
+                axum::http::HeaderValue::from_str(&value.to_string()).unwrap(),
+            );
+        }
+        if i >= 2 {
+            headers.insert(
+                axum::http::HeaderName::from_bytes(
+                    format!("x-herdex-pool-{}-limit-name", window.seconds).as_bytes(),
+                )
+                .unwrap(),
+                axum::http::HeaderValue::from_static("herdex pool"),
+            );
+        }
     }
 }
 
@@ -1124,10 +1330,6 @@ fn copy_headers(dst: &mut axum::http::HeaderMap, src: &reqwest::header::HeaderMa
             dst.insert(name, val);
         }
     }
-}
-
-fn truncate(s: &str) -> String {
-    s.chars().take(200).collect()
 }
 
 /// Extracts the parameter name from a backend 400 rejection that names it,
@@ -1335,6 +1537,32 @@ mod tests {
     use futures_util::StreamExt;
 
     #[tokio::test]
+    async fn transport_diagnostics_remove_url_credentials_and_query_parameters() {
+        let error = reqwest::Client::new()
+            .get("ftp://username:transport-secret@example.test/responses?token=query-secret")
+            .send()
+            .await
+            .unwrap_err();
+        let detail = transport_detail(error);
+        for secret in [
+            "username",
+            "transport-secret",
+            "query-secret",
+            "example.test",
+            "ftp://",
+        ] {
+            assert!(
+                !detail.contains(secret),
+                "URL data must not appear in diagnostics"
+            );
+        }
+        assert!(
+            detail.contains("scheme"),
+            "keep the underlying cause: {detail}"
+        );
+    }
+
+    #[tokio::test]
     async fn dropped_stream_finalizes_once_before_poll_and_after_yield() {
         for poll_first in [false, true] {
             for outcome in ["cancelled", "completed", "eof", "transport_error"] {
@@ -1360,9 +1588,13 @@ mod tests {
                     entry: Some(LogEntry {
                         account_email: "a1@test".into(),
                         model: "gpt-5.5".into(),
+                        service_tier: Some("priority".into()),
                         status: 200,
+                        diagnostics: Some(RequestDiagnostics::default()),
                         ..Default::default()
                     }),
+                    request_started: Instant::now(),
+                    attempt_started: Instant::now(),
                 };
                 observed.stats.push(b"data:{\"type\":\"token_count\",\"usage\":{\"input_tokens\":120,\"cached_tokens\":80,\"output_tokens\":45}}\n\n");
                 match outcome {
@@ -1370,7 +1602,13 @@ mod tests {
                         .stats
                         .push(b"data:{\"type\":\"response.completed\"}\n\n"),
                     "eof" => observed.eof(),
-                    "transport_error" => observed.transport_error(),
+                    "transport_error" => observed.transport_error(
+                        reqwest::Client::new()
+                            .get("http://[invalid")
+                            .send()
+                            .await
+                            .unwrap_err(),
+                    ),
                     _ => {}
                 }
                 // Check both an unpolled body and one suspended at yield. The
@@ -1386,6 +1624,7 @@ mod tests {
                 drop(stream);
                 let logs = store.recent_logs(5).unwrap();
                 assert_eq!(logs.len(), 1, "{outcome}: no missing or duplicate log");
+                assert_eq!(logs[0].service_tier.as_deref(), Some("priority"));
                 assert_eq!(
                     (
                         logs[0].input_tokens,
@@ -1462,6 +1701,55 @@ mod tests {
         // nothing calibrated → equal weights
         let e = vec![(29.0, None::<f64>), (30.0, None)];
         assert!((weighted_used(&e) - 29.5).abs() < 1e-9);
+    }
+
+    #[test]
+    fn pool_windows_count_an_account_once_per_duration() {
+        let window = |pct, reset| Window {
+            used_pct: Some(pct),
+            window_seconds: Some(604800),
+            reset_at: Some(reset),
+        };
+        let windows = aggregate_usage_windows(&[
+            (
+                Limit {
+                    primary: window(20.0, 100),
+                    secondary: window(40.0, 200),
+                    ..Default::default()
+                },
+                Some(2.0),
+            ),
+            (
+                Limit {
+                    primary: window(80.0, 300),
+                    ..Default::default()
+                },
+                Some(1.0),
+            ),
+        ]);
+        assert_eq!(windows.len(), 1);
+        assert!((windows[0].pct - 160.0 / 3.0).abs() < 1e-9);
+        assert_eq!(windows[0].reset_at, Some(200));
+    }
+
+    #[test]
+    fn pool_windows_require_a_known_finite_percentage_and_valid_duration() {
+        for (pct, seconds) in [
+            (None, Some(604800)),
+            (Some(f64::NAN), Some(604800)),
+            (Some(f64::INFINITY), Some(604800)),
+            (Some(20.0), None),
+            (Some(20.0), Some(0)),
+            (Some(20.0), Some(-1)),
+            (Some(20.0), Some(i64::MAX)),
+        ] {
+            assert!(PoolUsageWindow::from_window(&Window {
+                used_pct: pct,
+                window_seconds: seconds,
+                reset_at: Some(100),
+            })
+            .is_none());
+        }
     }
 
     #[test]
