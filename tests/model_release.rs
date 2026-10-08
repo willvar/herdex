@@ -232,9 +232,11 @@ async fn version_changes_failures_and_recovery_recheck_all_accounts() {
     assert!(f.app.refresh_model_version(&f.release_url).await.unwrap());
     f.refresh_catalogs().await;
     let models: Value = f.list("/v1/models").await.json().await.unwrap();
-    assert_eq!(models["data"].as_array().unwrap().len(), 2); // union: a1-a3 keep reserve, a4 lacks it
+    assert_eq!(models["data"].as_array().unwrap().len(), 4); // union plus one Fast alias per GPT model
     assert_eq!(models["data"][0]["id"], "gpt-6-sol");
-    assert_eq!(models["data"][1]["id"], "gpt-reserve");
+    assert_eq!(models["data"][1]["id"], "gpt-6-sol-fast");
+    assert_eq!(models["data"][2]["id"], "gpt-reserve");
+    assert_eq!(models["data"][3]["id"], "gpt-reserve-fast");
     // /models serves the same union without an extra upstream query
     let legacy: Value = f.list("/models").await.json().await.unwrap();
     assert_eq!(legacy, models);
@@ -257,7 +259,17 @@ async fn version_changes_failures_and_recovery_recheck_all_accounts() {
         .iter()
         .map(|m| m["id"].as_str().unwrap())
         .collect();
-    assert_eq!(slugs, ["gpt-6-sol", "gpt-6.1-sol", "gpt-reserve"]);
+    assert_eq!(
+        slugs,
+        [
+            "gpt-6-sol",
+            "gpt-6-sol-fast",
+            "gpt-6.1-sol",
+            "gpt-6.1-sol-fast",
+            "gpt-reserve",
+            "gpt-reserve-fast"
+        ]
+    );
     assert!(f.upstream.lock().unwrap().queries[4..]
         .iter()
         .all(|(_, v)| v == "0.159.2"));
@@ -294,15 +306,27 @@ async fn model_catalog_tracks_account_lifecycle_without_refresh() {
     f.set_release(StatusCode::OK, r#"{"tag_name":"rust-v0.159.1"}"#);
     f.app.refresh_model_version(&f.release_url).await.unwrap();
     f.refresh_catalogs().await;
-    f.assert_models(&["gpt-6-sol", "gpt-reserve"]).await;
+    f.assert_models(&[
+        "gpt-6-sol",
+        "gpt-6-sol-fast",
+        "gpt-reserve",
+        "gpt-reserve-fast",
+    ])
+    .await;
 
     // Shared models remain advertised while another enabled account has them.
     for id in ["a1", "a2"] {
         f.store.set_account_disabled(id, true).unwrap();
-        f.assert_models(&["gpt-6-sol", "gpt-reserve"]).await;
+        f.assert_models(&[
+            "gpt-6-sol",
+            "gpt-6-sol-fast",
+            "gpt-reserve",
+            "gpt-reserve-fast",
+        ])
+        .await;
     }
     f.store.set_account_disabled("a3", true).unwrap();
-    f.assert_models(&["gpt-6-sol"]).await;
+    f.assert_models(&["gpt-6-sol", "gpt-6-sol-fast"]).await;
     let response = reqwest::Client::new()
         .post(format!("{}/v1/responses", f.gateway_url))
         .bearer_auth("test-key")
@@ -314,16 +338,22 @@ async fn model_catalog_tracks_account_lifecycle_without_refresh() {
 
     // Re-enabling reuses the retained catalog without another upstream query.
     f.store.set_account_disabled("a1", false).unwrap();
-    f.assert_models(&["gpt-6-sol", "gpt-reserve"]).await;
+    f.assert_models(&[
+        "gpt-6-sol",
+        "gpt-6-sol-fast",
+        "gpt-reserve",
+        "gpt-reserve-fast",
+    ])
+    .await;
     let candidates = f.app.pool.candidates("gpt-reserve").unwrap();
     assert_eq!(candidates.len(), 1);
     assert_eq!(candidates[0].id, "a1");
 
     f.store.delete_account("a1").unwrap();
-    f.assert_models(&["gpt-6-sol"]).await;
+    f.assert_models(&["gpt-6-sol", "gpt-6-sol-fast"]).await;
     // Even a late catalog update for a deleted account must stay invisible.
     f.app.pool.set_account_models("a1", &["gpt-orphan".into()]);
-    f.assert_models(&["gpt-6-sol"]).await;
+    f.assert_models(&["gpt-6-sol", "gpt-6-sol-fast"]).await;
     f.store.delete_account("a4").unwrap();
     f.assert_models(&[]).await;
     assert_eq!(f.upstream.lock().unwrap().queries.len(), 4);
@@ -349,7 +379,13 @@ async fn model_catalog_ignores_missing_and_empty_account_catalogs() {
             "gpt-reserve".into(),
         ],
     );
-    f.assert_models(&["gpt-6-sol", "gpt-reserve"]).await;
+    f.assert_models(&[
+        "gpt-6-sol",
+        "gpt-6-sol-fast",
+        "gpt-reserve",
+        "gpt-reserve-fast",
+    ])
+    .await;
     assert!(f.upstream.lock().unwrap().queries.is_empty());
 }
 
@@ -359,7 +395,7 @@ async fn model_catalog_account_query_failure_returns_an_error() {
     f.set_release(StatusCode::OK, r#"{"tag_name":"rust-v0.159.1"}"#);
     f.app.refresh_model_version(&f.release_url).await.unwrap();
     f.app.pool.set_account_models("a1", &["gpt-6-sol".into()]);
-    f.assert_models(&["gpt-6-sol"]).await;
+    f.assert_models(&["gpt-6-sol", "gpt-6-sol-fast"]).await;
 
     rusqlite::Connection::open(f.root.join("herdex.db"))
         .unwrap()

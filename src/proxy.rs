@@ -1,6 +1,7 @@
 //! Codex client-facing routes: pure pass-through router with pool-aware
 //! auth swapping. Request bodies are forwarded byte-for-byte, so codex wire
-//! features (reasoning, service tier, encrypted CoT) are inherited for free.
+//! features (reasoning, service tier, encrypted CoT) are inherited for free;
+//! the documented server-side model aliases are normalized before forwarding.
 
 use crate::app::{App, AppHandle};
 use crate::pool;
@@ -28,6 +29,8 @@ const HOP_HEADERS: [&str; 9] = [
 const MAX_PREFIX_BYTES: usize = 2 * 1024 * 1024;
 // Observation is best-effort; exceeding this budget never truncates the wire.
 const MAX_OBSERVATION_BYTES: usize = 8 * 1024 * 1024;
+const FAST_MODEL_SUFFIX: &str = "-fast";
+const FAST_SERVICE_TIER: &str = "priority";
 
 pub fn router() -> axum::Router<AppHandle> {
     axum::Router::new()
@@ -87,8 +90,9 @@ fn auth_check(app: &App, headers: &HeaderMap) -> Result<String, Response> {
 }
 
 /// Model discovery: the union of existing, enabled accounts' discovered
-/// catalogs (or the config override). Requests skip accounts whose known
-/// catalogs lack the requested model.
+/// catalogs (or the config override), plus server-side Fast aliases for GPT
+/// models. Requests skip accounts whose known catalogs lack the requested
+/// model; alias requests are normalized before selection.
 async fn models(State(app): State<AppHandle>, headers: HeaderMap) -> Response {
     if auth_check(&app, &headers).is_err() {
         return (StatusCode::UNAUTHORIZED, "invalid api key").into_response();
@@ -112,11 +116,37 @@ async fn models(State(app): State<AppHandle>, headers: HeaderMap) -> Response {
     } else {
         app.cfg.models.clone()
     };
-    let data: Vec<serde_json::Value> = slugs
+    let data: Vec<serde_json::Value> = advertised_model_ids(&slugs)
         .iter()
         .map(|m| serde_json::json!({"id": m, "object": "model", "owned_by": "openai"}))
         .collect();
     axum::Json(serde_json::json!({"object": "list", "data": data})).into_response()
+}
+
+fn is_fast_capable_model(model: &str) -> bool {
+    matches!(model.get(..4), Some(prefix) if prefix.eq_ignore_ascii_case("gpt-"))
+        && matches!(model.get(4..), Some(rest) if !rest.is_empty())
+        && !model.ends_with(FAST_MODEL_SUFFIX)
+}
+
+fn fast_alias_for(model: &str) -> Option<String> {
+    is_fast_capable_model(model).then(|| format!("{model}{FAST_MODEL_SUFFIX}"))
+}
+
+fn fast_alias_base(model: &str) -> Option<&str> {
+    let base = model.strip_suffix(FAST_MODEL_SUFFIX)?;
+    is_fast_capable_model(base).then_some(base)
+}
+
+fn advertised_model_ids(slugs: &[String]) -> Vec<String> {
+    let mut ids = std::collections::BTreeSet::new();
+    for slug in slugs {
+        ids.insert(slug.clone());
+        if let Some(alias) = fast_alias_for(slug) {
+            ids.insert(alias);
+        }
+    }
+    ids.into_iter().collect()
 }
 
 #[derive(Clone, Copy)]
@@ -388,22 +418,58 @@ fn upstream_status(last: u16) -> StatusCode {
     StatusCode::from_u16(if last >= 400 { last } else { 502 }).unwrap_or(StatusCode::BAD_GATEWAY)
 }
 
+struct PreparedRequest {
+    model: String,
+    service_tier: Option<String>,
+    body: Vec<u8>,
+}
+
+/// Reads the request metadata while preserving ordinary request bytes. A
+/// `-fast` model alias is the one deliberate exception: it becomes the base
+/// model and forces the upstream Fast service tier.
+fn prepare_request(body: &[u8]) -> Option<PreparedRequest> {
+    let mut value: serde_json::Value = serde_json::from_slice(body).ok()?;
+    let requested_model = value.get("model")?.as_str()?.to_owned();
+    let service_tier = match value.get("service_tier") {
+        None | Some(serde_json::Value::Null) => Some(String::new()),
+        Some(serde_json::Value::String(tier)) => Some(tier.clone()),
+        _ => None,
+    };
+    let Some(base_model) = fast_alias_base(&requested_model) else {
+        return Some(PreparedRequest {
+            model: requested_model,
+            service_tier,
+            body: body.to_vec(),
+        });
+    };
+
+    let object = value.as_object_mut()?;
+    object.insert(
+        "model".into(),
+        serde_json::Value::String(base_model.to_owned()),
+    );
+    object.insert(
+        "service_tier".into(),
+        serde_json::Value::String(FAST_SERVICE_TIER.into()),
+    );
+    Some(PreparedRequest {
+        model: base_model.to_owned(),
+        service_tier: Some(FAST_SERVICE_TIER.into()),
+        body: serde_json::to_vec(&value).ok()?,
+    })
+}
+
 async fn responses(State(app): State<AppHandle>, headers: HeaderMap, body: Bytes) -> Response {
     let api_key = match auth_check(&app, &headers) {
         Ok(k) => k,
         Err(res) => return res,
     };
-    let probe: Result<serde_json::Value, _> = serde_json::from_slice(&body);
-    let (model, service_tier) = match probe.ok().and_then(|v| {
-        let model = v.get("model")?.as_str()?.to_owned();
-        let tier = match v.get("service_tier") {
-            None | Some(serde_json::Value::Null) => Some(String::new()),
-            Some(serde_json::Value::String(tier)) => Some(tier.clone()),
-            _ => None,
-        };
-        Some((model, tier))
-    }) {
-        Some(metadata) => metadata,
+    let PreparedRequest {
+        model,
+        service_tier,
+        body: request_body,
+    } = match prepare_request(&body) {
+        Some(request) => request,
         None => return (
             StatusCode::BAD_REQUEST,
             r#"{"error":{"message":"missing \"model\" in request body","type":"server_error"}}"#,
@@ -463,7 +529,7 @@ async fn responses(State(app): State<AppHandle>, headers: HeaderMap, body: Bytes
         match attempt_once(
             &app,
             &headers,
-            &body,
+            &request_body,
             &acc,
             &session_key,
             &mut request_log,
@@ -1665,6 +1731,22 @@ mod tests {
             Some("stream_options".to_string())
         );
         assert_eq!(rejected_param(r#"{"detail":"Invalid value"}"#), None);
+    }
+
+    #[test]
+    fn fast_aliases_are_gpt_only_and_not_recursive() {
+        let slugs = [
+            "o3".to_string(),
+            "gpt-5.5".to_string(),
+            "gpt-5.5-fast".to_string(),
+        ];
+        assert_eq!(
+            advertised_model_ids(&slugs),
+            ["gpt-5.5", "gpt-5.5-fast", "o3"]
+        );
+        assert_eq!(fast_alias_base("gpt-5.5-fast"), Some("gpt-5.5"));
+        assert_eq!(fast_alias_base("o3-fast"), None);
+        assert_eq!(fast_alias_base("gpt-5.5-fast-fast"), None);
     }
 
     #[test]

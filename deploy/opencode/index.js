@@ -2,6 +2,7 @@ import { Plugin, Provider, Model } from "@opencode/plugin"
 
 const REFRESH_MS = 60_000
 const METADATA = ["name", "family", "capabilities", "limit", "cost", "time"]
+const isFastAlias = (id) => /^gpt-.+-fast$/i.test(id)
 
 // Used only when the catalog and endpoint supply no display name.
 const prettyName = (id) => id
@@ -41,7 +42,10 @@ export default Plugin.define({
       } catch {
         console.error("herdex-models: catalog unavailable; using source metadata")
       }
-      return { entries: body.data, catalog }
+      // Herdex also advertises `-fast` model aliases for generic clients.
+      // OpenCode has native variants, so keep one model entry and expose Fast
+      // through the existing #fast and #<reasoning> fast choices below.
+      return { entries: body.data.filter((entry) => !isFastAlias(entry.id)), catalog }
     }
 
     let source = { entries: [], catalog: new Map() }

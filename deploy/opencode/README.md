@@ -4,6 +4,8 @@
 每 60 秒刷新一次，推理请求使用 `/v1/responses`。
 
 - 模型清单以 herdex 为准，无硬编码模型列表。
+- herdex 面向通用客户端暴露的 `gpt-*-fast` 模型别名会被插件隐藏；OpenCode 使用
+  同一模型下的 variant，不重复注册别名模型。
 - 从 OpenCode 的 OpenAI 同名模型继承显示名、推理档位、能力、上下文限制及参考价格。
   优先使用当前可用模型的元数据，否则读取目录源定义；不复制直连端点或认证信息。
 - 对 `gpt-*` 模型额外提供 `#fast`；该档位向 herdex 请求 `service_tier: "priority"`，

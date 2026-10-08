@@ -50,8 +50,8 @@ codex 专用账号池网关（Rust）。把多个 ChatGPT 账号聚合成一个 
 - **模型目录自动更新**：复用后台轮询，从 Codex 官方稳定版发布频道获取
   `client_version`，按账号采集上游目录；无 `models` 配置覆盖时，两个发现接口
   （`/models`、`/v1/models`）返回启用账号已采集目录的并集，禁用或删除账号立即
-  不参与合并；调度跳过目录明确不支持模型的账号。版本源不可用时两个目录接口
-  返回 503，不清除已有目录、用量或中断现有推理请求
+  不参与合并，并为 GPT 模型补充 `-fast` 别名；调度跳过目录明确不支持模型的账号。
+  版本源不可用时两个目录接口返回 503，不清除已有目录、用量或中断现有推理请求
 
 ## 构建
 
@@ -173,7 +173,7 @@ herdex 上，凭据始终是 herdex API key，无客户端 OAuth。
 接口总览（Bearer 认证用 manage 面板里创建的 API key）：
 
 - `POST /v1/responses`、`POST /backend-api/codex/responses` —— SSE 流式透传
-- `GET  /v1/models`、`GET /models` —— 启用账号模型并集（codex CLI 使用后者）
+- `GET  /v1/models`、`GET /models` —— 启用账号模型并集及 GPT Fast 别名（codex CLI 使用后者）
 - `GET  /api/codex/usage`（及 `/v1/api/codex/usage`、`/wham/usage`）—— 池子聚合用量
 - `GET  /v1/user-auth-credential/whoami` —— PAT 虚拟身份
 - `GET  /api/codex/accounts/check`（及 `/backend-api/wham/accounts/check`）—— 认证后的虚拟工作区发现
@@ -188,9 +188,13 @@ herdex 上，凭据始终是 herdex API key，无客户端 OAuth。
 配套插件位于 [`deploy/opencode/`](deploy/opencode/README.md)：
 启动时从 herdex 拉取模型清单，每分钟刷新，继承 OpenCode 目录中的同名模型显示名、
 推理强度、能力与限制；`gpt-*` 模型额外提供 `#fast` 及与推理档位组合的
-`#max fast` 等选项，映射为 `service_tier: "priority"`。使用 Responses API，可通过
+`#max fast` 等选项，映射为 `service_tier: "priority"`。插件会隐藏面向通用客户端的
+`gpt-*-fast` 模型别名。使用 Responses API，可通过
 `http://<herdex-host>:<listen 端口>/v1` 连接，无需证书配置或手动维护模型列表。
 安装与配置步骤见插件目录的 README。
+
+只支持 `model` 字段的 OpenAI-compatible 客户端可直接请求 `gpt-6.1-sol-fast`；
+herdex 会将其还原为 `gpt-6.1-sol` 并向上游注入 `service_tier: "priority"`。
 
 ## 测试
 
