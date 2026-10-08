@@ -80,9 +80,9 @@ export default Plugin.define({
             variants.push({ id: "fast", settings: { serviceTier: "priority" } })
           }
           for (const variant of [...variants]) {
-            if (variant.id === "fast" || variant.id.endsWith("-fast")) continue
+            if (variant.id === "fast" || variant.id.endsWith(" fast")) continue
             if (variant.settings?.reasoningEffort === undefined) continue
-            const id = `${variant.id}-fast`
+            const id = `${variant.id} fast`
             if (variants.some((candidate) => candidate.id === id)) continue
             variants.push({
               id,
