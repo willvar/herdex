@@ -10,7 +10,11 @@ codex 专用账号池网关（Rust）。把多个 ChatGPT 账号聚合成一个 
 
 - **配额感知调度**：least usage（模型级与账号级取 max，防止模型级 0% 遮蔽账号级耗尽）→ LRU 排序；单账号 429 只冷却该账号+模型组合（短 TTL），永不熔断全池，全部冷却时仍按"上次失败时间最早者优先"返回候选而非报错
 - **黏性让位可配**：`pin_yield_gap_pp`（面板可调）三档语义：`-1` 黏性优先（钉住的号永远先试，哪怕已耗尽）、`0` 纯水填、`>0` 滞后带（黏性在领先值 gap 内不让位）
-- **池子口径 statusline**：CLI 的 usage 轮询返回**容量加权的池子聚合值**；turn 响应头同步改写为池子值——两条写入源一致，statusline 永远显示"整个号池还剩多少"而非单号
+- **池子口径 statusline**：usage 轮询与 turn 响应头按实际窗口时长分别聚合，
+  周额度与月额度不混算；每组百分比、容量权重与最早重置时间都来自同一组账号。
+  前两个周期按时长递增放入主、次窗口，其余周期通过附加额度返回；
+  未知百分比或周期不当作 0%，没有已知窗口时 usage 返回 502。
+  容量权重沿用已有主窗口校准，未校准窗口在各自组内回退，不改历史计量
 - **流内过载 failover**：chatgpt.com 可能在 200 SSE 流内携带
   `server_is_overloaded` 错误帧——缓冲至首个内容帧，错误先于内容到达时
   无痕换号重试；判定不依赖 HTTP 分块数量。SSE 前缀超过 2 MiB 仍无完整内容时，
@@ -31,7 +35,23 @@ codex 专用账号池网关（Rust）。把多个 ChatGPT 账号聚合成一个 
   → `/wham/*` 重映射），CLI 的附属后端调用（遥测/插件/设置）有处可去
 - **400 参数自愈**：上游拒绝的参数（如 max_output_tokens）自动剥离重试，学习结果落盘复用
 - **可观测**：面板（`/manage/panel`）+ manage API；请求级 token 用量日志（按账号/模型/key 聚合），保留期可配
+- **失败诊断**：每次上游尝试（含 HTTP 错误、连接失败、参数重试和断流）单独入日志，
+  用 `diagnostics.request_id` 与递增的 `attempt` 关联；响应头 `x-herdex-request-id` 可用于对照。
+  面板展开「诊断」可查看失败阶段、上游请求编号、累计/单次耗时、已接收字节数和底层传输错误链。
+  `status=0` 表示尚未收到 HTTP 响应；流中断可能仍为 HTTP 200，面板按错误标红。
+  诊断不保存请求正文、认证头或上游错误消息正文；旧记录的诊断保持未知。
+  请求计数包含每次尝试，失败行只保留实际观察到的 token 用量。
+- **Banked reset 消耗顺序**：面板消耗前读取券明细，明确选择 `expires_at` 最早的可用券；
+  永不过期券排在有明确过期时间的券之后，同一过期时间保持上游顺序；无法解析过期时间时拒绝消耗。
+- **请求档位记录**：请求日志保存客户端的 `service_tier`，`priority` 表示请求 Fast；
+  历史未记录与新请求未指定档位分开表示。不保存请求正文，也不据此推定实际消费倍率
+  或调整原始 token 数量、容量校准
 - **令牌自维护**：后台 proactive refresh，过期前自动续
+- **模型目录自动更新**：复用后台轮询，从 Codex 官方稳定版发布频道获取
+  `client_version`，按账号采集上游目录；无 `models` 配置覆盖时，两个发现接口
+  （`/models`、`/v1/models`）返回启用账号已采集目录的并集，禁用或删除账号立即
+  不参与合并；调度跳过目录明确不支持模型的账号。版本源不可用时两个目录接口
+  返回 503，不清除已有目录、用量或中断现有推理请求
 
 ## 构建
 
@@ -72,6 +92,12 @@ beta-features = "multi_agent"
 [log]
 level = "info"
 ```
+
+启动时立即查询 `https://releases.openai.com/codex/channels/latest`；成功后约每小时
+检查版本（账号模型目录仍每约 2 分钟采集），失败后下一轮重试。模型目录查询只使用
+官方版本，不读取旧配置中的 `header-defaults.version`，也不以旧版本兜底；取不到
+版本时 `GET /models` 和 `GET /v1/models` 均返回 503，恢复后自动重新采集。两个
+接口（无 `models` 配置覆盖时）同源：返回当前存在且启用账号的已采集目录并集。
 
 ## 运行
 
@@ -147,7 +173,7 @@ herdex 上，凭据始终是 herdex API key，无客户端 OAuth。
 接口总览（Bearer 认证用 manage 面板里创建的 API key）：
 
 - `POST /v1/responses`、`POST /backend-api/codex/responses` —— SSE 流式透传
-- `GET  /v1/models`
+- `GET  /v1/models`、`GET /models` —— 启用账号模型并集（codex CLI 使用后者）
 - `GET  /api/codex/usage`（及 `/v1/api/codex/usage`、`/wham/usage`）—— 池子聚合用量
 - `GET  /v1/user-auth-credential/whoami` —— PAT 虚拟身份
 - `GET  /api/codex/accounts/check`（及 `/backend-api/wham/accounts/check`）—— 认证后的虚拟工作区发现

@@ -88,12 +88,32 @@ pub struct LogEntry {
     pub account_email: String,
     pub api_key: String,
     pub model: String,
+    /// Requested tier, not confirmation of the tier actually served.
+    /// None = not recorded or invalid; Some("") = omitted/null on a new request.
+    pub service_tier: Option<String>,
     pub status: i64,
     pub latency_ms: i64,
     pub input_tokens: i64,
     pub cached_tokens: i64,
     pub output_tokens: i64,
     pub error: String,
+    /// None for historical rows; never reconstruct missing diagnostics.
+    pub diagnostics: Option<RequestDiagnostics>,
+}
+
+#[derive(Clone, Default, Serialize, Deserialize)]
+pub struct RequestDiagnostics {
+    pub request_id: String,
+    /// Monotonic within one inbound request, including parameter retries.
+    pub attempt: u32,
+    pub stage: String,
+    pub upstream_request_id: Option<String>,
+    pub elapsed_ms: u64,
+    pub attempt_ms: u64,
+    pub received_bytes: u64,
+    pub content_seen: bool,
+    pub completed: bool,
+    pub error_detail: String,
 }
 
 #[derive(Clone, Copy)]
@@ -176,12 +196,14 @@ CREATE TABLE IF NOT EXISTS request_log (
 	account_id TEXT NOT NULL DEFAULT '',
 	account_email TEXT NOT NULL DEFAULT '',
 	model  TEXT NOT NULL,
+	service_tier TEXT,
 	status INTEGER NOT NULL,
 	latency_ms INTEGER NOT NULL DEFAULT 0,
 	input_tokens  INTEGER NOT NULL DEFAULT 0,
 	cached_tokens INTEGER NOT NULL DEFAULT 0,
 	output_tokens INTEGER NOT NULL DEFAULT 0,
-	error  TEXT NOT NULL DEFAULT ''
+	error  TEXT NOT NULL DEFAULT '',
+	diagnostics TEXT
 );
 CREATE TABLE IF NOT EXISTS account_models (
 	account_id TEXT NOT NULL,
@@ -245,6 +267,15 @@ impl Store {
                 [],
             )
             .map_err(|e| format!("migrate: {e}"))?;
+        }
+        // Never infer a tier for older requests: NULL means not recorded.
+        if !cols.iter().any(|c| c == "service_tier") {
+            conn.execute("ALTER TABLE request_log ADD COLUMN service_tier TEXT", [])
+                .map_err(|e| format!("migrate: {e}"))?;
+        }
+        if !cols.iter().any(|c| c == "diagnostics") {
+            conn.execute("ALTER TABLE request_log ADD COLUMN diagnostics TEXT", [])
+                .map_err(|e| format!("migrate: {e}"))?;
         }
         // v3: usage_probes gained a plan column (plan change resets accounting)
         let probe_cols: Vec<String> = {
@@ -554,14 +585,20 @@ impl Store {
 
     pub fn add_log(&self, e: &LogEntry) {
         let conn = self.conn.lock().unwrap_or_else(|e| e.into_inner());
-        let _ = conn.execute(
-            "INSERT INTO request_log(ts,account_email,api_key,model,status,latency_ms,input_tokens,cached_tokens,output_tokens,error,account_id)
-             VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11)",
+        let diagnostics = e
+            .diagnostics
+            .as_ref()
+            .map(|d| serde_json::to_string(d).expect("request diagnostics"));
+        if let Err(error) = conn.execute(
+            "INSERT INTO request_log(ts,account_email,api_key,model,status,latency_ms,input_tokens,cached_tokens,output_tokens,error,account_id,service_tier,diagnostics)
+             VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13)",
             rusqlite::params![
                 e.ts, e.account_email, e.api_key, e.model, e.status, e.latency_ms,
-                e.input_tokens, e.cached_tokens, e.output_tokens, e.error, e.account_id
+                e.input_tokens, e.cached_tokens, e.output_tokens, e.error, e.account_id, e.service_tier, diagnostics
             ],
-        );
+        ) {
+            log::error!("request log write failed: {error}");
+        }
     }
 
     /// Token usage aggregates for the panel. `col` must be a whitelisted
@@ -796,23 +833,6 @@ impl Store {
             .map_err(|e| e.to_string())?;
         let rows = stmt
             .query_map([account_id], |r| r.get(0))
-            .map_err(|e| e.to_string())?;
-        rows.collect::<Result<Vec<_>, _>>()
-            .map_err(|e| e.to_string())
-    }
-
-    /// Intersection across accounts that have discovered catalogs — a model
-    /// every account can serve. Accounts without a known set are ignored.
-    pub fn common_models(&self) -> Result<Vec<String>, String> {
-        let conn = self.conn.lock().unwrap_or_else(|e| e.into_inner());
-        let mut stmt = conn
-            .prepare(
-                r#"SELECT slug FROM account_models GROUP BY slug
-                   HAVING COUNT(DISTINCT account_id) = (SELECT COUNT(DISTINCT account_id) FROM account_models)"#,
-            )
-            .map_err(|e| e.to_string())?;
-        let rows = stmt
-            .query_map([], |r| r.get(0))
             .map_err(|e| e.to_string())?;
         rows.collect::<Result<Vec<_>, _>>()
             .map_err(|e| e.to_string())
@@ -1120,7 +1140,7 @@ impl Store {
         let conn = self.conn.lock().unwrap_or_else(|e| e.into_inner());
         let mut stmt = conn
             .prepare(
-                "SELECT ts,account_email,api_key,model,status,latency_ms,input_tokens,cached_tokens,output_tokens,error,account_id
+                "SELECT ts,account_email,api_key,model,status,latency_ms,input_tokens,cached_tokens,output_tokens,error,account_id,service_tier,diagnostics
                  FROM request_log ORDER BY seq DESC LIMIT ?1",
             )
             .map_err(|e| e.to_string())?;
@@ -1141,6 +1161,13 @@ impl Store {
                 output_tokens: row.get(8).map_err(|e| e.to_string())?,
                 error: row.get(9).map_err(|e| e.to_string())?,
                 account_id: row.get(10).map_err(|e| e.to_string())?,
+                service_tier: row.get(11).map_err(|e| e.to_string())?,
+                diagnostics: row
+                    .get::<_, Option<String>>(12)
+                    .map_err(|e| e.to_string())?
+                    .map(|raw| serde_json::from_str(&raw))
+                    .transpose()
+                    .map_err(|e| format!("request diagnostics: {e}"))?,
             });
         }
         Ok(out)

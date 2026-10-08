@@ -1,11 +1,13 @@
 //! Zero-cost codex usage probes on chatgpt.com:
 //!   GET  /backend-api/wham/usage                     — per-account quota windows
 //!   GET  /backend-api/wham/rate-limit-reset-credits  — banked reset credits
-//!   POST /backend-api/wham/rate-limit-reset-credits/consume — spend one credit
+//!   POST /backend-api/wham/rate-limit-reset-credits/consume — spend one chosen credit
 //! None of these consume model quota.
 
 use serde::{Deserialize, Serialize};
+use std::cmp::Ordering;
 use std::time::{SystemTime, UNIX_EPOCH};
+use time::{format_description::well_known::Rfc3339, OffsetDateTime};
 
 #[derive(Serialize, Deserialize, Clone, Default)]
 pub struct Window {
@@ -43,6 +45,25 @@ pub struct Credits {
     pub available: i64,
     #[serde(default)]
     pub applicable: i64,
+}
+
+/// A banked reset returned by the detail endpoint. The ID stays internal to
+/// the consume path; the panel only needs the aggregate count.
+#[derive(Clone, Debug, Deserialize)]
+pub struct ResetCredit {
+    pub id: String,
+    #[serde(default)]
+    pub status: String,
+    #[serde(default)]
+    pub expires_at: Option<String>,
+}
+
+#[derive(Clone, Debug, Deserialize)]
+pub struct ResetCredits {
+    #[serde(default)]
+    pub credits: Vec<ResetCredit>,
+    #[serde(default)]
+    pub available_count: i64,
 }
 
 #[derive(Serialize, Deserialize, Clone, Default)]
@@ -245,20 +266,83 @@ pub async fn fetch_raw(
     Ok(body)
 }
 
-/// POST consume: spends one banked reset credit for the account.
+/// GET the individual banked reset credits so callers can choose one safely.
+pub async fn list_reset_credits(
+    hc: &reqwest::Client,
+    root: &str,
+    token: &str,
+    account_id: &str,
+    defaults: &std::collections::HashMap<String, String>,
+) -> Result<ResetCredits, String> {
+    let url = format!(
+        "{}/backend-api/wham/rate-limit-reset-credits",
+        root.trim_end_matches('/')
+    );
+    let res = hc
+        .get(url)
+        .headers(headers(token, account_id, defaults))
+        .send()
+        .await
+        .map_err(|e| format!("list reset credits: {e}"))?;
+    let status = res.status();
+    let body = res.text().await.unwrap_or_default();
+    if status != reqwest::StatusCode::OK {
+        return Err(format!("list reset credits {status}: {}", truncate(&body)));
+    }
+    serde_json::from_str(&body).map_err(|e| format!("reset credits payload: {e}"))
+}
+
+/// Select the earliest-expiring available credit. Credits without an expiry
+/// are valid but sort after every dated credit. Stable sorting preserves the
+/// upstream order when two credits have the same expiry (or both never expire).
+pub fn earliest_available_reset_credit(credits: &ResetCredits) -> Result<ResetCredit, String> {
+    let mut available = credits
+        .credits
+        .iter()
+        .filter(|credit| credit.status.eq_ignore_ascii_case("available"))
+        .map(|credit| {
+            let expiry = credit
+                .expires_at
+                .as_deref()
+                .map(|raw| {
+                    OffsetDateTime::parse(raw, &Rfc3339)
+                        .map_err(|_| "invalid reset credit expiry timestamp".to_string())
+                })
+                .transpose()?;
+            Ok((credit.clone(), expiry))
+        })
+        .collect::<Result<Vec<_>, String>>()?;
+    available.sort_by(|(_, left), (_, right)| match (left, right) {
+        (Some(left), Some(right)) => left.cmp(right),
+        (Some(_), None) => Ordering::Less,
+        (None, Some(_)) => Ordering::Greater,
+        (None, None) => Ordering::Equal,
+    });
+    available
+        .into_iter()
+        .next()
+        .map(|(credit, _)| credit)
+        .ok_or_else(|| "no available reset credit".into())
+}
+
+/// POST consume one explicitly selected banked reset credit.
 pub async fn consume_reset_credit(
     hc: &reqwest::Client,
     root: &str,
     token: &str,
     account_id: &str,
     defaults: &std::collections::HashMap<String, String>,
+    credit_id: &str,
     redeem_request_id: &str,
 ) -> Result<(), String> {
     let url = format!(
         "{}/backend-api/wham/rate-limit-reset-credits/consume",
         root.trim_end_matches('/')
     );
-    let payload = serde_json::json!({ "redeem_request_id": redeem_request_id });
+    let payload = serde_json::json!({
+        "credit_id": credit_id,
+        "redeem_request_id": redeem_request_id,
+    });
     let res = hc
         .post(url)
         .headers(headers(token, account_id, defaults))
@@ -284,6 +368,45 @@ pub fn model_key(limit_name: &str) -> String {
     limit_name.trim().to_lowercase().replace(' ', "-")
 }
 
+pub const CODEX_LATEST_RELEASE: &str = "https://releases.openai.com/codex/channels/latest";
+
+#[derive(Deserialize)]
+struct ReleaseMetadata {
+    tag_name: String,
+}
+
+fn release_version(tag: &str) -> Result<String, String> {
+    let version = tag
+        .strip_prefix("rust-v")
+        .ok_or("release tag is not a Codex version")?;
+    let parts: Vec<_> = version.split('.').collect();
+    if parts.len() != 3
+        || parts.iter().any(|p| {
+            p.is_empty() || !p.bytes().all(|b| b.is_ascii_digit()) || p.parse::<u32>().is_err()
+        })
+    {
+        return Err("release tag is not a stable Codex version".into());
+    }
+    Ok(version.to_string())
+}
+
+/// Query the same stable release channel as the official Codex installer.
+/// No config value or previous version is substituted on failure.
+pub async fn fetch_latest_codex_version(hc: &reqwest::Client, url: &str) -> Result<String, String> {
+    let metadata: ReleaseMetadata = hc
+        .get(url)
+        .timeout(std::time::Duration::from_secs(10))
+        .send()
+        .await
+        .map_err(|e| format!("release fetch: {e}"))?
+        .error_for_status()
+        .map_err(|e| format!("release fetch: {e}"))?
+        .json()
+        .await
+        .map_err(|e| format!("release metadata: {e}"))?;
+    release_version(&metadata.tag_name)
+}
+
 pub async fn fetch_model_slugs(
     hc: &reqwest::Client,
     root: &str,
@@ -292,16 +415,29 @@ pub async fn fetch_model_slugs(
     defaults: &std::collections::HashMap<String, String>,
     client_version: &str,
 ) -> Result<Vec<String>, String> {
-    // the upstream catalog is tailored by client_version — an old version
-    // query yields an empty list, so this MUST track the real client
+    // Upstream tailors this catalog by client_version: older versions can
+    // silently omit newly released models.
     let url = format!(
         "{}/models?client_version={}",
         root.trim_end_matches('/'),
         client_version
     );
+    let mut h = headers(token, account_id, defaults);
+    h.insert(
+        "Version",
+        client_version
+            .parse()
+            .map_err(|_| "invalid Codex version header")?,
+    );
+    h.insert(
+        reqwest::header::USER_AGENT,
+        format!("codex_cli_rs/{client_version}")
+            .parse()
+            .map_err(|_| "invalid Codex user-agent header")?,
+    );
     let res = hc
         .get(url)
-        .headers(headers(token, account_id, defaults))
+        .headers(h)
         .send()
         .await
         .map_err(|e| e.to_string())?;
@@ -334,6 +470,21 @@ mod tests {
     use super::*;
 
     #[test]
+    fn release_tags_require_stable_codex_semver() {
+        assert_eq!(release_version("rust-v0.159.2").unwrap(), "0.159.2");
+        for tag in [
+            "",
+            "v0.159.2",
+            "rust-v0.159",
+            "rust-v0.159.2-beta",
+            "rust-v0.159.2.3",
+            "rust-v0.x.2",
+        ] {
+            assert!(release_version(tag).is_err(), "accepted {tag}");
+        }
+    }
+
+    #[test]
     fn parses_wham_usage_payload() {
         let body = br#"{
             "plan_type": "pro",
@@ -358,5 +509,106 @@ mod tests {
     #[test]
     fn model_key_normalizes_limit_name() {
         assert_eq!(model_key("GPT-5.3-Codex-Spark"), "gpt-5.3-codex-spark");
+    }
+
+    #[test]
+    fn selects_the_available_credit_with_the_earliest_expiry() {
+        let credits: ResetCredits = serde_json::from_value(serde_json::json!({
+            "available_count": 3,
+            "credits": [
+                {"id": "late", "status": "available", "expires_at": "2026-12-01T00:00:00Z"},
+                {"id": "used", "status": "redeemed", "expires_at": "2026-10-01T00:00:00Z"},
+                {"id": "early", "status": "available", "expires_at": "2026-10-15T00:00:00Z"},
+                {"id": "never", "status": "available", "expires_at": null}
+            ]
+        }))
+        .unwrap();
+        assert_eq!(
+            earliest_available_reset_credit(&credits).unwrap().id,
+            "early"
+        );
+    }
+
+    #[test]
+    fn puts_never_expiring_credits_after_dated_credits_and_keeps_ties_stable() {
+        let credits: ResetCredits = serde_json::from_value(serde_json::json!({
+            "credits": [
+                {"id": "never-first", "status": "available", "expires_at": null},
+                {"id": "never-second", "status": "available", "expires_at": null},
+                {"id": "dated", "status": "available", "expires_at": "2026-10-15T00:00:00Z"}
+            ]
+        }))
+        .unwrap();
+        assert_eq!(
+            earliest_available_reset_credit(&credits).unwrap().id,
+            "dated"
+        );
+        let credits: ResetCredits = serde_json::from_value(serde_json::json!({
+            "credits": [
+                {"id": "first", "status": "available", "expires_at": "2026-10-15T00:00:00Z"},
+                {"id": "second", "status": "available", "expires_at": "2026-10-15T00:00:00Z"}
+            ]
+        }))
+        .unwrap();
+        assert_eq!(
+            earliest_available_reset_credit(&credits).unwrap().id,
+            "first"
+        );
+    }
+
+    #[test]
+    fn refuses_to_choose_when_an_available_expiry_is_unparseable() {
+        let credits: ResetCredits = serde_json::from_value(serde_json::json!({
+            "credits": [
+                {"id": "bad", "status": "available", "expires_at": "not-a-date"}
+            ]
+        }))
+        .unwrap();
+        assert_eq!(
+            earliest_available_reset_credit(&credits).unwrap_err(),
+            "invalid reset credit expiry timestamp"
+        );
+    }
+
+    #[tokio::test]
+    async fn consume_sends_the_selected_credit_id() {
+        use axum::routing::post;
+        use axum::{Json, Router};
+        use std::sync::{Arc, Mutex};
+
+        let seen = Arc::new(Mutex::new(None));
+        let receiver = seen.clone();
+        let router = Router::new().route(
+            "/backend-api/wham/rate-limit-reset-credits/consume",
+            post(move |Json(body): Json<serde_json::Value>| {
+                let receiver = receiver.clone();
+                async move {
+                    *receiver.lock().unwrap() = Some(body);
+                    "{}"
+                }
+            }),
+        );
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let root = format!("http://{}", listener.local_addr().unwrap());
+        let task = tokio::spawn(async move { axum::serve(listener, router).await.unwrap() });
+        consume_reset_credit(
+            &reqwest::Client::new(),
+            &root,
+            "test-token",
+            "test-account",
+            &std::collections::HashMap::new(),
+            "credit-early",
+            "redeem-test",
+        )
+        .await
+        .unwrap();
+        task.abort();
+        assert_eq!(
+            seen.lock().unwrap().as_ref().unwrap(),
+            &serde_json::json!({
+                "credit_id": "credit-early",
+                "redeem_request_id": "redeem-test"
+            })
+        );
     }
 }

@@ -54,8 +54,9 @@ pub struct Config {
     pub retention_days: Option<i64>,
     #[serde(default)]
     pub tls: TlsCfg,
-    /// Optional override for /v1/models. Empty = serve the intersection of
-    /// upstream-discovered catalogs (fallback: builtin catalog).
+    /// Optional override for model discovery (/models, /v1/models). Empty =
+    /// serve the union of existing, enabled accounts' discovered catalogs
+    /// (only while release discovery is healthy).
     #[serde(default)]
     pub models: Vec<String>,
 }
@@ -115,16 +116,11 @@ impl Config {
         self.retention_days.unwrap_or(730)
     }
 
-    /// The codex client version we serve for — upstream endpoints tailor
-    /// responses to it (the models catalog is empty for stale versions).
-    pub fn client_version(&self) -> &str {
-        self.header_defaults
-            .get("version")
-            .map(|s| s.as_str())
-            .unwrap_or("0.156.1")
-    }
-
     fn apply_defaults(&mut self) {
+        // Legacy configs may still set this header. The model catalog version
+        // comes solely from the official stable release channel, not config.
+        self.header_defaults
+            .retain(|name, _| !name.eq_ignore_ascii_case("version"));
         if self.listen.is_empty() {
             self.listen = "127.0.0.1:8317".into();
         }
@@ -254,7 +250,7 @@ mod tests {
     #[test]
     fn full_overrides() {
         let cfg = load(&write_tmp(
-            "listen = \"192.0.2.10:8317\"\nheader-defaults = { originator = \"codex_cli_rs\" }\n[manage]\nkey = \"cpm-x\"\n[oauth]\nissuer = \"https://fake.invalid\"\ncallback-port = 1456\n",
+            "listen = \"192.0.2.10:8317\"\nheader-defaults = { originator = \"codex_cli_rs\", version = \"0.0.1\" }\n[manage]\nkey = \"cpm-x\"\n[oauth]\nissuer = \"https://fake.invalid\"\ncallback-port = 1456\n",
         ))
         .unwrap();
         assert_eq!(cfg.oauth.issuer, "https://fake.invalid");
@@ -262,5 +258,6 @@ mod tests {
             cfg.header_defaults.get("originator").unwrap(),
             "codex_cli_rs"
         );
+        assert!(!cfg.header_defaults.contains_key("version"));
     }
 }

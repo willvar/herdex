@@ -76,9 +76,11 @@ async fn async_main(cfg: config::Config) {
         store: store.clone(),
         pool,
         http: herdex::app::build_http_client(),
+        model_version: std::sync::RwLock::new(None),
         usage_root,
         pending: Mutex::new(HashMap::new()),
         refresh_guards: tokio::sync::Mutex::new(HashMap::new()),
+        reset_guards: tokio::sync::Mutex::new(HashMap::new()),
         last_prune_day: std::sync::atomic::AtomicI64::new(0),
         learned_strips: std::sync::Mutex::new(herdex::app::App::load_learned_strips(&cfg)),
     });

@@ -16,12 +16,17 @@ pub struct App {
     pub store: Store,
     pub pool: Pool,
     pub http: reqwest::Client,
+    /// Current stable Codex release, or None when its source is unavailable.
+    pub model_version: std::sync::RwLock<Option<String>>,
     pub usage_root: String,
     pub pending: Mutex<HashMap<String, oauth::PKCE>>,
     /// per-account refresh single-flight: concurrent refreshes would replay
     /// the same refresh token — OpenAI's replay detection then kills the
     /// whole token family ("already been used" 401s, unrecoverable)
     pub refresh_guards: tokio::sync::Mutex<HashMap<String, Arc<tokio::sync::Mutex<()>>>>,
+    /// Serialize reset-credit selection and consumption per account so two
+    /// panel clicks cannot select the same expiring credit concurrently.
+    pub reset_guards: tokio::sync::Mutex<HashMap<String, Arc<tokio::sync::Mutex<()>>>>,
     /// unix day of the last request_log prune (0 = never)
     pub last_prune_day: std::sync::atomic::AtomicI64,
     /// upstream-rejected body params learned from 400s (non-codex clients
@@ -30,6 +35,34 @@ pub struct App {
 }
 
 impl App {
+    pub fn model_version(&self) -> Option<String> {
+        self.model_version
+            .read()
+            .unwrap_or_else(|e| e.into_inner())
+            .clone()
+    }
+
+    /// A failed check invalidates discovery, including previously cached
+    /// catalogs. The catalogs remain stored but cannot be served as current.
+    pub async fn refresh_model_version(&self, url: &str) -> Result<bool, String> {
+        let result = usage::fetch_latest_codex_version(&self.http, url).await;
+        let mut current = self
+            .model_version
+            .write()
+            .unwrap_or_else(|e| e.into_inner());
+        match result {
+            Ok(version) => {
+                let changed = current.as_ref() != Some(&version);
+                *current = Some(version);
+                Ok(changed)
+            }
+            Err(e) => {
+                *current = None;
+                Err(e)
+            }
+        }
+    }
+
     /// Path of the learned-strips cache file (survives restarts).
     pub fn learned_path(&self) -> String {
         format!(
@@ -185,13 +218,16 @@ impl App {
     /// endpoint into the pool's per-account model sets (persisted, so
     /// restarts keep the discovery).
     pub async fn refresh_models(&self, a: &Account) {
+        let Some(version) = self.model_version() else {
+            return;
+        };
         match crate::usage::fetch_model_slugs(
             &self.http,
             &self.cfg.upstream.base_url,
             &a.access_token,
             &a.account_id,
             &self.cfg.header_defaults,
-            self.cfg.client_version(),
+            &version,
         )
         .await
         {
@@ -217,7 +253,11 @@ impl App {
     /// and completed-request watermark are all unchanged.
     pub fn observe_usage(&self, acc_id: &str, report: &usage::Report) {
         let now = crate::store::now_secs();
-        if report.main.primary.used_pct.is_some() || report.main.primary.reset_at.is_some() {
+        if report.main.primary.used_pct.is_some()
+            || report.main.primary.reset_at.is_some()
+            || report.main.secondary.used_pct.is_some()
+            || report.main.secondary.reset_at.is_some()
+        {
             self.pool.observe(
                 acc_id,
                 "default",
@@ -226,8 +266,20 @@ impl App {
                     secondary_pct: report.main.secondary.used_pct.unwrap_or(0.0),
                     primary_reset_at: report.main.primary.reset_at.unwrap_or(0),
                     secondary_reset_at: report.main.secondary.reset_at.unwrap_or(0),
-                    primary_window_secs: report.main.primary.window_seconds.unwrap_or(0),
-                    secondary_window_secs: report.main.secondary.window_seconds.unwrap_or(0),
+                    // A duration without an observed percentage must not turn
+                    // the fallback 0 into a displayable pool-usage window.
+                    primary_window_secs: report
+                        .main
+                        .primary
+                        .used_pct
+                        .and(report.main.primary.window_seconds)
+                        .unwrap_or(0),
+                    secondary_window_secs: report
+                        .main
+                        .secondary
+                        .used_pct
+                        .and(report.main.secondary.window_seconds)
+                        .unwrap_or(0),
                     observed_at: now,
                 },
             );
@@ -253,8 +305,26 @@ impl App {
         }
     }
 
-    /// Consumes one banked reset credit, then re-probes usage.
+    /// Consumes the earliest-expiring available banked reset credit, then
+    /// re-probes usage. Selection and consumption are one per-account flight.
     pub async fn consume_reset(&self, acc: &Account) -> Result<usage::Report, String> {
+        let guard = {
+            let mut guards = self.reset_guards.lock().await;
+            guards
+                .entry(acc.id.clone())
+                .or_insert_with(|| Arc::new(tokio::sync::Mutex::new(())))
+                .clone()
+        };
+        let _guard = guard.lock().await;
+        let credits = usage::list_reset_credits(
+            &self.http,
+            &self.usage_root,
+            &acc.access_token,
+            &acc.account_id,
+            &self.cfg.header_defaults,
+        )
+        .await?;
+        let credit = usage::earliest_available_reset_credit(&credits)?;
         let redeem = format!("{}-{}", crate::store::now_secs(), uuid::Uuid::new_v4());
         usage::consume_reset_credit(
             &self.http,
@@ -262,6 +332,7 @@ impl App {
             &acc.access_token,
             &acc.account_id,
             &self.cfg.header_defaults,
+            &credit.id,
             &redeem,
         )
         .await?;
@@ -419,7 +490,24 @@ pub fn build_router(app: AppHandle) -> axum::Router {
 /// whose tokens expire within 10 minutes.
 pub fn spawn_refresh_loop(app: AppHandle) {
     tokio::spawn(async move {
+        let mut last_version_check: Option<tokio::time::Instant> = None;
         loop {
+            // Reuse the 2-minute loop; check releases hourly when healthy,
+            // or again on the next cycle if the source is unavailable.
+            if version_check_due(last_version_check, tokio::time::Instant::now()) {
+                match app.refresh_model_version(usage::CODEX_LATEST_RELEASE).await {
+                    Ok(changed) => {
+                        last_version_check = Some(tokio::time::Instant::now());
+                        if changed {
+                            log::info!("Codex release version: {:?}", app.model_version());
+                        }
+                    }
+                    Err(e) => {
+                        last_version_check = None;
+                        log::warn!("Codex release version unavailable: {e}");
+                    }
+                }
+            }
             // work first, then wait: a fresh start must populate the quota
             // map (capacity panel) without waiting a full first cycle, and
             // every cycle refreshes usage so scheduling sees live pct even
@@ -431,7 +519,7 @@ pub fn spawn_refresh_loop(app: AppHandle) {
                         log::warn!("usage poll: {} {e}", a.email);
                     }
                     // per-account model catalog: feeds the entitlement filter
-                    // and the /v1/models intersection
+                    // and the /v1/models + /models union
                     app.refresh_models(a).await;
                 }
             }
@@ -472,4 +560,29 @@ pub fn spawn_refresh_loop(app: AppHandle) {
             tokio::time::sleep(Duration::from_secs(120)).await;
         }
     });
+}
+
+fn version_check_due(last: Option<tokio::time::Instant>, now: tokio::time::Instant) -> bool {
+    last.is_none_or(|at| now.duration_since(at) >= Duration::from_secs(3600))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn check_release_on_start_hourly_when_healthy_and_next_cycle_after_failure() {
+        let now = tokio::time::Instant::now();
+        assert!(version_check_due(None, now));
+        assert!(!version_check_due(Some(now), now));
+        assert!(!version_check_due(
+            Some(now - Duration::from_secs(3599)),
+            now
+        ));
+        assert!(version_check_due(
+            Some(now - Duration::from_secs(3600)),
+            now
+        ));
+        assert!(version_check_due(None, now)); // failure clears last check
+    }
 }

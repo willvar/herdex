@@ -12,7 +12,7 @@
 use crate::store::{Account, Store};
 #[cfg(test)]
 use rand::RngCore;
-use std::collections::{BTreeMap, HashMap};
+use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::sync::{Arc, Mutex};
 
 #[derive(Clone, Copy, Default, serde::Serialize)]
@@ -127,18 +127,20 @@ impl Pool {
             .insert(acc_id.to_string(), slugs.iter().cloned().collect());
     }
 
-    /// Models servable by EVERY enabled account with a known catalog.
-    pub fn common_models(&self) -> Vec<String> {
+    /// Models servable by at least one existing, enabled account with a known
+    /// catalog — the pool's advertised discovery list; per-request routing
+    /// still filters by each account's own catalog. Sorted for a stable
+    /// response.
+    pub fn union_models(&self) -> Result<Vec<String>, String> {
+        let accounts = self.shared.st.list_accounts()?;
         let inner = self.shared.state.lock().unwrap_or_else(|e| e.into_inner());
-        let mut sets: Vec<&std::collections::HashSet<String>> =
-            inner.models.values().filter(|s| !s.is_empty()).collect();
-        if sets.is_empty() {
-            return Vec::new();
+        let mut out = BTreeSet::new();
+        for a in accounts.into_iter().filter(|a| !a.disabled) {
+            if let Some(set) = inner.models.get(&a.id) {
+                out.extend(set.iter().cloned());
+            }
         }
-        sets.sort_by_key(|s| std::cmp::Reverse(s.len()));
-        let mut out = sets[0].clone();
-        out.retain(|m| sets[1..].iter().all(|s| s.contains(m)));
-        out.into_iter().collect()
+        Ok(out.into_iter().collect())
     }
 
     /// Records tokens a completed request attributed to this account
