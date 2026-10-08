@@ -7,7 +7,8 @@
 - 从 OpenCode 的 OpenAI 同名模型继承显示名、推理档位、能力、上下文限制及参考价格。
   优先使用当前可用模型的元数据，否则读取目录源定义；不复制直连端点或认证信息。
 - 对 `gpt-*` 模型额外提供 `#fast`；该档位向 herdex 请求 `service_tier: "priority"`，
-  对应账号池的 Fast 模式。
+  对应账号池的 Fast 模式；已有推理档位还会生成组合档位，例如 `#max-fast`。
+  `#fast` 使用模型默认推理强度，`#max-fast` 才是 max 推理加 Fast。
 - 未匹配目录的模型保留 OpenCode 默认能力/限制，显示名取端点的 `name` 或格式化 ID；
   除上述 GPT Fast 档位外不凭空添加推理档位。参考价格是目录元数据，不代表 ChatGPT
   订阅池的实际费用。
@@ -73,6 +74,12 @@ GPT 模型还可选择 Fast 档位：
 
 ```bash
 opencode run --model 'herdex/<GPT 模型 ID>#fast' '只回复：正常'
+```
+
+需要 max 推理与 Fast 同时启用时，选择组合档位：
+
+```bash
+opencode run --model 'herdex/<GPT 模型 ID>#max-fast' '只回复：正常'
 ```
 
 若模型存在但无推理档位，检查 OpenCode 的 OpenAI 同名模型元数据是否包含 `variants`。
