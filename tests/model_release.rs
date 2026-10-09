@@ -382,6 +382,26 @@ async fn model_catalog_ignores_missing_and_empty_account_catalogs() {
 }
 
 #[tokio::test]
+async fn startup_restores_persisted_catalogs_without_refresh() {
+    let f = Fixture::new().await;
+    f.set_release(StatusCode::OK, r#"{"tag_name":"rust-v0.159.1"}"#);
+    f.app.refresh_model_version(&f.release_url).await.unwrap();
+    // Discovery persisted by a previous run; no upstream catalog refresh yet.
+    f.store
+        .set_account_models("a1", &["gpt-6-sol".into()])
+        .unwrap();
+    f.app.load_cached_catalogs();
+    // Both discovery endpoints serve the restored union immediately.
+    f.assert_models(&["gpt-6-sol"]).await;
+    // The entitlement filter works before the first refresh: a1 provably
+    // lacks reserve and is skipped for it while unknown accounts stay eligible.
+    let candidates = f.app.pool.candidates("gpt-reserve").unwrap();
+    assert_eq!(candidates.len(), 3);
+    assert!(candidates.iter().all(|a| a.id != "a1"));
+    assert!(f.upstream.lock().unwrap().queries.is_empty());
+}
+
+#[tokio::test]
 async fn model_catalog_account_query_failure_returns_an_error() {
     let f = Fixture::new().await;
     f.set_release(StatusCode::OK, r#"{"tag_name":"rust-v0.159.1"}"#);

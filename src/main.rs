@@ -85,6 +85,10 @@ async fn async_main(cfg: config::Config) {
         learned_strips: std::sync::Mutex::new(herdex::app::App::load_learned_strips(&cfg)),
     });
 
+    // routing and both discovery endpoints must be correct from the first
+    // second: seed the pool from the persisted catalog; the refresh loop
+    // self-heals any staleness on its first cycle
+    app.load_cached_catalogs();
     spawn_refresh_loop(app.clone());
 
     let root = herdex::app::build_router(app.clone());
