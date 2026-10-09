@@ -1027,6 +1027,47 @@ async fn spaced_stream_error_before_content_fails_over() {
 }
 
 #[tokio::test]
+async fn single_account_retries_once_after_pre_content_overload() {
+    let h = harness(&["a1"]).await;
+    *h.upstream.behavior.lock().unwrap() = Behavior::StreamErrorFirst(1);
+    let response = send_post(&h, "gpt-5.5", "retry-once").await;
+    assert_eq!(
+        response.status(),
+        200,
+        "the retry absorbs the transient error"
+    );
+    response.bytes().await.unwrap();
+    assert_eq!(
+        h.upstream.calls.lock().unwrap().len(),
+        2,
+        "exactly one same-account retry"
+    );
+    let logs = h.store.recent_logs(5).unwrap();
+    assert_eq!(logs.len(), 2);
+    assert_eq!(logs[1].error, "server_is_overloaded");
+    assert_eq!(logs[1].diagnostics.as_ref().unwrap().attempt, 1);
+    assert!(logs[0].error.is_empty());
+    assert_eq!(logs[0].diagnostics.as_ref().unwrap().attempt, 2);
+}
+
+#[tokio::test]
+async fn pre_content_retry_is_capped_at_one() {
+    let h = harness(&["a1"]).await;
+    *h.upstream.behavior.lock().unwrap() = Behavior::StreamErrorFirst(2);
+    let response = send_post(&h, "gpt-5.5", "retry-cap").await;
+    assert_eq!(response.status(), 503);
+    response.bytes().await.unwrap();
+    assert_eq!(
+        h.upstream.calls.lock().unwrap().len(),
+        2,
+        "the retry is bounded: no third attempt"
+    );
+    let logs = h.store.recent_logs(5).unwrap();
+    assert_eq!(logs.len(), 2);
+    assert!(logs.iter().all(|l| l.error == "server_is_overloaded"));
+}
+
+#[tokio::test]
 async fn all_fail_surfaces_real_upstream_error() {
     let h = harness(&["a1", "a2"]).await;
     *h.upstream.behavior.lock().unwrap() = Behavior::AlwaysFail(429);

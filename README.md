@@ -220,3 +220,4 @@ cd web/panel && npm ci && npm run lint && npm test && npm run build
 - 400 "not supported" 正确 failover、其它 400 原样返回
 - spark 模型目录不泄漏给 plus
 - 会话粘性（Session-Id → 账号，TTL 1h 滑动，失败重钉）
+- 内容前流内错误（如 server_is_overloaded）：候选耗尽后对同账号重试一次，永不无界重试

@@ -530,7 +530,9 @@ async fn responses(State(app): State<AppHandle>, headers: HeaderMap, body: Bytes
         started: Instant::now(),
         attempts: 0,
     };
-    for attempt in 0..attempts {
+    let mut attempt = 0;
+    let mut retried_pre_content = false;
+    while attempt < attempts {
         let mut acc = candidates[attempt % candidates.len()].clone();
         let mut observed = request_log.begin(&app, &acc);
         if (acc.expires_at - crate::store::now_secs()) < 300 {
@@ -539,6 +541,7 @@ async fn responses(State(app): State<AppHandle>, headers: HeaderMap, body: Bytes
                 observed.record(Some("token_refresh_failed"), true);
                 last_status = 401;
                 last_err = format!("token refresh failed for {}", acc.email);
+                attempt += 1;
                 continue;
             }
         }
@@ -558,14 +561,28 @@ async fn responses(State(app): State<AppHandle>, headers: HeaderMap, body: Bytes
                     .insert("x-herdex-request-id", request_id.parse().unwrap());
                 return resp;
             }
-            Err((status, msg)) => {
+            Err(AttemptFailure {
+                status,
+                message,
+                pre_content,
+            }) => {
                 last_status = status;
-                last_err = msg;
+                last_err = message;
                 if !failoverable(last_status, &last_err) {
                     break;
                 }
+                // A pre-content error sent nothing user-visible, and this
+                // class is transient upstream overload (server_is_overloaded
+                // arrives inside a 200 stream): after the candidate list is
+                // exhausted, retry the same account exactly once. The flag
+                // bounds it — never a second retry.
+                if pre_content && attempt + 1 == attempts && !retried_pre_content {
+                    retried_pre_content = true;
+                    continue;
+                }
             }
         }
+        attempt += 1;
     }
     let body = serde_json::json!({
         "error": {"message": format!("all pool attempts failed; last: {last_err}"), "type": "server_error"}
@@ -577,7 +594,34 @@ async fn responses(State(app): State<AppHandle>, headers: HeaderMap, body: Bytes
     response
 }
 
-type AttemptResult = Result<Response, (u16, String)>;
+type AttemptResult = Result<Response, AttemptFailure>;
+
+/// One failed upstream attempt. A pre-content stream error left nothing
+/// user-visible, so the same account earns exactly one retry after the
+/// candidate list is exhausted; every other failure keeps the existing flow.
+struct AttemptFailure {
+    status: u16,
+    message: String,
+    pre_content: bool,
+}
+
+impl AttemptFailure {
+    fn http(status: u16, message: String) -> Self {
+        Self {
+            status,
+            message,
+            pre_content: false,
+        }
+    }
+
+    fn pre_content(message: String) -> Self {
+        Self {
+            status: 503,
+            message,
+            pre_content: true,
+        }
+    }
+}
 
 async fn attempt_once(
     app: &App,
@@ -639,7 +683,10 @@ async fn attempt_once(
                 }
                 observed.diagnostics().error_detail = transport_detail(e);
                 observed.record(Some("upstream_request_error"), true);
-                return Err((0, format!("{}: upstream request error", acc.email)));
+                return Err(AttemptFailure::http(
+                    0,
+                    format!("{}: upstream request error", acc.email),
+                ));
             }
         };
         let status = res.status().as_u16();
@@ -748,7 +795,7 @@ async fn attempt_once(
                         observed.diagnostics().error_detail = transport_detail(error);
                         observed
                             .record(Some("upstream_error_body_error"), failoverable(status, ""));
-                        return Err((
+                        return Err(AttemptFailure::http(
                             status,
                             format!("{}: {status} upstream error body interrupted", acc.email),
                         ));
@@ -782,7 +829,10 @@ async fn attempt_once(
             }
             if failoverable(status, &snippet) {
                 app.pool.mark_failure(&acc.id, &model);
-                return Err((status, format!("{}: {status} {snippet}", acc.email)));
+                return Err(AttemptFailure::http(
+                    status,
+                    format!("{}: {status} {snippet}", acc.email),
+                ));
             }
             // genuine client error: pass through untouched
             let mut out = Response::builder()
@@ -790,7 +840,7 @@ async fn attempt_once(
             copy_headers(out.headers_mut().unwrap(), &resp_headers);
             return out
                 .body(Body::from(bytes))
-                .map_err(|e| (500, e.to_string()));
+                .map_err(|e| AttemptFailure::http(500, e.to_string()));
         }
         break res;
     };
@@ -831,7 +881,10 @@ async fn attempt_once(
             }
             Err(error) => {
                 observed.transport_error(error);
-                return Err((0, format!("{}: upstream stream error", acc.email)));
+                return Err(AttemptFailure::http(
+                    0,
+                    format!("{}: upstream stream error", acc.email),
+                ));
             }
         };
         // The same observer spans every chunk, including an incomplete
@@ -839,7 +892,10 @@ async fn attempt_once(
         // whether a coalesced content/error pair can still fail over.
         if let Some(code) = observed.stats.error_before_content.clone() {
             observed.record(None, false);
-            return Err((503, format!("{}: {code}", acc.email)));
+            return Err(AttemptFailure::pre_content(format!(
+                "{}: {code}",
+                acc.email
+            )));
         }
         if ended
             || observed.stats.content_seen
@@ -915,7 +971,7 @@ async fn attempt_once(
         observed.eof();
     };
     out.body(Body::from_stream(stream))
-        .map_err(|e| (500, e.to_string()))
+        .map_err(|e| AttemptFailure::http(500, e.to_string()))
 }
 
 struct RequestLog {
