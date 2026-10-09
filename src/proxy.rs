@@ -978,6 +978,63 @@ fn error_code(code: &str) -> Option<&str> {
     .then_some(code)
 }
 
+/// Bounded, text-free metadata of one upstream in-stream error event: field
+/// names plus whitelisted code/type/status values at the top level and under
+/// "error". Message text is deliberately excluded, so diagnostics never carry
+/// upstream error bodies.
+fn error_event_meta(v: &serde_json::Value) -> String {
+    fn safe_name(name: &str) -> Option<String> {
+        (!name.is_empty()
+            && name.len() <= 32
+            && name
+                .bytes()
+                .all(|c| c.is_ascii_alphanumeric() || b"_.-".contains(&c)))
+        .then(|| name.to_owned())
+    }
+    fn key_names(object: Option<&serde_json::Value>) -> serde_json::Value {
+        let mut names: Vec<String> = object
+            .and_then(|o| o.as_object())
+            .map(|o| o.keys().filter_map(|k| safe_name(k)).take(16).collect())
+            .unwrap_or_default();
+        names.sort();
+        serde_json::Value::from(names)
+    }
+    fn safe_value(object: Option<&serde_json::Value>, name: &str) -> Option<serde_json::Value> {
+        object?
+            .get(name)?
+            .as_str()
+            .and_then(error_code)
+            .map(|value| serde_json::Value::from(value.to_owned()))
+    }
+    let mut meta = serde_json::Map::new();
+    meta.insert("keys".into(), key_names(Some(v)));
+    if let Some(code) = safe_value(Some(v), "code") {
+        meta.insert("code".into(), code);
+    }
+    if let Some(status) = v.get("status").and_then(|s| {
+        s.as_i64()
+            .or_else(|| s.as_str().and_then(|x| x.trim().parse().ok()))
+    }) {
+        meta.insert("status".into(), serde_json::Value::from(status));
+    }
+    let nested = v.get("error").filter(|e| e.is_object());
+    if nested.is_some() {
+        let mut error = serde_json::Map::new();
+        error.insert("keys".into(), key_names(nested));
+        for field in ["code", "type"] {
+            if let Some(value) = safe_value(nested, field) {
+                error.insert(field.into(), value);
+            }
+        }
+        meta.insert("error".into(), serde_json::Value::Object(error));
+    }
+    serde_json::Value::Object(meta)
+        .to_string()
+        .chars()
+        .take(2048)
+        .collect()
+}
+
 /// Finalize once even when a response is dropped before its first poll or
 /// while suspended at a yield. User cancellation alone never cools an account.
 struct StreamLog {
@@ -1032,6 +1089,13 @@ impl StreamLog {
             .to_owned();
         if upstream_failed || self.stats.error.is_some() {
             self.pool.mark_failure(&self.account_id, &entry.model);
+        }
+        if let Some(meta) = self.stats.error_meta.as_deref() {
+            log::warn!(
+                "upstream error event metadata: model={:?} account={:?} {meta}",
+                entry.model,
+                entry.account_email
+            );
         }
         log::log!(
             if entry.error.is_empty() {
@@ -1106,6 +1170,7 @@ struct StreamStats {
     completed: bool,
     error_before_content: Option<String>,
     error: Option<String>,
+    error_meta: Option<String>,
     input: i64,
     cached: i64,
     output: i64,
@@ -1231,6 +1296,9 @@ impl StreamStats {
         if is_content_type(ty) {
             self.content_seen = true;
         } else if ty == "error" {
+            if self.error_meta.is_none() {
+                self.error_meta = Some(error_event_meta(&v));
+            }
             let code = v
                 .get("code")
                 .and_then(|c| c.as_str())
@@ -1763,6 +1831,40 @@ mod tests {
         assert_eq!(fast_alias_base("gpt-5.5-fast"), Some("gpt-5.5"));
         assert_eq!(fast_alias_base("o3-fast"), None);
         assert_eq!(fast_alias_base("gpt-5.5-fast-fast"), None);
+    }
+
+    #[test]
+    fn error_event_metadata_keeps_shapes_not_text() {
+        let meta = error_event_meta(&serde_json::json!({
+            "type": "error",
+            "status": 429,
+            "error": {
+                "code": "usage_limit_reached",
+                "type": "limit",
+                "message": "private upstream text"
+            }
+        }));
+        assert!(meta.contains("\"code\":\"usage_limit_reached\""), "{meta}");
+        assert!(meta.contains("\"status\":429"), "{meta}");
+        assert!(meta.contains("\"type\":\"limit\""), "{meta}");
+        assert!(!meta.contains("private"), "{meta}");
+
+        let plain = error_event_meta(&serde_json::json!({
+            "type": "error",
+            "message": "private upstream text"
+        }));
+        assert!(plain.contains("\"keys\":[\"message\",\"type\"]"), "{plain}");
+        assert!(!plain.contains("private"), "{plain}");
+
+        let odd = error_event_meta(&serde_json::json!({
+            "type": "error",
+            "bad key!": 1,
+            "status": "not a number",
+            "code": "this code has spaces"
+        }));
+        assert!(!odd.contains("bad key"), "{odd}");
+        assert!(!odd.contains("spaces"), "{odd}");
+        assert!(!odd.contains("not a number"), "{odd}");
     }
 
     #[test]
