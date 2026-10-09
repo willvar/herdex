@@ -242,6 +242,34 @@ impl App {
         }
     }
 
+    /// Seeds the pool's per-account model catalogs from the persisted
+    /// discovery so routing and the discovery endpoints are correct from the
+    /// first second after a restart. Staleness self-heals on the next refresh
+    /// cycle.
+    pub fn load_cached_catalogs(&self) {
+        let accounts = match self.store.list_accounts() {
+            Ok(accounts) => accounts,
+            Err(e) => {
+                log::warn!("cached catalogs: {e}");
+                return;
+            }
+        };
+        let mut loaded = 0usize;
+        for a in accounts {
+            match self.store.account_models(&a.id) {
+                Ok(slugs) if !slugs.is_empty() => {
+                    self.pool.set_account_models(&a.id, &slugs);
+                    loaded += 1;
+                }
+                Ok(_) => {}
+                Err(e) => log::warn!("cached catalog {}: {e}", a.email),
+            }
+        }
+        if loaded > 0 {
+            log::info!("restored cached model catalogs for {loaded} account(s)");
+        }
+    }
+
     /// Records a usage report's windows into the pool ("default" for the
     /// limit, per-model for additional limits like spark).
     /// Records a usage report's windows into the pool ("default" for the main
