@@ -978,6 +978,21 @@ fn error_code(code: &str) -> Option<&str> {
     .then_some(code)
 }
 
+/// Extracts the error code from one in-stream error event. Current upstream
+/// frames nest it under "error" (with a sibling "type"); older frames carried
+/// a top-level "code". Values are whitelist-validated before use.
+fn event_error_code(v: &serde_json::Value) -> Option<&str> {
+    [
+        v.get("code"),
+        v.get("error").and_then(|e| e.get("code")),
+        v.get("error").and_then(|e| e.get("type")),
+    ]
+    .into_iter()
+    .flatten()
+    .filter_map(|c| c.as_str())
+    .find_map(error_code)
+}
+
 /// Bounded, text-free metadata of one upstream in-stream error event: field
 /// names plus whitelisted code/type/status values at the top level and under
 /// "error". Message text is deliberately excluded, so diagnostics never carry
@@ -1299,12 +1314,7 @@ impl StreamStats {
             if self.error_meta.is_none() {
                 self.error_meta = Some(error_event_meta(&v));
             }
-            let code = v
-                .get("code")
-                .and_then(|c| c.as_str())
-                .and_then(error_code)
-                .unwrap_or("unknown")
-                .to_owned();
+            let code = event_error_code(&v).unwrap_or("unknown").to_owned();
             if !self.content_seen && self.error_before_content.is_none() {
                 self.error_before_content = Some(code.clone());
             }
@@ -1865,6 +1875,41 @@ mod tests {
         assert!(!odd.contains("bad key"), "{odd}");
         assert!(!odd.contains("spaces"), "{odd}");
         assert!(!odd.contains("not a number"), "{odd}");
+    }
+
+    #[test]
+    fn event_error_code_prefers_top_level_then_nested() {
+        assert_eq!(
+            event_error_code(&serde_json::json!({"type": "error", "code": "top_level"})),
+            Some("top_level")
+        );
+        assert_eq!(
+            event_error_code(&serde_json::json!({
+                "type": "error",
+                "sequence_number": 1,
+                "error": {
+                    "code": "server_is_overloaded",
+                    "type": "service_unavailable_error",
+                    "message": "private upstream text"
+                }
+            })),
+            Some("server_is_overloaded")
+        );
+        assert_eq!(
+            event_error_code(&serde_json::json!({
+                "type": "error",
+                "error": {"type": "service_unavailable_error"}
+            })),
+            Some("service_unavailable_error")
+        );
+        assert_eq!(
+            event_error_code(&serde_json::json!({
+                "type": "error",
+                "code": "bad code!",
+                "error": {"code": "has space"}
+            })),
+            None
+        );
     }
 
     #[test]
