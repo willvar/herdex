@@ -322,7 +322,7 @@ async fn consume(
         return err_json(StatusCode::NOT_FOUND, "account not found");
     };
     match app.consume_reset(&acc).await {
-        Ok(report) => Json(report).into_response(),
+        Ok(()) => Json(json!({"consumed": true})).into_response(),
         Err(e) => err_json(StatusCode::BAD_GATEWAY, e),
     }
 }

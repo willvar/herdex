@@ -18,11 +18,28 @@ pub struct OAuthCfg {
     pub client_id: String,
 }
 
-#[derive(Deserialize, Clone, Default)]
+#[derive(Deserialize, Clone)]
 #[serde(rename_all = "kebab-case", default)]
 pub struct UpstreamCfg {
     #[serde(default)]
     pub base_url: String,
+    /// Maximum time spent on one standalone alpha/search upstream attempt.
+    /// The pool may fail over to another eligible account after this budget.
+    #[serde(default = "default_standalone_search_timeout_seconds")]
+    pub standalone_search_timeout_seconds: u64,
+}
+
+fn default_standalone_search_timeout_seconds() -> u64 {
+    45
+}
+
+impl Default for UpstreamCfg {
+    fn default() -> Self {
+        Self {
+            base_url: String::new(),
+            standalone_search_timeout_seconds: default_standalone_search_timeout_seconds(),
+        }
+    }
 }
 
 #[derive(Deserialize, Clone, Default)]
@@ -54,9 +71,9 @@ pub struct Config {
     pub retention_days: Option<i64>,
     #[serde(default)]
     pub tls: TlsCfg,
-    /// Optional override for model discovery (/models, /v1/models). Empty =
-    /// serve the union of existing, enabled accounts' discovered catalogs
-    /// (only while release discovery is healthy).
+    /// Optional model-ID filter for discovery. Empty = serve the union of
+    /// existing, enabled accounts' discovered catalogs (only while release
+    /// discovery is healthy).
     #[serde(default)]
     pub models: Vec<String>,
 }
@@ -135,6 +152,10 @@ impl Config {
         }
         if self.upstream.base_url.is_empty() {
             self.upstream.base_url = "https://chatgpt.com/backend-api/codex".into();
+        }
+        if self.upstream.standalone_search_timeout_seconds == 0 {
+            self.upstream.standalone_search_timeout_seconds =
+                default_standalone_search_timeout_seconds();
         }
         if self.log.level.is_empty() {
             self.log.level = "info".into();
@@ -227,6 +248,7 @@ mod tests {
         assert!(!cfg.state_root.is_empty());
         assert!(!cfg.oauth.issuer.is_empty());
         assert!(!cfg.upstream.base_url.is_empty());
+        assert_eq!(cfg.upstream.standalone_search_timeout_seconds, 45);
         assert_eq!(cfg.log.level, "info");
     }
 

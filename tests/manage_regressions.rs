@@ -18,6 +18,10 @@ struct Server {
 
 impl Server {
     async fn new() -> Self {
+        Self::with_usage_root("http://127.0.0.1:1").await
+    }
+
+    async fn with_usage_root(usage_root: &str) -> Self {
         let root = std::env::temp_dir().join(format!("herdex-manage-{}", uuid::Uuid::new_v4()));
         let store = Store::open(root.to_str().unwrap()).unwrap();
         let app = Arc::new(App {
@@ -31,7 +35,7 @@ impl Server {
             pool: Pool::new(store.clone()),
             http: reqwest::Client::new(),
             model_version: Default::default(),
-            usage_root: "http://127.0.0.1:1".into(),
+            usage_root: usage_root.into(),
             pending: Default::default(),
             refresh_guards: Default::default(),
             reset_guards: Default::default(),
@@ -261,4 +265,91 @@ async fn header_probe_without_plan_then_usage_report_preserves_calibration() {
         .await
         .unwrap();
     assert_eq!(body["accounts"][0]["tokens_per_pct"], 100.0);
+}
+
+#[tokio::test]
+async fn reset_returns_redemption_result_without_probing_quota() {
+    use axum::http::StatusCode;
+    use axum::routing::{get, post};
+    use axum::{Json, Router};
+    use std::sync::Mutex;
+
+    for (available, consume_status) in [
+        (true, StatusCode::OK),
+        (true, StatusCode::BAD_REQUEST),
+        (false, StatusCode::OK),
+    ] {
+        let calls = Arc::new(Mutex::new(Vec::new()));
+        let consumes = calls.clone();
+        let probes = calls.clone();
+        let upstream = Router::new()
+            .route(
+                "/backend-api/wham/rate-limit-reset-credits",
+                get(move || async move {
+                    Json(json!({"credits": if available { json!([
+                        {"id": "late", "status": "available", "expires_at": "2027-12-01T00:00:00Z"},
+                        {"id": "early", "status": "available", "expires_at": "2027-11-01T00:00:00Z"}
+                    ]) } else { json!([]) }}))
+                }),
+            )
+            .route(
+                "/backend-api/wham/rate-limit-reset-credits/consume",
+                post(move |Json(body): Json<Value>| {
+                    let calls = consumes.clone();
+                    async move {
+                        calls.lock().unwrap().push("consume");
+                        assert_eq!(body["credit_id"], "early");
+                        assert!(!body["redeem_request_id"].as_str().unwrap().is_empty());
+                        (consume_status, Json(json!({})))
+                    }
+                }),
+            )
+            .route(
+                "/backend-api/wham/usage",
+                get(move || {
+                    let calls = probes.clone();
+                    async move {
+                        calls.lock().unwrap().push("quota");
+                        StatusCode::SERVICE_UNAVAILABLE
+                    }
+                }),
+            );
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let upstream_root = format!("http://{}", listener.local_addr().unwrap());
+        let upstream_task = tokio::spawn(async move {
+            axum::serve(listener, upstream).await.unwrap();
+        });
+        let server = Server::with_usage_root(&upstream_root).await;
+        server
+            .store
+            .upsert_account(&Account {
+                id: "a".into(),
+                email: "a@example.test".into(),
+                access_token: "test-token".into(),
+                account_id: "test-account".into(),
+                ..Default::default()
+            })
+            .unwrap();
+        let response = reqwest::Client::new()
+            .post(format!("{}/accounts/a/quota/consume", server.url))
+            .bearer_auth("test-manage-key")
+            .send()
+            .await
+            .unwrap();
+        let status = response.status();
+        let body: Value = response.json().await.unwrap();
+        upstream_task.abort();
+
+        if !available || !consume_status.is_success() {
+            assert_eq!(status, StatusCode::BAD_GATEWAY);
+            assert!(body["error"].is_string());
+            assert!(body.get("consumed").is_none());
+            let expected = if available { vec!["consume"] } else { vec![] };
+            assert_eq!(*calls.lock().unwrap(), expected);
+        } else {
+            assert_eq!(status, StatusCode::OK);
+            assert_eq!(body, json!({"consumed": true}));
+            assert_eq!(*calls.lock().unwrap(), vec!["consume"]);
+        }
+    }
 }
