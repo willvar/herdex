@@ -47,22 +47,29 @@ pub struct Credits {
     pub applicable: i64,
 }
 
-/// A banked reset returned by the detail endpoint. The ID stays internal to
-/// the consume path; the panel only needs the aggregate count.
-#[derive(Clone, Debug, Deserialize)]
+/// A banked reset returned by the detail endpoint.
+#[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct ResetCredit {
     pub id: String,
     #[serde(default)]
     pub status: String,
-    #[serde(default)]
+    #[serde(default, alias = "grantedAt")]
+    pub granted_at: Option<String>,
+    #[serde(default, alias = "expiresAt")]
     pub expires_at: Option<String>,
+    #[serde(default, alias = "resetType")]
+    pub reset_type: Option<String>,
+    #[serde(default)]
+    pub title: Option<String>,
+    #[serde(default)]
+    pub description: Option<String>,
 }
 
-#[derive(Clone, Debug, Deserialize)]
+#[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct ResetCredits {
     #[serde(default)]
-    pub credits: Vec<ResetCredit>,
-    #[serde(default)]
+    pub credits: Option<Vec<ResetCredit>>,
+    #[serde(default, alias = "availableCount")]
     pub available_count: i64,
 }
 
@@ -76,6 +83,11 @@ pub struct Report {
     pub additional: Vec<AdditionalLimit>,
     #[serde(default)]
     pub credits: Option<Credits>,
+    /// Detailed banked reset rows fetched from the dedicated endpoint by the
+    /// management quota route. Normal background usage probes leave this
+    /// empty so they do not add another upstream request.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub reset_credits: Option<ResetCredits>,
 }
 
 #[derive(Deserialize)]
@@ -173,6 +185,7 @@ pub fn parse(body: &[u8]) -> Result<Report, String> {
         main: parse_limit(&raw.rate_limit),
         additional: Vec::new(),
         credits: None,
+        reset_credits: None,
     };
     if let Some(adds) = raw.additional_rate_limits {
         for a in adds {
@@ -298,6 +311,8 @@ pub async fn list_reset_credits(
 pub fn earliest_available_reset_credit(credits: &ResetCredits) -> Result<ResetCredit, String> {
     let mut available = credits
         .credits
+        .as_deref()
+        .unwrap_or(&[])
         .iter()
         .filter(|credit| credit.status.eq_ignore_ascii_case("available"))
         .map(|credit| {
@@ -546,6 +561,23 @@ mod tests {
             earliest_available_reset_credit(&credits).unwrap().id,
             "early"
         );
+    }
+
+    #[test]
+    fn preserves_reset_credit_grant_and_expiry_details() {
+        let credits: ResetCredits = serde_json::from_value(serde_json::json!({
+            "available_count": 1,
+            "credits": [{
+                "id": "credit-1",
+                "status": "available",
+                "granted_at": "2026-10-01T12:34:56Z",
+                "expires_at": "2026-10-31T12:34:56Z"
+            }]
+        }))
+        .unwrap();
+        let credit = &credits.credits.as_ref().unwrap()[0];
+        assert_eq!(credit.granted_at.as_deref(), Some("2026-10-01T12:34:56Z"));
+        assert_eq!(credit.expires_at.as_deref(), Some("2026-10-31T12:34:56Z"));
     }
 
     #[test]

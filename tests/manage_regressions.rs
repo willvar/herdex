@@ -353,3 +353,88 @@ async fn reset_returns_redemption_result_without_probing_quota() {
         }
     }
 }
+
+#[tokio::test]
+async fn quota_includes_reset_credit_grant_and_expiry_details() {
+    use axum::http::StatusCode;
+    use axum::routing::get;
+    use axum::{Json, Router};
+
+    let upstream = Router::new()
+        .route(
+            "/backend-api/wham/usage",
+            get(|| async {
+                Json(json!({
+                    "plan_type": "pro",
+                    "rate_limit": {
+                        "primary_window": {"used_percent": 12, "reset_at": 1893456000}
+                    },
+                    "rate_limit_reset_credits": {
+                        "available_count": 2,
+                        "applicable_available_count": 2
+                    }
+                }))
+            }),
+        )
+        .route(
+            "/backend-api/wham/rate-limit-reset-credits",
+            get(|| async {
+                Json(json!({
+                    "available_count": 2,
+                    "credits": [
+                        {
+                            "id": "credit-1",
+                            "status": "available",
+                            "granted_at": "2026-10-01T12:34:56Z",
+                            "expires_at": "2026-10-31T12:34:56Z"
+                        },
+                        {
+                            "id": "credit-2",
+                            "status": "available",
+                            "granted_at": "2026-10-02T12:34:56Z",
+                            "expires_at": null
+                        }
+                    ]
+                }))
+            }),
+        );
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let upstream_root = format!("http://{}", listener.local_addr().unwrap());
+    let upstream_task = tokio::spawn(async move {
+        axum::serve(listener, upstream).await.unwrap();
+    });
+
+    let server = Server::with_usage_root(&upstream_root).await;
+    server
+        .store
+        .upsert_account(&Account {
+            id: "a".into(),
+            email: "a@example.test".into(),
+            access_token: "test-token".into(),
+            account_id: "test-account".into(),
+            ..Default::default()
+        })
+        .unwrap();
+    let response = reqwest::Client::new()
+        .post(format!("{}/accounts/a/quota", server.url))
+        .bearer_auth("test-manage-key")
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+    let body: Value = response.json().await.unwrap();
+    assert_eq!(body["credits"]["available"], 2);
+    assert_eq!(
+        body["reset_credits"]["credits"][0]["granted_at"],
+        "2026-10-01T12:34:56Z"
+    );
+    assert_eq!(
+        body["reset_credits"]["credits"][0]["expires_at"],
+        "2026-10-31T12:34:56Z"
+    );
+    assert_eq!(
+        body["reset_credits"]["credits"][1]["expires_at"],
+        Value::Null
+    );
+    upstream_task.abort();
+}

@@ -31,6 +31,26 @@ function winLabel(w) {
   if (w.window_seconds) return `${Math.round(w.window_seconds / 3600)}h`
   return ''
 }
+function creditTime(value, empty = '未知') {
+  if (!value) return empty
+  const time = Date.parse(value)
+  if (!Number.isFinite(time)) return value
+  const date = new Date(time)
+  const pad = n => String(n).padStart(2, '0')
+  return `${date.getFullYear()}-${pad(date.getMonth() + 1)}-${pad(date.getDate())} ${pad(date.getHours())}:${pad(date.getMinutes())}`
+}
+function creditStatus(status) {
+  return { available: '可用', redeemed: '已使用', expired: '已过期' }[status] || status || '未知'
+}
+function resetCreditRows(details) {
+  if (!Array.isArray(details?.credits)) return []
+  return details.credits.map((credit, index) => ({
+    key: credit.id || index,
+    status: creditStatus(credit.status),
+    granted: creditTime(credit.granted_at),
+    expires: creditTime(credit.expires_at, '永不过期'),
+  }))
+}
 function hasData(w) {
   return w && w.used_pct !== undefined && w.used_pct !== null &&
     ((w.window_seconds && w.window_seconds > 0) || tsOf(w.reset_at) > 0)
@@ -100,6 +120,11 @@ const detailColumns = [
     ]) },
   { title: '重置倒计时', key: 'reset', width: 130 },
 ]
+const resetCreditColumns = [
+  { title: '状态', key: 'status', width: 80 },
+  { title: '发放时间', key: 'granted', width: 150 },
+  { title: '到期时间', key: 'expires', width: 150 },
+]
 
 function renderQuota(row) {
   const loading = store.quotaLoading[row.email]
@@ -107,6 +132,8 @@ function renderQuota(row) {
   const rows = quotaRows(row)
   const live = store.liveQuota[row.email]
   const reset = resets[row.id]
+  const resetDetails = live?.reset_credits
+  const resetRows = resetCreditRows(resetDetails)
   const stale = rows.length > 0 && (loading || error || !live)
   return h('div', { style: 'padding:8px 12px 4px' }, [
     loading && h('div', { role: 'status', class: 'muted' }, '查询中…'),
@@ -135,6 +162,13 @@ function renderQuota(row) {
           default: () => `确认消耗账号 ${row.email} 的 1 张最早过期可用券并重置额度？券消耗后不可撤销。`,
         }),
     ]),
+    resetDetails && h('div', { style: 'margin-top:10px' }, [
+      h('div', { class: 'muted', style: 'margin-bottom:4px' }, `banked 重置券明细：${resetDetails.available_count} 张可用`),
+      resetRows.length > 0
+        ? h(NDataTable, { data: resetRows, columns: resetCreditColumns, size: 'small', bordered: false })
+        : h('div', { class: 'muted' }, '上游未提供逐张重置券明细。'),
+    ]),
+    live?.credits && !resetDetails && h('div', { class: 'muted', style: 'margin-top:8px' }, '重置券明细暂时不可用。'),
     reset && h('div', {
       role: reset.type === 'error' ? 'alert' : 'status',
       class: reset.type === 'success' ? 'ok' : reset.type === 'error' ? 'err' : 'muted',

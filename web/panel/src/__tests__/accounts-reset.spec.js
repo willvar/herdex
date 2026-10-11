@@ -65,6 +65,25 @@ describe('Reset-credit confirmation and outcome', () => {
     expect(messages.success).not.toHaveBeenCalled()
   })
 
+  it('shows reset credit grant and expiry timestamps when the upstream provides details', async () => {
+    store.liveQuota[account.email] = {
+      ...quota(),
+      reset_credits: {
+        available_count: 2,
+        credits: [{
+          id: 'credit-1', status: 'available',
+          granted_at: '2026-10-01T12:34:56Z',
+          expires_at: '2026-10-31T12:34:56Z',
+        }],
+      },
+    }
+    await flushPromises()
+    expect(wrapper.text()).toContain('发放时间')
+    expect(wrapper.text()).toContain('到期时间')
+    expect(wrapper.text()).toContain('2026-10-01')
+    expect(wrapper.text()).toContain('2026-10-31')
+  })
+
   it('locks pending actions and leaves a success receipt with the refreshed quota and credit count', async () => {
     let finish
     api.mockReturnValueOnce(new Promise(resolve => { finish = resolve }))

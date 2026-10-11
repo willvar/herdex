@@ -359,14 +359,7 @@ impl App {
                 .clone()
         };
         let _guard = guard.lock().await;
-        let credits = usage::list_reset_credits(
-            &self.http,
-            &self.usage_root,
-            &acc.access_token,
-            &acc.account_id,
-            &self.cfg.header_defaults,
-        )
-        .await?;
+        let credits = self.fetch_reset_credits(acc).await?;
         let credit = usage::earliest_available_reset_credit(&credits)?;
         let redeem = format!("{}-{}", crate::store::now_secs(), uuid::Uuid::new_v4());
         usage::consume_reset_credit(
@@ -377,6 +370,17 @@ impl App {
             &self.cfg.header_defaults,
             &credit.id,
             &redeem,
+        )
+        .await
+    }
+
+    pub async fn fetch_reset_credits(&self, acc: &Account) -> Result<usage::ResetCredits, String> {
+        usage::list_reset_credits(
+            &self.http,
+            &self.usage_root,
+            &acc.access_token,
+            &acc.account_id,
+            &self.cfg.header_defaults,
         )
         .await
     }

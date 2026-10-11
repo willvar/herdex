@@ -305,7 +305,21 @@ async fn quota(
     };
     match app.fetch_usage(&acc).await {
         // probe persistence happens inside observe_usage (single point)
-        Ok(report) => Json(report).into_response(),
+        Ok(mut report) => {
+            match app.fetch_reset_credits(&acc).await {
+                Ok(details) => {
+                    let summary = report
+                        .credits
+                        .get_or_insert_with(crate::usage::Credits::default);
+                    summary.available = details.available_count;
+                    report.reset_credits = Some(details);
+                }
+                Err(error) => {
+                    log::warn!("reset credit details {}: {error}", acc.email);
+                }
+            }
+            Json(report).into_response()
+        }
         Err(e) => err_json(StatusCode::BAD_GATEWAY, e),
     }
 }
