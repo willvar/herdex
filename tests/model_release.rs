@@ -27,6 +27,17 @@ struct Fixture {
     root: std::path::PathBuf,
 }
 
+fn catalog_model(slug: &str) -> Value {
+    json!({
+        "slug": slug,
+        "display_name": slug,
+        "description": format!("metadata for {slug}"),
+        "use_responses_lite": slug != "gpt-5.5",
+        "web_search_tool_type": "text_and_image",
+        "catalog_marker": format!("marker-{slug}"),
+    })
+}
+
 impl Fixture {
     async fn new() -> Self {
         let root = std::env::temp_dir().join(format!("herdex-release-{}", uuid::Uuid::new_v4()));
@@ -82,12 +93,12 @@ impl Fixture {
                             .unwrap()
                             .queries
                             .push((account.clone(), version.clone()));
-                        let mut models = vec![json!({"slug": "gpt-6-sol"})];
+                        let mut models = vec![catalog_model("gpt-6-sol")];
                         if account != "a4" {
-                            models.push(json!({"slug": "gpt-reserve"}));
+                            models.push(catalog_model("gpt-reserve"));
                         }
                         if version == "0.159.2" {
-                            models.push(json!({"slug": "gpt-6.1-sol"}));
+                            models.push(catalog_model("gpt-6.1-sol"));
                         }
                         Json(json!({"models": models}))
                     },
@@ -109,6 +120,7 @@ impl Fixture {
         let cfg = Config {
             upstream: UpstreamCfg {
                 base_url: upstream_url.clone(),
+                standalone_search_timeout_seconds: 45,
             },
             header_defaults: [
                 ("User-Agent".into(), "codex_cli_rs/0.153.4".into()),
@@ -164,36 +176,52 @@ impl Fixture {
     }
 
     async fn list(&self, path: &str) -> reqwest::Response {
+        self.list_with_key(path, "test-key").await
+    }
+
+    async fn list_with_key(&self, path: &str, key: &str) -> reqwest::Response {
         reqwest::Client::new()
             .get(format!("{}{path}", self.gateway_url))
-            .bearer_auth("test-key")
+            .bearer_auth(key)
             .send()
             .await
             .unwrap()
     }
 
-    async fn assert_models(&self, expected: &[&str]) {
+    async fn assert_v1_models(&self, expected: &[&str]) {
         let raw: Vec<String> = expected.iter().map(|id| (*id).to_string()).collect();
-        let mut v1 = raw.clone();
-        for id in expected {
-            if id.starts_with("gpt-") && !id.ends_with("-fast") {
-                v1.push(format!("{id}-fast"));
-            }
+        let response = self.list("/v1/models").await;
+        assert_eq!(response.status(), StatusCode::OK, "/v1/models");
+        let body: Value = response.json().await.unwrap();
+        let slugs: Vec<_> = body["data"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|m| m["id"].as_str().unwrap().to_string())
+            .collect();
+        assert_eq!(slugs, raw);
+    }
+
+    async fn assert_codex_models(&self, expected: &[&str]) {
+        let raw: Vec<String> = expected.iter().map(|id| (*id).to_string()).collect();
+        let response = self.list("/models").await;
+        assert_eq!(response.status(), StatusCode::OK, "/models");
+        let body: Value = response.json().await.unwrap();
+        let slugs: Vec<_> = body["models"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|m| m["slug"].as_str().unwrap().to_string())
+            .collect();
+        assert_eq!(slugs, raw);
+        for model in body["models"].as_array().unwrap() {
+            assert!(model["catalog_marker"].as_str().is_some());
         }
-        v1.sort();
-        v1.dedup();
-        for (path, expected) in [("/models", raw.as_slice()), ("/v1/models", v1.as_slice())] {
-            let response = self.list(path).await;
-            assert_eq!(response.status(), StatusCode::OK, "{path}");
-            let body: Value = response.json().await.unwrap();
-            let slugs: Vec<_> = body["data"]
-                .as_array()
-                .unwrap()
-                .iter()
-                .map(|m| m["id"].as_str().unwrap().to_string())
-                .collect();
-            assert_eq!(slugs, expected, "{path}");
-        }
+    }
+
+    async fn assert_models(&self, expected: &[&str]) {
+        self.assert_v1_models(expected).await;
+        self.assert_codex_models(expected).await;
     }
 }
 
@@ -241,21 +269,20 @@ async fn version_changes_failures_and_recovery_recheck_all_accounts() {
     assert!(f.app.refresh_model_version(&f.release_url).await.unwrap());
     f.refresh_catalogs().await;
     let models: Value = f.list("/v1/models").await.json().await.unwrap();
-    assert_eq!(models["data"].as_array().unwrap().len(), 4); // union plus one Fast alias per GPT model
+    assert_eq!(models["data"].as_array().unwrap().len(), 2);
     assert_eq!(models["data"][0]["id"], "gpt-6-sol");
-    assert_eq!(models["data"][1]["id"], "gpt-6-sol-fast");
-    assert_eq!(models["data"][2]["id"], "gpt-reserve");
-    assert_eq!(models["data"][3]["id"], "gpt-reserve-fast");
-    // /models serves the raw union without an extra upstream query; Fast
-    // aliases are reserved for the OpenAI-compatible /v1/models endpoint.
+    assert_eq!(models["data"][1]["id"], "gpt-reserve");
+    // The native Codex endpoint preserves the full upstream catalog.
     let legacy: Value = f.list("/models").await.json().await.unwrap();
-    let legacy_slugs: Vec<_> = legacy["data"]
+    let legacy_slugs: Vec<_> = legacy["models"]
         .as_array()
         .unwrap()
         .iter()
-        .map(|m| m["id"].as_str().unwrap())
+        .map(|m| m["slug"].as_str().unwrap())
         .collect();
     assert_eq!(legacy_slugs, ["gpt-6-sol", "gpt-reserve"]);
+    assert_eq!(legacy["models"][0]["catalog_marker"], "marker-gpt-6-sol");
+    assert_eq!(legacy["models"][0]["use_responses_lite"], true);
     assert_eq!(f.upstream.lock().unwrap().queries.len(), 4);
     assert!(f
         .upstream
@@ -275,17 +302,7 @@ async fn version_changes_failures_and_recovery_recheck_all_accounts() {
         .iter()
         .map(|m| m["id"].as_str().unwrap())
         .collect();
-    assert_eq!(
-        slugs,
-        [
-            "gpt-6-sol",
-            "gpt-6-sol-fast",
-            "gpt-6.1-sol",
-            "gpt-6.1-sol-fast",
-            "gpt-reserve",
-            "gpt-reserve-fast"
-        ]
-    );
+    assert_eq!(slugs, ["gpt-6-sol", "gpt-6.1-sol", "gpt-reserve"]);
     assert!(f.upstream.lock().unwrap().queries[4..]
         .iter()
         .all(|(_, v)| v == "0.159.2"));
@@ -314,6 +331,52 @@ async fn version_changes_failures_and_recovery_recheck_all_accounts() {
     assert!(f.app.refresh_model_version(&f.release_url).await.unwrap());
     f.refresh_catalogs().await;
     assert_eq!(f.list("/v1/models").await.status(), StatusCode::OK);
+}
+
+#[tokio::test]
+async fn fast_key_filters_to_canonical_fast_capable_model_ids() {
+    let f = Fixture::new().await;
+    f.set_release(StatusCode::OK, r#"{"tag_name":"rust-v0.159.1"}"#);
+    f.app.refresh_model_version(&f.release_url).await.unwrap();
+    f.refresh_catalogs().await;
+    f.app.pool.set_account_models("a4", &["o3".into()]);
+
+    for path in ["/models", "/v1/models"] {
+        let normal: Value = f
+            .list_with_key(path, "test-key")
+            .await
+            .json()
+            .await
+            .unwrap();
+        let fast: Value = f
+            .list_with_key(path, "test-key-fast")
+            .await
+            .json()
+            .await
+            .unwrap();
+        let ids = |body: &Value, native: bool| {
+            let (array, field) = if native {
+                (&body["models"], "slug")
+            } else {
+                (&body["data"], "id")
+            };
+            array
+                .as_array()
+                .unwrap()
+                .iter()
+                .map(|model| model[field].as_str().unwrap().to_string())
+                .collect::<Vec<_>>()
+        };
+        let native = path == "/models";
+        let normal_expected = if native {
+            vec!["gpt-6-sol", "gpt-reserve"]
+        } else {
+            vec!["gpt-6-sol", "gpt-reserve", "o3"]
+        };
+        assert_eq!(ids(&normal, native), normal_expected, "{path}");
+        assert_eq!(ids(&fast, native), ["gpt-6-sol", "gpt-reserve"], "{path}");
+        assert!(ids(&fast, native).iter().all(|id| !id.ends_with("-fast")));
+    }
 }
 
 #[tokio::test]
@@ -362,13 +425,13 @@ async fn model_catalog_ignores_missing_and_empty_account_catalogs() {
     let f = Fixture::new().await;
     f.set_release(StatusCode::OK, r#"{"tag_name":"rust-v0.159.1"}"#);
     f.app.refresh_model_version(&f.release_url).await.unwrap();
-    f.assert_models(&[]).await;
+    f.assert_v1_models(&[]).await;
 
     f.app
         .pool
         .set_account_models("missing", &["gpt-orphan".into()]);
     f.app.pool.set_account_models("a2", &[]);
-    f.assert_models(&[]).await;
+    f.assert_v1_models(&[]).await;
     f.app.pool.set_account_models(
         "a1",
         &[
@@ -377,7 +440,7 @@ async fn model_catalog_ignores_missing_and_empty_account_catalogs() {
             "gpt-reserve".into(),
         ],
     );
-    f.assert_models(&["gpt-6-sol", "gpt-reserve"]).await;
+    f.assert_v1_models(&["gpt-6-sol", "gpt-reserve"]).await;
     assert!(f.upstream.lock().unwrap().queries.is_empty());
 }
 
@@ -388,7 +451,7 @@ async fn startup_restores_persisted_catalogs_without_refresh() {
     f.app.refresh_model_version(&f.release_url).await.unwrap();
     // Discovery persisted by a previous run; no upstream catalog refresh yet.
     f.store
-        .set_account_models("a1", &["gpt-6-sol".into()])
+        .set_account_catalog("a1", &[catalog_model("gpt-6-sol")])
         .unwrap();
     f.app.load_cached_catalogs();
     // Both discovery endpoints serve the restored union immediately.
@@ -407,7 +470,7 @@ async fn model_catalog_account_query_failure_returns_an_error() {
     f.set_release(StatusCode::OK, r#"{"tag_name":"rust-v0.159.1"}"#);
     f.app.refresh_model_version(&f.release_url).await.unwrap();
     f.app.pool.set_account_models("a1", &["gpt-6-sol".into()]);
-    f.assert_models(&["gpt-6-sol"]).await;
+    f.assert_v1_models(&["gpt-6-sol"]).await;
 
     rusqlite::Connection::open(f.root.join("herdex.db"))
         .unwrap()

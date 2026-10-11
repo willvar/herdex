@@ -11,8 +11,8 @@ use axum::body::{Body, Bytes};
 use axum::extract::State;
 use axum::http::{HeaderMap, Method, StatusCode, Uri};
 use axum::response::{IntoResponse, Response};
-use std::collections::BTreeMap;
-use std::time::Instant;
+use std::collections::{BTreeMap, BTreeSet};
+use std::time::{Duration, Instant};
 
 const HOP_HEADERS: [&str; 9] = [
     "connection",
@@ -30,17 +30,29 @@ const MAX_PREFIX_BYTES: usize = 2 * 1024 * 1024;
 // Observation is best-effort; exceeding this budget never truncates the wire.
 const MAX_OBSERVATION_BYTES: usize = 8 * 1024 * 1024;
 const FAST_MODEL_SUFFIX: &str = "-fast";
+const FAST_KEY_SUFFIX: &str = "-fast";
 const FAST_SERVICE_TIER: &str = "priority";
 
 pub fn router() -> axum::Router<AppHandle> {
     axum::Router::new()
-        // model discovery: codex CLI reads {chatgpt_base_url}/models and gets
-        // the raw enabled-account union; other clients read /v1/models and
-        // also get the server-side Fast aliases. Per-request routing filters
-        // by each account's catalog.
+        // /models is the native Codex catalog; /v1/models is the compact
+        // OpenAI-compatible view. A key ending in -fast receives only
+        // Fast-capable models; its requests are forced to the Fast tier.
         .route("/models", axum::routing::get(models))
         .route("/v1/models", axum::routing::get(v1_models))
         .route("/v1/responses", axum::routing::post(responses))
+        // Responses Lite executes `web.run` through the provider's standalone
+        // search endpoint, which needs its own pool-account authentication.
+        .route("/v1/alpha/search", axum::routing::post(standalone_search))
+        .route("/alpha/search", axum::routing::post(standalone_search))
+        .route(
+            "/api/codex/alpha/search",
+            axum::routing::post(standalone_search),
+        )
+        .route(
+            "/backend-api/codex/alpha/search",
+            axum::routing::post(standalone_search),
+        )
         .route(
             "/backend-api/codex/responses",
             axum::routing::post(responses),
@@ -73,41 +85,98 @@ pub fn router() -> axum::Router<AppHandle> {
 
 // Err carries an axum Response; boxing everywhere is not worth it
 #[allow(clippy::result_large_err)]
-fn auth_check(app: &App, headers: &HeaderMap) -> Result<String, Response> {
-    let key = headers
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct ApiAuth {
+    key: String,
+    fast: bool,
+}
+
+#[allow(clippy::result_large_err)]
+fn auth_check(app: &App, headers: &HeaderMap) -> Result<ApiAuth, Response> {
+    let supplied = headers
         .get("Authorization")
         .and_then(|v| v.to_str().ok())
         .and_then(|v| v.strip_prefix("Bearer "))
         .unwrap_or("")
         .to_string();
-    if key.is_empty() {
+    if supplied.is_empty() {
         return Err((StatusCode::UNAUTHORIZED, "missing bearer key").into_response());
     }
+
+    // The suffix is a mode selector, not a second stored credential. Validate
+    // the base key before accepting the derived Fast form, so disabling or
+    // deleting one stored key controls both provider forms.
+    let (key, fast) = if let Some(base) = supplied.strip_suffix(FAST_KEY_SUFFIX) {
+        if !base.is_empty() {
+            match app.store.api_key_valid(base) {
+                Ok(true) => (base.to_string(), true),
+                Ok(false) => (supplied.clone(), false),
+                Err(e) => return Err((StatusCode::INTERNAL_SERVER_ERROR, e).into_response()),
+            }
+        } else {
+            (supplied.clone(), false)
+        }
+    } else {
+        (supplied, false)
+    };
     match app.store.api_key_valid(&key) {
-        Ok(true) => Ok(key),
+        Ok(true) => Ok(ApiAuth { key, fast }),
         Ok(false) => Err((StatusCode::UNAUTHORIZED, "invalid api key").into_response()),
         Err(e) => Err((StatusCode::INTERNAL_SERVER_ERROR, e).into_response()),
     }
 }
 
-/// Codex model discovery: the raw union of existing, enabled accounts'
-/// discovered catalogs (or the config override). Requests skip accounts whose
-/// known catalogs lack the requested model; alias requests are normalized
-/// before selection.
+/// Native Codex model discovery: return the full upstream model metadata for
+/// the union of enabled accounts. The model catalog drives request-shape
+/// choices such as Responses Lite and hosted web-search support.
 async fn models(State(app): State<AppHandle>, headers: HeaderMap) -> Response {
-    model_list(app, headers, false).await
+    codex_model_list(app, headers).await
 }
 
-/// OpenAI-compatible model discovery: the enabled-account union plus
-/// server-side Fast aliases for GPT models.
+/// OpenAI-compatible model discovery: canonical model IDs. A `-fast` API key
+/// receives only the subset that can use the Fast service tier.
 async fn v1_models(State(app): State<AppHandle>, headers: HeaderMap) -> Response {
-    model_list(app, headers, true).await
+    compatible_model_list(app, headers).await
 }
 
-async fn model_list(app: AppHandle, headers: HeaderMap, include_fast_aliases: bool) -> Response {
-    if auth_check(&app, &headers).is_err() {
-        return (StatusCode::UNAUTHORIZED, "invalid api key").into_response();
+async fn codex_model_list(app: AppHandle, headers: HeaderMap) -> Response {
+    let auth = match auth_check(&app, &headers) {
+        Ok(auth) => auth,
+        Err(response) => return response,
+    };
+    if app.model_version().is_none() {
+        return (
+            StatusCode::SERVICE_UNAVAILABLE,
+            "Codex release version unavailable",
+        )
+            .into_response();
     }
+
+    let allowed = (!app.cfg.models.is_empty())
+        .then(|| app.cfg.models.iter().cloned().collect::<BTreeSet<_>>());
+    let mut models = match app.pool.union_model_catalog() {
+        Ok(models) => models,
+        Err(e) => return (StatusCode::INTERNAL_SERVER_ERROR, e).into_response(),
+    };
+    models.retain(|model| {
+        let Some(slug) = model.get("slug").and_then(|value| value.as_str()) else {
+            return false;
+        };
+        allowed
+            .as_ref()
+            .is_none_or(|allowed| allowed.contains(slug))
+            && (!auth.fast || is_fast_capable_model(slug))
+    });
+    axum::Json(serde_json::json!({"models": models})).into_response()
+}
+
+/// OpenAI-compatible model discovery: canonical model IDs. A `-fast` API key
+/// receives only the subset that can use the Fast service tier.
+async fn compatible_model_list(app: AppHandle, headers: HeaderMap) -> Response {
+    let auth = match auth_check(&app, &headers) {
+        Ok(auth) => auth,
+        Err(response) => return response,
+    };
     if app.model_version().is_none() {
         return (
             StatusCode::SERVICE_UNAVAILABLE,
@@ -127,8 +196,8 @@ async fn model_list(app: AppHandle, headers: HeaderMap, include_fast_aliases: bo
     } else {
         app.cfg.models.clone()
     };
-    let model_ids = if include_fast_aliases {
-        advertised_model_ids(&slugs)
+    let model_ids = if auth.fast {
+        fast_model_ids(&slugs)
     } else {
         slugs
     };
@@ -145,24 +214,17 @@ fn is_fast_capable_model(model: &str) -> bool {
         && !model.ends_with(FAST_MODEL_SUFFIX)
 }
 
-fn fast_alias_for(model: &str) -> Option<String> {
-    is_fast_capable_model(model).then(|| format!("{model}{FAST_MODEL_SUFFIX}"))
-}
-
 fn fast_alias_base(model: &str) -> Option<&str> {
     let base = model.strip_suffix(FAST_MODEL_SUFFIX)?;
     is_fast_capable_model(base).then_some(base)
 }
 
-fn advertised_model_ids(slugs: &[String]) -> Vec<String> {
-    let mut ids = std::collections::BTreeSet::new();
-    for slug in slugs {
-        ids.insert(slug.clone());
-        if let Some(alias) = fast_alias_for(slug) {
-            ids.insert(alias);
-        }
-    }
-    ids.into_iter().collect()
+fn fast_model_ids(slugs: &[String]) -> Vec<String> {
+    slugs
+        .iter()
+        .filter(|slug| is_fast_capable_model(slug))
+        .cloned()
+        .collect()
 }
 
 #[derive(Clone, Copy)]
@@ -440,26 +502,52 @@ struct PreparedRequest {
     body: Vec<u8>,
 }
 
+enum PrepareError {
+    Invalid,
+    FastUnsupported(String),
+}
+
 /// Reads the request metadata while preserving ordinary request bytes. A
 /// `-fast` model alias is the one deliberate exception: it becomes the base
 /// model and forces the upstream Fast service tier.
-fn prepare_request(body: &[u8]) -> Option<PreparedRequest> {
-    let mut value: serde_json::Value = serde_json::from_slice(body).ok()?;
-    let requested_model = value.get("model")?.as_str()?.to_owned();
+fn prepare_request(body: &[u8], fast_mode: bool) -> Result<PreparedRequest, PrepareError> {
+    let mut value: serde_json::Value =
+        serde_json::from_slice(body).map_err(|_| PrepareError::Invalid)?;
+    let requested_model = value
+        .get("model")
+        .and_then(|model| model.as_str())
+        .ok_or(PrepareError::Invalid)?
+        .to_owned();
     let service_tier = match value.get("service_tier") {
         None | Some(serde_json::Value::Null) => Some(String::new()),
         Some(serde_json::Value::String(tier)) => Some(tier.clone()),
         _ => None,
     };
+
     let Some(base_model) = fast_alias_base(&requested_model) else {
-        return Some(PreparedRequest {
+        if fast_mode && !is_fast_capable_model(&requested_model) {
+            return Err(PrepareError::FastUnsupported(requested_model));
+        }
+        if !fast_mode {
+            return Ok(PreparedRequest {
+                model: requested_model,
+                service_tier,
+                body: body.to_vec(),
+            });
+        }
+        let object = value.as_object_mut().ok_or(PrepareError::Invalid)?;
+        object.insert(
+            "service_tier".into(),
+            serde_json::Value::String(FAST_SERVICE_TIER.into()),
+        );
+        return Ok(PreparedRequest {
             model: requested_model,
-            service_tier,
-            body: body.to_vec(),
+            service_tier: Some(FAST_SERVICE_TIER.into()),
+            body: serde_json::to_vec(&value).map_err(|_| PrepareError::Invalid)?,
         });
     };
 
-    let object = value.as_object_mut()?;
+    let object = value.as_object_mut().ok_or(PrepareError::Invalid)?;
     object.insert(
         "model".into(),
         serde_json::Value::String(base_model.to_owned()),
@@ -468,29 +556,41 @@ fn prepare_request(body: &[u8]) -> Option<PreparedRequest> {
         "service_tier".into(),
         serde_json::Value::String(FAST_SERVICE_TIER.into()),
     );
-    Some(PreparedRequest {
+    Ok(PreparedRequest {
         model: base_model.to_owned(),
         service_tier: Some(FAST_SERVICE_TIER.into()),
-        body: serde_json::to_vec(&value).ok()?,
+        body: serde_json::to_vec(&value).map_err(|_| PrepareError::Invalid)?,
     })
 }
 
 async fn responses(State(app): State<AppHandle>, headers: HeaderMap, body: Bytes) -> Response {
-    let api_key = match auth_check(&app, &headers) {
-        Ok(k) => k,
+    let auth = match auth_check(&app, &headers) {
+        Ok(auth) => auth,
         Err(res) => return res,
     };
     let PreparedRequest {
         model,
         service_tier,
         body: request_body,
-    } = match prepare_request(&body) {
-        Some(request) => request,
-        None => return (
+    } = match prepare_request(&body, auth.fast) {
+        Ok(request) => request,
+        Err(PrepareError::Invalid) => return (
             StatusCode::BAD_REQUEST,
             r#"{"error":{"message":"missing \"model\" in request body","type":"server_error"}}"#,
         )
             .into_response(),
+        Err(PrepareError::FastUnsupported(model)) => {
+            return (
+                StatusCode::BAD_REQUEST,
+                axum::Json(serde_json::json!({
+                    "error": {
+                        "message": format!("model {model} does not support Fast mode"),
+                        "type": "invalid_request_error"
+                    }
+                })),
+            )
+                .into_response()
+        }
     };
 
     let session_key = headers
@@ -518,7 +618,7 @@ async fn responses(State(app): State<AppHandle>, headers: HeaderMap, body: Bytes
     let request_id = uuid::Uuid::new_v4().to_string();
     let mut request_log = RequestLog {
         entry: LogEntry {
-            api_key,
+            api_key: auth.key,
             model: model.clone(),
             service_tier,
             diagnostics: Some(RequestDiagnostics {
@@ -530,18 +630,41 @@ async fn responses(State(app): State<AppHandle>, headers: HeaderMap, body: Bytes
         started: Instant::now(),
         attempts: 0,
     };
-    let mut attempt = 0;
+    let mut attempted_accounts = BTreeSet::new();
+    let mut retry_account: Option<Account> = None;
     let mut retried_pre_content = false;
-    while attempt < attempts {
-        let mut acc = candidates[attempt % candidates.len()].clone();
-        let mut observed = request_log.begin(&app, &acc);
+    while attempted_accounts.len() < attempts || retry_account.is_some() {
+        let selected = if let Some(acc) = retry_account.take() {
+            match app.pool.lease_account(&acc.id, &model) {
+                Ok(Some(lease)) => Some((acc, lease)),
+                Ok(None) => None,
+                Err(error) => {
+                    last_status = 500;
+                    last_err = error;
+                    None
+                }
+            }
+        } else {
+            match app.pool.lease(&model, &session_key, &attempted_accounts) {
+                Ok(lease) => lease,
+                Err(error) => {
+                    last_status = 500;
+                    last_err = error;
+                    None
+                }
+            }
+        };
+        let Some((mut acc, lease)) = selected else {
+            break;
+        };
+        attempted_accounts.insert(acc.id.clone());
+        let mut observed = request_log.begin(&app, &acc, lease);
         if (acc.expires_at - crate::store::now_secs()) < 300 {
             observed.diagnostics().stage = "refresh".into();
             if app.refresh_expired(&mut acc).await.is_err() {
                 observed.record(Some("token_refresh_failed"), true);
                 last_status = 401;
                 last_err = format!("token refresh failed for {}", acc.email);
-                attempt += 1;
                 continue;
             }
         }
@@ -576,13 +699,13 @@ async fn responses(State(app): State<AppHandle>, headers: HeaderMap, body: Bytes
                 // arrives inside a 200 stream): after the candidate list is
                 // exhausted, retry the same account exactly once. The flag
                 // bounds it — never a second retry.
-                if pre_content && attempt + 1 == attempts && !retried_pre_content {
+                if pre_content && attempted_accounts.len() >= attempts && !retried_pre_content {
                     retried_pre_content = true;
+                    retry_account = Some(acc);
                     continue;
                 }
             }
         }
-        attempt += 1;
     }
     let body = serde_json::json!({
         "error": {"message": format!("all pool attempts failed; last: {last_err}"), "type": "server_error"}
@@ -592,6 +715,316 @@ async fn responses(State(app): State<AppHandle>, headers: HeaderMap, body: Bytes
         .headers_mut()
         .insert("x-herdex-request-id", request_id.parse().unwrap());
     response
+}
+
+/// Proxies Codex's standalone `alpha/search` call with a pool account token.
+/// Responses Lite deliberately omits hosted Responses tools; Codex invokes
+/// this endpoint for the `web.run` namespace instead. Search requests do not
+/// carry a service tier or a completion stream, so they are forwarded as JSON
+/// and are not recorded as model completions.
+async fn standalone_search(
+    State(app): State<AppHandle>,
+    headers: HeaderMap,
+    body: Bytes,
+) -> Response {
+    let _auth = match auth_check(&app, &headers) {
+        Ok(auth) => auth,
+        Err(response) => return response,
+    };
+    let value: serde_json::Value = match serde_json::from_slice(&body) {
+        Ok(value) => value,
+        Err(_) => {
+            return (
+                StatusCode::BAD_REQUEST,
+                r#"{"error":{"message":"invalid JSON request body","type":"invalid_request_error"}}"#,
+            )
+                .into_response();
+        }
+    };
+    let model = match value.get("model").and_then(|model| model.as_str()) {
+        Some(model) if !model.is_empty() => model.to_owned(),
+        _ => {
+            return (
+                StatusCode::BAD_REQUEST,
+                r#"{"error":{"message":"missing \"model\" in request body","type":"invalid_request_error"}}"#,
+            )
+                .into_response();
+        }
+    };
+    let session_key = headers
+        .get("Session-Id")
+        .and_then(|value| value.to_str().ok())
+        .unwrap_or("");
+    let candidates = match app.pool.select(&model, session_key) {
+        Ok(candidates) => candidates,
+        Err(error) => return (StatusCode::INTERNAL_SERVER_ERROR, error).into_response(),
+    };
+    if candidates.is_empty() {
+        return (
+            StatusCode::SERVICE_UNAVAILABLE,
+            format!("no enabled account can serve model {model}"),
+        )
+            .into_response();
+    }
+    let attempts = candidates.len();
+    let request_id = uuid::Uuid::new_v4().to_string();
+    let request_started = Instant::now();
+    let timeout = Duration::from_secs(app.cfg.upstream.standalone_search_timeout_seconds.max(1));
+
+    let url = format!(
+        "{}/alpha/search",
+        app.cfg.upstream.base_url.trim_end_matches('/')
+    );
+    let mut last_status = 0u16;
+    let mut last_error = String::new();
+    let mut attempted_accounts = BTreeSet::new();
+    let mut attempt_number = 0u32;
+    while attempted_accounts.len() < attempts {
+        let selected = match app.pool.lease(&model, session_key, &attempted_accounts) {
+            Ok(selected) => selected,
+            Err(error) => {
+                last_status = 500;
+                last_error = error;
+                break;
+            }
+        };
+        let Some((mut account, _lease)) = selected else {
+            break;
+        };
+        attempted_accounts.insert(account.id.clone());
+        attempt_number += 1;
+        let attempt_started = Instant::now();
+        if (account.expires_at - crate::store::now_secs()) < 300
+            && app.refresh_expired(&mut account).await.is_err()
+        {
+            last_status = 401;
+            last_error = format!("token refresh failed for {}", account.email);
+            app.pool.mark_failure(&account.id, &model);
+            log_standalone_search_attempt(SearchAttemptLog {
+                request_id: &request_id,
+                attempt: attempt_number,
+                model: &model,
+                account_id: &account.id,
+                status: 401,
+                request_started,
+                attempt_started,
+                ttfb_ms: None,
+                received_bytes: 0,
+                upstream_request_id: None,
+                error: Some("token_refresh_failed"),
+            });
+            continue;
+        }
+
+        let mut request = app
+            .http
+            .post(&url)
+            .header(
+                "Content-Type",
+                headers
+                    .get("Content-Type")
+                    .and_then(|value| value.to_str().ok())
+                    .unwrap_or("application/json"),
+            )
+            .header(
+                "Accept",
+                headers
+                    .get("Accept")
+                    .and_then(|value| value.to_str().ok())
+                    .unwrap_or("application/json"),
+            )
+            .bearer_auth(&account.access_token)
+            .header("Chatgpt-Account-Id", &account.account_id);
+        if let Some(value) = headers.get("X-Codex-Turn-Metadata") {
+            request = request.header("X-Codex-Turn-Metadata", value);
+        }
+        request = app.apply_identity(request, &headers);
+        let result = tokio::time::timeout(timeout, async {
+            let response = request
+                .body(body.to_vec())
+                .send()
+                .await
+                .map_err(SearchAttemptError::Request)?;
+            let ttfb = attempt_started.elapsed().as_millis() as u64;
+            let status = response.status().as_u16();
+            let response_headers = response.headers().clone();
+            let upstream_request_id = upstream_request_id(&response_headers);
+            let response_body = response.bytes().await.map_err(SearchAttemptError::Body)?;
+            Ok::<_, SearchAttemptError>((
+                status,
+                response_headers,
+                response_body,
+                ttfb,
+                upstream_request_id,
+            ))
+        })
+        .await;
+        let (status, response_headers, response_body, ttfb, upstream_id) = match result {
+            Ok(Ok(result)) => result,
+            Ok(Err(error)) => {
+                last_status = 0;
+                last_error = format!("{}: upstream search transport error", account.email);
+                app.pool.mark_failure(&account.id, &model);
+                let detail = match error {
+                    SearchAttemptError::Request(error) | SearchAttemptError::Body(error) => {
+                        transport_detail(error)
+                    }
+                };
+                log_standalone_search_attempt(SearchAttemptLog {
+                    request_id: &request_id,
+                    attempt: attempt_number,
+                    model: &model,
+                    account_id: &account.id,
+                    status: 0,
+                    request_started,
+                    attempt_started,
+                    ttfb_ms: None,
+                    received_bytes: 0,
+                    upstream_request_id: None,
+                    error: Some(&detail),
+                });
+                continue;
+            }
+            Err(_) => {
+                last_status = 0;
+                last_error = format!("{}: standalone search timeout", account.email);
+                app.pool.mark_failure(&account.id, &model);
+                log_standalone_search_attempt(SearchAttemptLog {
+                    request_id: &request_id,
+                    attempt: attempt_number,
+                    model: &model,
+                    account_id: &account.id,
+                    status: 0,
+                    request_started,
+                    attempt_started,
+                    ttfb_ms: None,
+                    received_bytes: 0,
+                    upstream_request_id: None,
+                    error: Some("timeout"),
+                });
+                continue;
+            }
+        };
+        if status >= 400 {
+            let snippet = String::from_utf8_lossy(&response_body);
+            last_status = status;
+            last_error = format!("{}: {status} {snippet}", account.email);
+            let error = format!("http_{status}");
+            log_standalone_search_attempt(SearchAttemptLog {
+                request_id: &request_id,
+                attempt: attempt_number,
+                model: &model,
+                account_id: &account.id,
+                status,
+                request_started,
+                attempt_started,
+                ttfb_ms: Some(ttfb),
+                received_bytes: response_body.len(),
+                upstream_request_id: upstream_id.as_deref(),
+                error: Some(&error),
+            });
+            if failoverable(status, &snippet) {
+                app.pool.mark_failure(&account.id, &model);
+                continue;
+            }
+            let mut output = Response::builder()
+                .status(StatusCode::from_u16(status).unwrap_or(StatusCode::BAD_REQUEST));
+            copy_headers(output.headers_mut().unwrap(), &response_headers);
+            output
+                .headers_mut()
+                .unwrap()
+                .insert("x-herdex-request-id", request_id.parse().unwrap());
+            return output
+                .body(Body::from(response_body))
+                .unwrap_or_else(|error| {
+                    (StatusCode::BAD_GATEWAY, error.to_string()).into_response()
+                });
+        }
+
+        log_standalone_search_attempt(SearchAttemptLog {
+            request_id: &request_id,
+            attempt: attempt_number,
+            model: &model,
+            account_id: &account.id,
+            status,
+            request_started,
+            attempt_started,
+            ttfb_ms: Some(ttfb),
+            received_bytes: response_body.len(),
+            upstream_request_id: upstream_id.as_deref(),
+            error: None,
+        });
+
+        let mut output = Response::builder()
+            .status(StatusCode::from_u16(status).unwrap_or(StatusCode::BAD_GATEWAY));
+        copy_headers(output.headers_mut().unwrap(), &response_headers);
+        output
+            .headers_mut()
+            .unwrap()
+            .insert("x-herdex-request-id", request_id.parse().unwrap());
+        return output
+            .body(Body::from(response_body))
+            .unwrap_or_else(|error| (StatusCode::BAD_GATEWAY, error.to_string()).into_response());
+    }
+
+    let output = serde_json::json!({
+        "error": {
+            "message": format!("all pool search attempts failed; last: {last_error}"),
+            "type": "server_error"
+        }
+    });
+    let mut response = (upstream_status(last_status), axum::Json(output)).into_response();
+    response
+        .headers_mut()
+        .insert("x-herdex-request-id", request_id.parse().unwrap());
+    response
+}
+
+enum SearchAttemptError {
+    Request(reqwest::Error),
+    Body(reqwest::Error),
+}
+
+struct SearchAttemptLog<'a> {
+    request_id: &'a str,
+    attempt: u32,
+    model: &'a str,
+    account_id: &'a str,
+    status: u16,
+    request_started: Instant,
+    attempt_started: Instant,
+    ttfb_ms: Option<u64>,
+    received_bytes: usize,
+    upstream_request_id: Option<&'a str>,
+    error: Option<&'a str>,
+}
+
+fn log_standalone_search_attempt(log: SearchAttemptLog<'_>) {
+    let total_ms = log.request_started.elapsed().as_millis() as u64;
+    let attempt_ms = log.attempt_started.elapsed().as_millis() as u64;
+    let diagnostics = serde_json::json!({
+        "request_id": log.request_id,
+        "attempt": log.attempt,
+        "elapsed_ms": total_ms,
+        "attempt_ms": attempt_ms,
+        "ttfb_ms": log.ttfb_ms,
+        "body_ms": log.ttfb_ms.map(|ttfb| attempt_ms.saturating_sub(ttfb)),
+        "received_bytes": log.received_bytes,
+        "upstream_request_id": log.upstream_request_id,
+        "error": log.error,
+    });
+    log::log!(
+        if log.error.is_some() {
+            log::Level::Warn
+        } else {
+            log::Level::Info
+        },
+        "standalone search attempt: model={:?} account_id={:?} status={} diagnostics={}",
+        log.model,
+        log.account_id,
+        log.status,
+        diagnostics
+    );
 }
 
 type AttemptResult = Result<Response, AttemptFailure>;
@@ -693,17 +1126,7 @@ async fn attempt_once(
         let entry = observed.entry.as_mut().unwrap();
         entry.status = status as i64;
         entry.latency_ms = request_log.started.elapsed().as_millis() as i64;
-        observed.diagnostics().upstream_request_id = ["x-request-id", "openai-request-id"]
-            .into_iter()
-            .filter_map(|name| res.headers().get(name)?.to_str().ok())
-            .find(|id| {
-                !id.is_empty()
-                    && id.len() <= 128
-                    && id
-                        .bytes()
-                        .all(|c| c.is_ascii_alphanumeric() || b"-_.".contains(&c))
-            })
-            .map(str::to_owned);
+        observed.diagnostics().upstream_request_id = upstream_request_id(res.headers());
 
         // full rate-limit header observability: log every limit-related response
         // header verbatim (read-only; passthrough unaffected)
@@ -822,7 +1245,17 @@ async fn attempt_once(
                             app.learn_strip(param);
                         }
                         body = nb;
-                        observed = request_log.begin(app, acc);
+                        let lease = match app.pool.lease_account(&acc.id, &model) {
+                            Ok(Some(lease)) => lease,
+                            Ok(None) => {
+                                return Err(AttemptFailure::http(
+                                    503,
+                                    format!("{}: account no longer eligible", acc.email),
+                                ));
+                            }
+                            Err(error) => return Err(AttemptFailure::http(500, error)),
+                        };
+                        observed = request_log.begin(app, acc, lease);
                         continue;
                     }
                 }
@@ -981,7 +1414,7 @@ struct RequestLog {
 }
 
 impl RequestLog {
-    fn begin(&mut self, app: &App, acc: &Account) -> StreamLog {
+    fn begin(&mut self, app: &App, acc: &Account, lease: pool::PoolLease) -> StreamLog {
         self.attempts += 1;
         let mut entry = self.entry.clone();
         entry.account_id = acc.id.clone();
@@ -991,6 +1424,7 @@ impl RequestLog {
             stats: StreamStats::default(),
             store: app.store.clone(),
             pool: app.pool.clone(),
+            _lease: Some(lease),
             account_id: acc.id.clone(),
             entry: Some(entry),
             request_started: self.started,
@@ -1025,6 +1459,20 @@ fn transport_detail(error: reqwest::Error) -> String {
         cause = current.source();
     }
     detail.chars().take(2048).collect()
+}
+
+fn upstream_request_id(h: &reqwest::header::HeaderMap) -> Option<String> {
+    ["x-request-id", "openai-request-id"]
+        .into_iter()
+        .filter_map(|name| h.get(name)?.to_str().ok())
+        .find(|id| {
+            !id.is_empty()
+                && id.len() <= 128
+                && id
+                    .bytes()
+                    .all(|c| c.is_ascii_alphanumeric() || b"-_.".contains(&c))
+        })
+        .map(str::to_owned)
 }
 
 fn error_code(code: &str) -> Option<&str> {
@@ -1112,6 +1560,7 @@ struct StreamLog {
     stats: StreamStats,
     store: Store,
     pool: pool::Pool,
+    _lease: Option<pool::PoolLease>,
     account_id: String,
     entry: Option<LogEntry>,
     request_started: Instant,
@@ -1800,6 +2249,7 @@ mod tests {
                     stats: StreamStats::default(),
                     store: store.clone(),
                     pool: pool.clone(),
+                    _lease: None,
                     account_id: "a1".into(),
                     entry: Some(LogEntry {
                         account_email: "a1@test".into(),
@@ -1884,16 +2334,13 @@ mod tests {
     }
 
     #[test]
-    fn fast_aliases_are_gpt_only_and_not_recursive() {
+    fn fast_filter_is_gpt_only_and_aliases_are_not_recursive() {
         let slugs = [
             "o3".to_string(),
             "gpt-5.5".to_string(),
             "gpt-5.5-fast".to_string(),
         ];
-        assert_eq!(
-            advertised_model_ids(&slugs),
-            ["gpt-5.5", "gpt-5.5-fast", "o3"]
-        );
+        assert_eq!(fast_model_ids(&slugs), ["gpt-5.5"]);
         assert_eq!(fast_alias_base("gpt-5.5-fast"), Some("gpt-5.5"));
         assert_eq!(fast_alias_base("o3-fast"), None);
         assert_eq!(fast_alias_base("gpt-5.5-fast-fast"), None);
