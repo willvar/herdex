@@ -46,14 +46,23 @@ codex 专用账号池网关（Rust）。把多个 ChatGPT 账号聚合成一个 
   请求计数包含每次尝试，失败行只保留实际观察到的 token 用量。
 - **Banked reset 消耗顺序**：面板消耗前读取券明细，明确选择 `expires_at` 最早的可用券；
   永不过期券排在有明确过期时间的券之后，同一过期时间保持上游顺序；无法解析过期时间时拒绝消耗。
+  点击后须确认账号及消耗 1 张券，执行中阻止重复提交，结果常驻账号详情。
+  操作结果仅由消耗重置请求决定；成功后独立刷新额度。
 - **请求档位记录**：请求日志保存客户端的 `service_tier`，`priority` 表示请求 Fast；
   历史未记录与新请求未指定档位分开表示。不保存请求正文，也不据此推定实际消费倍率
   或调整原始 token 数量、容量校准
 - **令牌自维护**：后台 proactive refresh，过期前自动续
+- **搜索并发调度**：standalone `alpha/search` 使用账号级 in-flight lease，
+  并发请求优先分散到空闲的可用账号；每次尝试记录首字节、完整响应、字节数和上游
+  request ID，不记录查询正文。单次搜索超时后在有限候选内 failover，避免一个账号永久占住请求。
 - **模型目录自动更新**：复用后台轮询，从 Codex 官方稳定版发布频道获取
-  `client_version`，按账号采集上游目录；无 `models` 配置覆盖时，两个发现接口
-  均以启用账号已采集目录的并集为基础，禁用或删除账号立即不参与合并；仅
-  `/v1/models` 为 GPT 模型补充 `-fast` 别名，`/models` 保持 Codex 原始目录。
+  `client_version`，按账号采集上游完整目录；`/models` 返回 Codex 原生
+  `{"models": [...]}` 模型元数据，`/v1/models` 返回 OpenAI-compatible 的
+  `{"object":"list","data":[...]}` canonical 模型 ID 视图。无 `models`
+  配置过滤时，两者均以启用账号目录的并集为基础，禁用或删除账号立即不参与合并；
+  `-fast` Key 过滤为支持 Fast 的 canonical 模型子集，原生目录保留完整对象。
+  Fast Key 的请求自动使用 `service_tier: "priority"`。
+  旧的 `gpt-*-fast` 请求仍作为兼容入口接受。
   调度跳过目录明确不支持模型的账号；启动时先从磁盘恢复上次已采集目录，
   首个刷新周期前路由与两个目录接口即保持正确。
   版本源不可用时两个目录接口返回 503，不清除已有目录、用量或中断现有推理请求
@@ -88,6 +97,7 @@ client-id = "app_EMoamEEZ73f0CkXaXp7hrann"
 
 [upstream]
 base-url = "https://chatgpt.com/backend-api/codex"
+standalone-search-timeout-seconds = 45  # 单次 alpha/search 上游尝试上限
 
 [header-defaults]                     # 仅对非 codex 客户端生效
 user-agent = "codex_cli_rs/0.153.4"
@@ -103,6 +113,7 @@ level = "info"
 官方版本，不读取旧配置中的 `header-defaults.version`，也不以旧版本兜底；取不到
 版本时 `GET /models` 和 `GET /v1/models` 均返回 503，恢复后自动重新采集。两个
 接口（无 `models` 配置覆盖时）同源：返回当前存在且启用账号的已采集目录并集。
+使用以 `-fast` 结尾的 Bearer Key 时，目录改为该并集中支持 Fast 的 canonical 模型子集。
 
 ## 运行
 
@@ -178,29 +189,41 @@ herdex 上，凭据始终是 herdex API key，无客户端 OAuth。
 接口总览（Bearer 认证用 manage 面板里创建的 API key）：
 
 - `POST /v1/responses`、`POST /backend-api/codex/responses` —— SSE 流式透传
-- `GET  /v1/models` —— 启用账号模型并集及 GPT Fast 别名
-- `GET  /models` —— 启用账号原始模型并集（codex CLI 使用）
+- `POST /v1/alpha/search`（及 `/api/codex/alpha/search`）—— Codex Responses Lite
+  的独立 `web.run` 搜索代理，使用池内账号凭据访问上游
+- `GET  /v1/models` —— 启用账号的 canonical 模型并集；Key 以 `-fast` 结尾时筛出 Fast 模型
+- `GET  /models` —— 启用账号完整 Codex 模型目录并集（codex CLI 使用）
 - `GET  /api/codex/usage`（及 `/v1/api/codex/usage`、`/wham/usage`）—— 池子聚合用量
 - `GET  /v1/user-auth-credential/whoami` —— PAT 虚拟身份
 - `GET  /api/codex/accounts/check`（及 `/backend-api/wham/accounts/check`）—— 认证后的虚拟工作区发现
 - `*    /backend-api/*`（其余路径）—— 上游后端反代
 - `POST /api/codex/ps/mcp` —— apps MCP 代理
 
+使用自定义 Codex provider 时，若要启用 Lite 模型的原生搜索，还需在 provider
+配置中设置 `supports_standalone_web_search = true`；`web_search = "live"` 仍由
+Codex 全局配置控制。Lite 模型的搜索请求会单独访问上面的 `alpha/search`，不会伪装成
+一次 Responses 完成。
+
 注意：herdex 是 CLI 的认证依赖；网关不可达、API key 无效或禁用、HTTPS 证书不受
 信任时，codex 会在身份获取或工作区发现阶段拒绝启动（fail-closed）。
+
+Fast Provider 不需要第二条数据库 Key：若普通 Key 为 `<key>`，下游 Provider 使用
+`<key>-fast` 即可。两种形式共享同一 Key 的启用/禁用和删除状态；`-fast` 只是 Provider
+模式选择，不是独立权限边界。
 
 ## OpenCode v2 接入
 
 配套插件位于 [`deploy/opencode/`](deploy/opencode/README.md)：
-启动时从 herdex 拉取模型清单，每分钟刷新，继承 OpenCode 目录中的同名模型显示名、
-推理强度、能力与限制；`gpt-*` 模型额外提供 `#fast` 及与推理档位组合的
-`#max fast` 等选项，映射为 `service_tier: "priority"`。插件会隐藏面向通用客户端的
-`gpt-*-fast` 模型别名。使用 Responses API，可通过
-`http://<herdex-host>:<listen 端口>/v1` 连接，无需证书配置或手动维护模型列表。
+  启动时从 herdex 拉取普通与 Fast 两套模型清单，每分钟刷新，继承 OpenCode 目录中的
+  同名模型显示名、推理强度、能力与限制；模型 ID 始终使用 canonical ID。选择
+  `herdex-fast` Provider 后，herdex 通过 `<key>-fast` 自动使用
+  `service_tier: "priority"`。使用 Responses API，可通过
+ `http://<herdex-host>:<listen 端口>/v1` 连接，无需证书配置或手动维护模型列表。
 安装与配置步骤见插件目录的 README。
 
-只支持 `model` 字段的 OpenAI-compatible 客户端可直接请求 `gpt-6.1-sol-fast`；
-herdex 会将其还原为 `gpt-6.1-sol` 并向上游注入 `service_tier: "priority"`。
+只支持 `model` 字段的 OpenAI-compatible 客户端使用普通 Key 请求 canonical 模型 ID；
+需要 Fast 时，将 Bearer Key 写成 `<key>-fast`，模型 ID 保持不变。旧的
+`gpt-*-fast` 请求 ID 仍会被兼容处理。
 
 ## 测试
 
@@ -211,8 +234,8 @@ cargo test --locked   # 单测 + HTTP 集成：假上游 + 真实 axum 链路
 cd web/panel && npm ci && npm run lint && npm test && npm run build
 ```
 
-前端回归覆盖设置保存与轮询的并发、额度查询失败/重试、同邮箱账号容量隔离、
-空闲日预测和图表卸载；后端覆盖慢速 SSE 分块、前缀预算、同秒请求归属、
+前端回归覆盖设置保存与轮询的并发、额度查询失败/重试、重置券确认/防重复提交/结果反馈、同邮箱账号容量隔离、
+空闲日预测和图表卸载；后端覆盖重置券消耗结果、慢速 SSE 分块、前缀预算、同秒请求归属、
 未知套餐、旧数据库迁移、断连收尾，以及历史清理后的容量统计。
 
 核心语义不变式（逐条测试锁定）：

@@ -13,6 +13,9 @@ client-id = "app_EMoamEEZ73f0CkXaXp7hrann"
 
 [upstream]
 base-url = "https://chatgpt.com/backend-api/codex"
+# Per-account timeout for Codex Lite standalone web search attempts.
+# A timed-out attempt may fail over to another eligible account.
+standalone-search-timeout-seconds = 45
 
 # 伪装壳：仅对非 codex 客户端生效；真 codex 客户端透传自身身份
 [header-defaults]

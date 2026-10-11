@@ -22,9 +22,18 @@ type StreamChunk = Result<Bytes, std::io::Error>;
 struct FakeUp {
     calls: Arc<Mutex<Vec<String>>>, // chatgpt-account-id seen per call
     bodies: Arc<Mutex<Vec<String>>>,
+    auths: Arc<Mutex<Vec<String>>>,
     behavior: Arc<Mutex<Behavior>>,
+    search_behavior: Arc<Mutex<SearchBehavior>>,
     usage: Arc<Mutex<HashMap<String, (StatusCode, Value)>>>,
     response_headers: Arc<Mutex<HeaderMap>>,
+}
+
+#[derive(Clone)]
+enum SearchBehavior {
+    Ok,
+    DelayFirst(Duration),
+    DelayAll(Duration),
 }
 
 #[derive(Clone)]
@@ -48,6 +57,10 @@ enum Behavior {
 impl FakeUp {
     fn router(self) -> Router {
         let usage = self.usage.clone();
+        let search_calls = self.calls.clone();
+        let search_bodies = self.bodies.clone();
+        let search_auths = self.auths.clone();
+        let search_behavior = self.search_behavior.clone();
         Router::new().route(
             "/backend-api/wham/usage",
             axum::routing::get(move |headers: HeaderMap| async move {
@@ -63,7 +76,42 @@ impl FakeUp {
                     .unwrap_or((StatusCode::BAD_GATEWAY, json!({"error": "probe unavailable"})));
                 (status, axum::Json(body)).into_response()
             }),
-        ).route(
+        )
+        .route(
+            "/alpha/search",
+            axum::routing::post(move |headers: HeaderMap, body: String| async move {
+                search_calls.lock().unwrap().push(
+                    headers
+                        .get("Chatgpt-Account-Id")
+                        .and_then(|value| value.to_str().ok())
+                        .unwrap_or("")
+                        .to_string(),
+                );
+                search_auths.lock().unwrap().push(
+                    headers
+                        .get("Authorization")
+                        .and_then(|value| value.to_str().ok())
+                        .unwrap_or("")
+                        .to_string(),
+                );
+                search_bodies.lock().unwrap().push(body);
+                let call_number = search_calls.lock().unwrap().len();
+                let behavior = search_behavior.lock().unwrap().clone();
+                match behavior {
+                    SearchBehavior::DelayFirst(delay) if call_number == 1 => {
+                        tokio::time::sleep(delay).await;
+                    }
+                    SearchBehavior::DelayAll(delay) => tokio::time::sleep(delay).await,
+                    SearchBehavior::Ok | SearchBehavior::DelayFirst(_) => {}
+                }
+                axum::Json(json!({
+                    "encrypted_output": null,
+                    "output": "search output",
+                    "results": []
+                }))
+            }),
+        )
+        .route(
             "/responses",
             axum::routing::post(move |headers: axum::http::HeaderMap, body: String| async move {
                 let acct = headers
@@ -196,6 +244,10 @@ struct Harness {
 }
 
 async fn harness(accounts: &[&str]) -> Harness {
+    harness_with_search_timeout(accounts, 45).await
+}
+
+async fn harness_with_search_timeout(accounts: &[&str], search_timeout_seconds: u64) -> Harness {
     let tmp = std::env::temp_dir().join(format!(
         "herdex-it-{}-{}",
         std::process::id(),
@@ -222,7 +274,9 @@ async fn harness(accounts: &[&str]) -> Harness {
     let upstream = FakeUp {
         calls: Arc::new(Mutex::new(Vec::new())),
         bodies: Arc::new(Mutex::new(Vec::new())),
+        auths: Arc::new(Mutex::new(Vec::new())),
         behavior: Arc::new(Mutex::new(Behavior::Ok)),
+        search_behavior: Arc::new(Mutex::new(SearchBehavior::Ok)),
         usage: Default::default(),
         response_headers: Default::default(),
     };
@@ -238,6 +292,7 @@ async fn harness(accounts: &[&str]) -> Harness {
         },
         upstream: herdex::config::UpstreamCfg {
             base_url: format!("http://{up_addr}"),
+            standalone_search_timeout_seconds: search_timeout_seconds,
         },
         header_defaults: [
             ("User-Agent".to_string(), "codex_cli_rs/0.153.4".to_string()),
@@ -289,6 +344,21 @@ async fn send_post(h: &Harness, model: &str, sid: &str) -> reqwest::Response {
         .bearer_auth("sk-test")
         .header("Session-Id", sid)
         .json(&serde_json::json!({"model": model, "input": "hi"}))
+        .send()
+        .await
+        .unwrap()
+}
+
+async fn send_search(h: &Harness, id: &str) -> reqwest::Response {
+    reqwest::Client::new()
+        .post(format!("{}/v1/alpha/search", h.proxy_url))
+        .bearer_auth("sk-test")
+        .header("Originator", "codex_cli_rs")
+        .json(&serde_json::json!({
+            "id": id,
+            "model": "gpt-5.5",
+            "commands": {"search_query": [{"q": "official Go homepage"}]}
+        }))
         .send()
         .await
         .unwrap()
@@ -880,6 +950,69 @@ async fn passthrough_swaps_auth_and_preserves_body() {
 }
 
 #[tokio::test]
+async fn standalone_search_reauthenticates_and_preserves_body() {
+    let h = harness(&["a1"]).await;
+    h.app.pool.set_account_models("a1", &["gpt-6.1-sol".into()]);
+    let body = json!({
+        "id": "search-1",
+        "model": "gpt-6.1-sol",
+        "commands": {"search_query": [{"q": "official Go homepage"}]}
+    });
+    let raw = serde_json::to_string(&body).unwrap();
+    let response = reqwest::Client::new()
+        .post(format!("{}/v1/alpha/search", h.proxy_url))
+        .bearer_auth("sk-test")
+        .header("Originator", "codex_cli_rs")
+        .body(raw.clone())
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+    assert_eq!(
+        response.json::<Value>().await.unwrap()["output"],
+        "search output"
+    );
+    assert_eq!(h.upstream.calls.lock().unwrap().as_slice(), ["chat-a1"]);
+    assert_eq!(
+        h.upstream.auths.lock().unwrap().as_slice(),
+        ["Bearer at-a1"]
+    );
+    assert_eq!(h.upstream.bodies.lock().unwrap().as_slice(), [raw]);
+}
+
+#[tokio::test]
+async fn standalone_search_leases_different_accounts_for_parallel_requests() {
+    let h = harness(&["a1", "a2"]).await;
+    *h.upstream.search_behavior.lock().unwrap() =
+        SearchBehavior::DelayAll(Duration::from_millis(100));
+
+    let (first, second) = tokio::join!(send_search(&h, "search-a"), send_search(&h, "search-b"));
+    assert_eq!(first.status(), StatusCode::OK);
+    assert_eq!(second.status(), StatusCode::OK);
+
+    let mut calls = h.upstream.calls.lock().unwrap().clone();
+    calls.sort();
+    assert_eq!(calls, ["chat-a1", "chat-a2"]);
+}
+
+#[tokio::test]
+async fn standalone_search_timeout_fails_over_to_another_account() {
+    let h = harness_with_search_timeout(&["a1", "a2"], 1).await;
+    *h.upstream.search_behavior.lock().unwrap() =
+        SearchBehavior::DelayFirst(Duration::from_millis(1100));
+
+    let response = send_search(&h, "search-timeout").await;
+    assert_eq!(response.status(), StatusCode::OK);
+    assert_eq!(
+        response.json::<Value>().await.unwrap()["output"],
+        "search output"
+    );
+
+    let calls = h.upstream.calls.lock().unwrap().clone();
+    assert_eq!(calls, ["chat-a1", "chat-a2"]);
+}
+
+#[tokio::test]
 async fn request_tiers_are_recorded_without_mutating_the_body_or_tokens() {
     let h = harness(&["a1"]).await;
     let client = reqwest::Client::new();
@@ -989,6 +1122,60 @@ async fn fast_model_alias_rewrites_model_and_forces_priority() {
     assert_eq!(logs.len(), 1);
     assert_eq!(logs[0].model, "gpt-5.5");
     assert_eq!(logs[0].service_tier.as_deref(), Some("priority"));
+}
+
+#[tokio::test]
+async fn fast_key_keeps_the_canonical_model_id_and_forces_priority() {
+    let h = harness(&["a1"]).await;
+    let response = reqwest::Client::new()
+        .post(format!("{}/v1/responses", h.proxy_url))
+        .bearer_auth("sk-test-fast")
+        .json(&json!({
+            "model": "gpt-5.5",
+            "input": "hi",
+            "service_tier": "default"
+        }))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(response.status(), 200);
+    response.text().await.unwrap();
+
+    let bodies = h.upstream.bodies.lock().unwrap();
+    assert_eq!(bodies.len(), 1);
+    let forwarded: Value = serde_json::from_str(&bodies[0]).unwrap();
+    assert_eq!(forwarded["model"], "gpt-5.5");
+    assert_eq!(forwarded["service_tier"], "priority");
+    assert_eq!(forwarded["input"], "hi");
+    drop(bodies);
+
+    let logs = h.store.recent_logs(5).unwrap();
+    assert_eq!(logs.len(), 1);
+    assert_eq!(logs[0].api_key, "sk-test");
+    assert_eq!(logs[0].model, "gpt-5.5");
+    assert_eq!(logs[0].service_tier.as_deref(), Some("priority"));
+}
+
+#[tokio::test]
+async fn fast_key_rejects_a_model_outside_the_fast_catalog() {
+    let h = harness(&["a1"]).await;
+    let response = reqwest::Client::new()
+        .post(format!("{}/v1/responses", h.proxy_url))
+        .bearer_auth("sk-test-fast")
+        .json(&json!({"model": "o3", "input": "hi"}))
+        .send()
+        .await
+        .unwrap();
+    let status = response.status();
+    let text = response.text().await.unwrap();
+    assert_eq!(status, StatusCode::BAD_REQUEST, "response body: {text}");
+    let body: Value = serde_json::from_str(&text).unwrap();
+    assert_eq!(body["error"]["type"], "invalid_request_error");
+    assert!(body["error"]["message"]
+        .as_str()
+        .unwrap()
+        .contains("does not support Fast mode"));
+    assert!(h.upstream.bodies.lock().unwrap().is_empty());
 }
 
 #[tokio::test]
