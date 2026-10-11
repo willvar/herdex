@@ -14,6 +14,16 @@ async function addKey() {
   try { await api('POST', '/keys', { key: nk.value, comment: nl.value }); nk.value = ''; nl.value = ''; loadState() }
   catch (e) { message.error(e.message) }
 }
+async function copyFastKey(k) {
+  const fastKey = `${k.key}-fast`
+  try {
+    if (!navigator.clipboard?.writeText) throw new Error('当前浏览器不支持剪贴板')
+    await navigator.clipboard.writeText(fastKey)
+    message.success('Fast Key 已复制')
+  } catch (e) {
+    message.error(`复制失败：${e.message}`)
+  }
+}
 function delKey(k) {
   api('DELETE', `/keys/${encodeURIComponent(k.key)}`).then(loadState).catch(e => message.error(e.message))
 }
@@ -32,8 +42,9 @@ const columns = [
   { title: 'Key', key: 'key', minWidth: 200 },
   { title: '注释', key: 'comment', width: 140 },
   { title: '创建', key: 'created_at', width: 120 },
-  { title: '操作', key: 'actions', width: 220, render: (r) =>
+  { title: '操作', key: 'actions', width: 320, render: (r) =>
     h('span', { style: 'display:inline-flex;gap:8px' }, [
+      h(NButton, { size: 'tiny', onClick: () => copyFastKey(r) }, { default: () => '复制 Fast Key' }),
       h(NButton, { size: 'tiny', onClick: () => editKey(r) }, { default: () => '编辑' }),
       h(NButton, { size: 'tiny', onClick: () => toggleKey(r, !r.disabled) }, { default: () => r.disabled ? '启用' : '禁用' }),
       h(NPopconfirm, { onPositiveClick: () => delKey(r) }, {
@@ -49,6 +60,10 @@ const columns = [
     title="API Keys"
     size="small"
   >
+    <div class="key-hint">
+      Fast Provider 使用同一 Key 加 <code>-fast</code> 后缀，不会新增数据库 Key；普通/Fast
+      形式共享启用、禁用和删除状态。
+    </div>
     <n-data-table
       :data="keys"
       :columns="columns"
@@ -79,4 +94,5 @@ const columns = [
 
 <style>
 .key-disabled { opacity: 0.45; }
+.key-hint { margin-bottom: 10px; color: var(--n-text-color-3); font-size: 12px; }
 </style>

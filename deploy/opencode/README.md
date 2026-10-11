@@ -1,20 +1,21 @@
 # OpenCode v2 接入
 
-此插件为 OpenCode 注册 `herdex` provider：启动时读取 herdex 的 `/v1/models`，
-每 60 秒刷新一次，推理请求使用 `/v1/responses`。
+此插件为 OpenCode 注册 `herdex` 和 `herdex-fast` 两个 Provider：启动时分别使用普通
+Key 与 `<key>-fast` 读取 herdex 的 `/v1/models`，每 60 秒刷新一次，推理请求使用
+`/v1/responses`。
 
-- 模型清单以 herdex 为准，无硬编码模型列表。
-- herdex 面向通用客户端暴露的 `gpt-*-fast` 模型别名会被插件隐藏；OpenCode 使用
-  同一模型下的 variant，不重复注册别名模型。
+- 模型清单以 herdex 为准，无硬编码模型列表；两个 Provider 使用相同的 canonical 模型 ID。
+- `herdex` 使用普通 Key，显示所有可用模型；`herdex-fast` 使用派生 Fast Key，只显示
+  herdex 判定为 Fast-capable 的模型。Fast 由 Provider/API key 模式选择，不是模型 ID 后缀。
 - 从 OpenCode 的 OpenAI 同名模型继承显示名、推理档位、能力、上下文限制及参考价格。
   优先使用当前可用模型的元数据，否则读取目录源定义；不复制直连端点或认证信息。
-- 对 `gpt-*` 模型额外提供 `#fast`；该档位向 herdex 请求 `service_tier: "priority"`，
-  对应账号池的 Fast 模式；已有推理档位还会生成组合档位，例如 `#max fast`。
-  `#fast` 使用模型默认推理强度，`#max fast` 才是 max 推理加 Fast。
+- 两个 Provider 都保留模型自身的推理档位；选择 `herdex-fast` 后，herdex 会自动强制
+  `service_tier: "priority"`，不需要额外的 variant 或请求参数。
 - 未匹配目录的模型保留 OpenCode 默认能力/限制，显示名取端点的 `name` 或格式化 ID；
-  除上述 GPT Fast 档位外不凭空添加推理档位。参考价格是目录元数据，不代表 ChatGPT
+  不凭空添加推理档位。参考价格是目录元数据，不代表 ChatGPT
   订阅池的实际费用。
-- 首次发现失败时清单为空；后续刷新失败保留上一次结果；成功返回空列表则清空。
+- 普通目录首次发现失败时清单为空；Fast 目录失败只使 `herdex-fast` 暂时为空；后续
+  刷新失败保留上一次结果，成功返回空列表则清空对应 Provider。
 - 插件卸载时停止定时刷新。
 
 使用 OpenCode v2；依赖固定为 `@opencode/plugin@2.0.16`。
@@ -54,6 +55,9 @@ npm ci --prefix "$plugin_dir" --omit=peer --ignore-scripts
 服务**持有；仅在新终端里 export 不会改变已运行服务的环境。省略地址时默认
 `http://127.0.0.1:8088/v1`，API key 没有默认值。
 
+配置普通 Key 即可：插件不会要求面板新增第二条 Key，而是为 Fast Provider 自动使用
+`<herdex API key>-fast`。该后缀只是模式选择，与普通 Key 共享启用、禁用和删除状态。
+
 配置目录受 OpenCode 监视，文件变更会自动重载。打开 `/models`，选择 **Herdex Pool**
 下的模型及推理档位即可，无需 `/connect`。插件已经提供 provider，配置中不必再写
 `providers.herdex.models`。如果已有旧的 `plugins/herdex-models` 自动发现安装，只保留
@@ -66,22 +70,17 @@ opencode plugin list
 opencode models
 ```
 
-从列表选择实际存在的 `herdex/<模型 ID>`；仅在该模型列出对应档位时使用 `#high` 等后缀：
+从列表选择实际存在的 `herdex/<模型 ID>` 或 `herdex-fast/<模型 ID>`；仅在该模型列出
+对应档位时使用 `#high` 等后缀：
 
 ```bash
 opencode run --model 'herdex/<模型 ID>#high' '只回复：正常'
 ```
 
-GPT 模型还可选择 Fast 档位：
+选择 Fast Provider：
 
 ```bash
-opencode run --model 'herdex/<GPT 模型 ID>#fast' '只回复：正常'
-```
-
-需要 max 推理与 Fast 同时启用时，选择带空格的组合档位：
-
-```bash
-opencode run --model 'herdex/<GPT 模型 ID>#max fast' '只回复：正常'
+opencode run --model 'herdex-fast/<GPT 模型 ID>' '只回复：正常'
 ```
 
 若模型存在但无推理档位，检查 OpenCode 的 OpenAI 同名模型元数据是否包含 `variants`。

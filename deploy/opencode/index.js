@@ -19,11 +19,10 @@ export default Plugin.define({
       .replace(/\/+$/, "")
     const apiKey = process.env.HERDEX_API_KEY ?? ctx.options.apiKey
     if (!apiKey) throw new Error("herdex-models: set options.apiKey or HERDEX_API_KEY")
-    const pid = Provider.ID.make("herdex")
 
-    const discover = async () => {
+    const fetchModels = async (key) => {
       const res = await fetch(`${baseURL}/models`, {
-        headers: { Authorization: `Bearer ${apiKey}` },
+        headers: { Authorization: `Bearer ${key}` },
         signal: AbortSignal.timeout(10_000),
       })
       if (!res.ok) throw new Error(`/models returned HTTP ${res.status}`)
@@ -31,24 +30,44 @@ export default Plugin.define({
       if (!Array.isArray(body.data) || body.data.some((m) => typeof m?.id !== "string" || !m.id)) {
         throw new Error("/models returned an invalid model list")
       }
+      // Older herdex versions may still advertise generated aliases. OpenCode
+      // has separate providers for Fast, so only canonical IDs belong here.
+      return body.data.filter((entry) => !isFastAlias(entry.id))
+    }
 
+    const readCatalog = async () => {
       // Active OpenAI models may have richer metadata from the account catalog.
       const catalog = new Map()
       try {
         const out = await ctx.model.list()
-        for (const model of Array.isArray(out) ? out : out.data) {
+        const models = Array.isArray(out) ? out : out?.data ?? []
+        for (const model of models) {
           if (model.providerID === "openai") catalog.set(model.id, model)
         }
       } catch {
         console.error("herdex-models: catalog unavailable; using source metadata")
       }
-      // Herdex also advertises `-fast` model aliases for generic clients.
-      // OpenCode has native variants, so keep one model entry and expose Fast
-      // through the existing #fast and #<reasoning> fast choices below.
-      return { entries: body.data.filter((entry) => !isFastAlias(entry.id)), catalog }
+      return catalog
     }
 
-    let source = { entries: [], catalog: new Map() }
+    const discover = async () => {
+      const [normal, fast] = await Promise.allSettled([
+        fetchModels(apiKey),
+        fetchModels(`${apiKey}-fast`),
+      ])
+      if (normal.status === "rejected") throw normal.reason
+
+      if (fast.status === "rejected") {
+        console.error("herdex-models: Fast provider discovery failed; keeping it empty")
+      }
+      return {
+        normal: normal.value,
+        fast: fast.status === "fulfilled" ? fast.value : [],
+        catalog: await readCatalog(),
+      }
+    }
+
+    let source = { normal: [], fast: [], catalog: new Map() }
     try {
       source = await discover()
     } catch {
@@ -58,7 +77,7 @@ export default Plugin.define({
     await ctx.provider.transform((editor) => {
       // Source definitions also include inactive OpenAI providers.
       const defaults = editor.get("openai")?.models
-      const models = source.entries.map((entry) => {
+      const definitions = (pid, entries) => entries.map((entry) => {
         const model = Model.Info.default(pid, Model.ID.make(entry.id))
         const catalog = source.catalog.get(entry.id) ?? defaults?.get(entry.id)
         if (catalog) {
@@ -66,7 +85,8 @@ export default Plugin.define({
             if (catalog[field] !== undefined) model[field] = structuredClone(catalog[field])
           }
         }
-        // Inherit selected semantic choices, never another provider's routing/auth overrides.
+        // Inherit semantic choices, but keep Fast as a provider choice rather
+        // than a variant that could accidentally use the ordinary API key.
         const variants = (catalog?.variants ?? []).map((variant) => {
           const settings = {}
           for (const field of ["reasoningEffort", "reasoningSummary", "include", "serviceTier"]) {
@@ -75,40 +95,28 @@ export default Plugin.define({
             }
           }
           return { id: variant.id, settings }
-        })
-        if (/^gpt-/i.test(entry.id)) {
-          const fast = variants.find((variant) => variant.id === "fast")
-          if (fast) {
-            fast.settings = { ...fast.settings, serviceTier: "priority" }
-          } else {
-            variants.push({ id: "fast", settings: { serviceTier: "priority" } })
-          }
-          for (const variant of [...variants]) {
-            if (variant.id === "fast" || variant.id.endsWith(" fast")) continue
-            if (variant.settings?.reasoningEffort === undefined) continue
-            const id = `${variant.id} fast`
-            if (variants.some((candidate) => candidate.id === id)) continue
-            variants.push({
-              id,
-              settings: { ...variant.settings, serviceTier: "priority" },
-            })
-          }
-        }
+        }).filter((variant) => variant.id !== "fast" && !variant.id.endsWith(" fast"))
         model.variants = variants
         model.name = catalog?.name || entry.name || prettyName(entry.id)
         return model
       })
 
-      editor.add({
-        info: {
-          ...Provider.Info.empty(pid),
-          name: "Herdex Pool",
-          activation: "enabled",
-          package: "@opencode/ai/providers/openai/responses",
-          settings: { baseURL, apiKey },
-        },
-        models,
-      })
+      const addProvider = (id, name, key, entries) => {
+        const pid = Provider.ID.make(id)
+        editor.add({
+          info: {
+            ...Provider.Info.empty(pid),
+            name,
+            activation: "enabled",
+            package: "@opencode/ai/providers/openai/responses",
+            settings: { baseURL, apiKey: key },
+          },
+          models: definitions(pid, entries),
+        })
+      }
+
+      addProvider("herdex", "Herdex Pool", apiKey, source.normal)
+      addProvider("herdex-fast", "Herdex Pool (Fast)", `${apiKey}-fast`, source.fast)
     })
 
     let stopped = false
