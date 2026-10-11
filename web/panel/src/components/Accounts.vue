@@ -1,5 +1,5 @@
 <script setup>
-import { computed, h } from 'vue'
+import { computed, h, reactive } from 'vue'
 import { NCard, NDataTable, NButton, NSwitch, NTag, NPopconfirm, useMessage } from 'naive-ui'
 import { api } from '../api.js'
 import { store, loadState, fetchQuota } from '../store.js'
@@ -7,6 +7,7 @@ import { store, loadState, fetchQuota } from '../store.js'
 const message = useMessage()
 const accounts = computed(() => store.st?.accounts || [])
 const cachedQuota = computed(() => store.st?.quota || {})
+const resets = reactive({})
 
 function tsOf(v) { if (!v) return 0; return typeof v === 'number' ? (v < 1e12 ? v * 1000 : v) : Date.parse(v) }
 function remPct(w) { return Math.round(100 - w.used_pct) }
@@ -60,19 +61,33 @@ function delAcc(a) {
   api('DELETE', `/accounts/${a.id}`).then(loadState).catch(e => message.error(e.message))
 }
 async function consumeReset(a) {
+  if (!canReset(a)) return false
+  const result = resets[a.id] = reactive({ loading: true, type: 'info', text: '正在消耗 1 张最早过期券并重置…' })
   try {
     const r = await api('POST', `/accounts/${a.id}/quota/consume`)
-    store.liveQuota[a.email] = r
-    delete store.quotaErr[a.email]
-    loadState()
-    message.success('已消耗最早过期的重置积分')
-  } catch (e) { message.error(e.message) }
+    if (r?.consumed !== true) throw new Error('未收到有效的重置结果')
+    result.type = 'success'
+    result.text = '重置成功：已消耗 1 张最早过期券。'
+  } catch (e) {
+    result.type = 'error'
+    result.text = `重置请求失败：${e.message}`
+  } finally {
+    result.loading = false
+  }
+  message[result.type](`${a.email}：${result.text}`, { duration: 8000, closable: true })
+  if (result.type === 'success') void fetchQuota(a.id, a.email, true)
+}
+function canReset(a) {
+  return !resets[a.id]?.loading && !store.quotaLoading[a.email] && !store.quotaErr[a.email] &&
+    (store.liveQuota[a.email]?.credits?.available ?? 0) > 0
 }
 async function toggleAll() {
   const anyClosed = accounts.value.some(a => !store.quotaOpen[a.id])
   for (const a of accounts.value) store.quotaOpen[a.id] = anyClosed
   if (anyClosed) {
-    for (const a of accounts.value) await fetchQuota(a.id, a.email, true)
+    for (const a of accounts.value) {
+      if (!resets[a.id]?.loading) await fetchQuota(a.id, a.email, true)
+    }
   }
 }
 
@@ -91,6 +106,7 @@ function renderQuota(row) {
   const error = store.quotaErr[row.email]
   const rows = quotaRows(row)
   const live = store.liveQuota[row.email]
+  const reset = resets[row.id]
   const stale = rows.length > 0 && (loading || error || !live)
   return h('div', { style: 'padding:8px 12px 4px' }, [
     loading && h('div', { role: 'status', class: 'muted' }, '查询中…'),
@@ -102,16 +118,28 @@ function renderQuota(row) {
     }),
     !loading && !error && rows.length === 0 && h('div', { class: 'muted' }, '尚无观测，查询额度不消耗模型配额。'),
     h(NButton, {
-      size: 'tiny', disabled: !!loading, style: 'margin-top:8px',
+      size: 'tiny', disabled: !!loading || !!reset?.loading, style: 'margin-top:8px',
       onClick: e => { e.stopPropagation(); fetchQuota(row.id, row.email, true) },
     }, { default: () => error ? '重试' : '刷新额度' }),
     live?.credits && h('div', { style: 'margin-top:8px;display:flex;gap:8px;align-items:center' }, [
-        `banked 重置积分：${live.credits.available}`,
-        h(NButton, {
-          size: 'tiny', disabled: live.credits.available < 1,
-          onClick: () => consumeReset(row),
-        }, { default: () => '消耗最早过期券并重置' }),
+        `banked 重置券：${live.credits.available}`,
+        h(NPopconfirm, {
+          positiveText: '确认消耗 1 张并重置', negativeText: '取消',
+          positiveButtonProps: { loading: !!reset?.loading, disabled: !canReset(row) },
+          negativeButtonProps: { disabled: !!reset?.loading },
+          onPositiveClick: () => consumeReset(row),
+        }, {
+          trigger: () => h(NButton, {
+            size: 'tiny', type: 'warning', loading: !!reset?.loading, disabled: !canReset(row),
+          }, { default: () => reset?.loading ? '正在重置…' : '消耗最早过期券并重置' }),
+          default: () => `确认消耗账号 ${row.email} 的 1 张最早过期可用券并重置额度？券消耗后不可撤销。`,
+        }),
     ]),
+    reset && h('div', {
+      role: reset.type === 'error' ? 'alert' : 'status',
+      class: reset.type === 'success' ? 'ok' : reset.type === 'error' ? 'err' : 'muted',
+      style: 'margin-top:8px;white-space:pre-wrap;overflow-wrap:anywhere',
+    }, reset.text),
   ])
 }
 
@@ -139,7 +167,7 @@ const rowProps = (r) => ({
   style: 'cursor:pointer',
   onClick: () => {
     store.quotaOpen[r.id] = !store.quotaOpen[r.id]
-    if (store.quotaOpen[r.id]) fetchQuota(r.id, r.email, true)
+    if (store.quotaOpen[r.id] && !resets[r.id]?.loading) fetchQuota(r.id, r.email, true)
   },
 })
 </script>
