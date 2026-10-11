@@ -214,14 +214,14 @@ impl App {
         Ok(report)
     }
 
-    /// Refreshes one account's model catalog from the upstream /models
-    /// endpoint into the pool's per-account model sets (persisted, so
-    /// restarts keep the discovery).
+    /// Refreshes one account's full model catalog from the upstream /models
+    /// endpoint into the pool's per-account metadata and entitlement sets
+    /// (persisted, so restarts keep native discovery).
     pub async fn refresh_models(&self, a: &Account) {
         let Some(version) = self.model_version() else {
             return;
         };
-        match crate::usage::fetch_model_slugs(
+        match crate::usage::fetch_model_catalog(
             &self.http,
             &self.cfg.upstream.base_url,
             &a.access_token,
@@ -231,9 +231,9 @@ impl App {
         )
         .await
         {
-            Ok(slugs) if !slugs.is_empty() => {
-                self.pool.set_account_models(&a.id, &slugs);
-                if let Err(e) = self.store.set_account_models(&a.id, &slugs) {
+            Ok(models) if !models.is_empty() => {
+                self.pool.set_account_catalog(&a.id, &models);
+                if let Err(e) = self.store.set_account_catalog(&a.id, &models) {
                     log::warn!("model catalog store {}: {e}", a.email);
                 }
             }
@@ -256,13 +256,28 @@ impl App {
         };
         let mut loaded = 0usize;
         for a in accounts {
-            match self.store.account_models(&a.id) {
-                Ok(slugs) if !slugs.is_empty() => {
-                    self.pool.set_account_models(&a.id, &slugs);
+            match self.store.account_model_catalog(&a.id) {
+                Ok(models) if !models.is_empty() => {
+                    self.pool.set_account_catalog(&a.id, &models);
                     loaded += 1;
                 }
-                Ok(_) => {}
-                Err(e) => log::warn!("cached catalog {}: {e}", a.email),
+                Ok(_) => match self.store.account_models(&a.id) {
+                    Ok(slugs) if !slugs.is_empty() => {
+                        self.pool.set_account_models(&a.id, &slugs);
+                        loaded += 1;
+                    }
+                    Ok(_) => {}
+                    Err(e) => log::warn!("cached model slugs {}: {e}", a.email),
+                },
+                Err(e) => {
+                    log::warn!("cached catalog {}: {e}", a.email);
+                    if let Ok(slugs) = self.store.account_models(&a.id) {
+                        if !slugs.is_empty() {
+                            self.pool.set_account_models(&a.id, &slugs);
+                            loaded += 1;
+                        }
+                    }
+                }
             }
         }
         if loaded > 0 {
@@ -333,9 +348,9 @@ impl App {
         }
     }
 
-    /// Consumes the earliest-expiring available banked reset credit, then
-    /// re-probes usage. Selection and consumption are one per-account flight.
-    pub async fn consume_reset(&self, acc: &Account) -> Result<usage::Report, String> {
+    /// Consumes the earliest-expiring available banked reset credit.
+    /// Selection and consumption are one per-account flight.
+    pub async fn consume_reset(&self, acc: &Account) -> Result<(), String> {
         let guard = {
             let mut guards = self.reset_guards.lock().await;
             guards
@@ -363,9 +378,7 @@ impl App {
             &credit.id,
             &redeem,
         )
-        .await?;
-        let report = self.fetch_usage(acc).await?;
-        Ok(report)
+        .await
     }
 
     pub fn state_json(&self) -> serde_json::Value {
@@ -546,8 +559,8 @@ pub fn spawn_refresh_loop(app: AppHandle) {
                     if let Err(e) = app.fetch_usage(a).await {
                         log::warn!("usage poll: {} {e}", a.email);
                     }
-                    // per-account model catalog: feeds the entitlement filter
-                    // and the /v1/models + /models union
+                    // per-account model catalog: feeds entitlement routing and
+                    // both the native /models and compact /v1/models views
                     app.refresh_models(a).await;
                 }
             }

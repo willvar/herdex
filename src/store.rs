@@ -210,6 +210,12 @@ CREATE TABLE IF NOT EXISTS account_models (
 	slug       TEXT NOT NULL,
 	PRIMARY KEY (account_id, slug)
 );
+CREATE TABLE IF NOT EXISTS account_model_catalog (
+	account_id TEXT NOT NULL,
+	slug       TEXT NOT NULL,
+	model_json TEXT NOT NULL,
+	PRIMARY KEY (account_id, slug)
+);
 CREATE TABLE IF NOT EXISTS usage_probes (
 	seq        INTEGER PRIMARY KEY AUTOINCREMENT,
 	account_id TEXT NOT NULL,
@@ -825,6 +831,53 @@ impl Store {
         tx.commit().map_err(|e| e.to_string())
     }
 
+    /// Replaces one account's full native Codex model catalog. The slug table
+    /// is kept alongside it for the fast entitlement check in the request
+    /// path. Empty input keeps the previous known-good catalog.
+    pub fn set_account_catalog(
+        &self,
+        account_id: &str,
+        models: &[serde_json::Value],
+    ) -> Result<(), String> {
+        let mut entries = BTreeMap::new();
+        for model in models {
+            let Some(slug) = model.get("slug").and_then(|value| value.as_str()) else {
+                continue;
+            };
+            let serialized = serde_json::to_string(model).map_err(|e| e.to_string())?;
+            entries.insert(slug.to_owned(), serialized);
+        }
+        if entries.is_empty() {
+            return Ok(());
+        }
+
+        let mut conn = self.conn.lock().unwrap_or_else(|e| e.into_inner());
+        let tx = conn.transaction().map_err(|e| e.to_string())?;
+        tx.execute(
+            "DELETE FROM account_model_catalog WHERE account_id=?1",
+            [account_id],
+        )
+        .map_err(|e| e.to_string())?;
+        tx.execute(
+            "DELETE FROM account_models WHERE account_id=?1",
+            [account_id],
+        )
+        .map_err(|e| e.to_string())?;
+        for (slug, model_json) in entries {
+            tx.execute(
+                "INSERT INTO account_model_catalog (account_id, slug, model_json) VALUES (?1, ?2, ?3)",
+                rusqlite::params![account_id, slug, model_json],
+            )
+            .map_err(|e| e.to_string())?;
+            tx.execute(
+                "INSERT INTO account_models (account_id, slug) VALUES (?1, ?2)",
+                rusqlite::params![account_id, slug],
+            )
+            .map_err(|e| e.to_string())?;
+        }
+        tx.commit().map_err(|e| e.to_string())
+    }
+
     /// Models discovered for one account; empty when nothing fetched yet.
     pub fn account_models(&self, account_id: &str) -> Result<Vec<String>, String> {
         let conn = self.conn.lock().unwrap_or_else(|e| e.into_inner());
@@ -836,6 +889,27 @@ impl Store {
             .map_err(|e| e.to_string())?;
         rows.collect::<Result<Vec<_>, _>>()
             .map_err(|e| e.to_string())
+    }
+
+    /// Full native Codex model objects discovered for one account.
+    pub fn account_model_catalog(
+        &self,
+        account_id: &str,
+    ) -> Result<Vec<serde_json::Value>, String> {
+        let conn = self.conn.lock().unwrap_or_else(|e| e.into_inner());
+        let mut stmt = conn
+            .prepare(
+                "SELECT model_json FROM account_model_catalog WHERE account_id=?1 ORDER BY slug",
+            )
+            .map_err(|e| e.to_string())?;
+        let rows = stmt
+            .query_map([account_id], |r| r.get::<_, String>(0))
+            .map_err(|e| e.to_string())?;
+        rows.map(|row| {
+            let raw = row.map_err(|e| e.to_string())?;
+            serde_json::from_str(&raw).map_err(|e| format!("decode model catalog: {e}"))
+        })
+        .collect()
     }
 
     /// Latest probe snapshot per account (for hydrating the pool's

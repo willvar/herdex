@@ -59,16 +59,54 @@ struct PoolShared {
     state: Mutex<PoolInner>,
 }
 
+/// An account reservation held for the lifetime of one upstream request.
+///
+/// The quota snapshot is too coarse to balance simultaneous requests: several
+/// callers can observe the same least-used account before any of them receives
+/// its first response bytes.  The lease closes that race without imposing a
+/// global semaphore.  Dropping it releases the account even when the client
+/// cancels or the upstream stream fails.
+pub struct PoolLease {
+    shared: Arc<PoolShared>,
+    account_id: String,
+    model: String,
+}
+
+impl PoolLease {
+    pub fn account_id(&self) -> &str {
+        &self.account_id
+    }
+}
+
+impl Drop for PoolLease {
+    fn drop(&mut self) {
+        let mut inner = self.shared.state.lock().unwrap_or_else(|e| e.into_inner());
+        let key = (self.account_id.clone(), self.model.clone());
+        let Some(count) = inner.in_flight.get_mut(&key) else {
+            return;
+        };
+        if *count <= 1 {
+            inner.in_flight.remove(&key);
+        } else {
+            *count -= 1;
+        }
+    }
+}
+
 #[derive(Default)]
 struct PoolInner {
     quota: HashMap<(String, String), Quota>,
     failures: HashMap<(String, String), Failure>,
     last_used: HashMap<String, i64>,
+    in_flight: HashMap<(String, String), usize>,
     affinity: HashMap<String, Pin>,
     /// Per-account model catalogs discovered from upstream /models. An
     /// account that provably lacks a model is skipped for it instead of
     /// wasting a request on a guaranteed upstream rejection.
     models: HashMap<String, std::collections::HashSet<String>>,
+    /// Full native Codex model objects, keyed by slug. The routing catalog
+    /// above intentionally remains a compact slug set for the hot path.
+    catalogs: HashMap<String, HashMap<String, serde_json::Value>>,
     /// Shadow ledger: tokens attributed locally since the account's last
     /// quota snapshot, bucketed per model. Upstream wham reports lag heavy
     /// sessions; without this the scheduler chases stale "least used"
@@ -122,9 +160,32 @@ impl Pool {
     /// Sets one account's discovered model slugs (empty = clear knowledge).
     pub fn set_account_models(&self, acc_id: &str, slugs: &[String]) {
         let mut inner = self.shared.state.lock().unwrap_or_else(|e| e.into_inner());
-        inner
-            .models
-            .insert(acc_id.to_string(), slugs.iter().cloned().collect());
+        let models: std::collections::HashSet<String> = slugs.iter().cloned().collect();
+        inner.models.insert(acc_id.to_string(), models.clone());
+        if models.is_empty() {
+            inner.catalogs.remove(acc_id);
+        } else if let Some(catalog) = inner.catalogs.get_mut(acc_id) {
+            catalog.retain(|slug, _| models.contains(slug));
+        }
+    }
+
+    /// Replaces one account's full native Codex catalog and its compact
+    /// entitlement set used by request routing.
+    pub fn set_account_catalog(&self, acc_id: &str, models: &[serde_json::Value]) {
+        let catalog: HashMap<String, serde_json::Value> = models
+            .iter()
+            .filter_map(|model| {
+                let slug = model.get("slug")?.as_str()?.to_owned();
+                Some((slug, model.clone()))
+            })
+            .collect();
+        if catalog.is_empty() {
+            return;
+        }
+        let slugs = catalog.keys().cloned().collect();
+        let mut inner = self.shared.state.lock().unwrap_or_else(|e| e.into_inner());
+        inner.models.insert(acc_id.to_string(), slugs);
+        inner.catalogs.insert(acc_id.to_string(), catalog);
     }
 
     /// Models servable by at least one existing, enabled account with a known
@@ -141,6 +202,28 @@ impl Pool {
             }
         }
         Ok(out.into_iter().collect())
+    }
+
+    /// Full native Codex model objects available from at least one enabled
+    /// account. Duplicate slugs are represented once, with stable ordering.
+    pub fn union_model_catalog(&self) -> Result<Vec<serde_json::Value>, String> {
+        let accounts = self.shared.st.list_accounts()?;
+        let inner = self.shared.state.lock().unwrap_or_else(|e| e.into_inner());
+        let mut out = BTreeMap::new();
+        for account in accounts.into_iter().filter(|account| !account.disabled) {
+            let Some(known) = inner.models.get(&account.id) else {
+                continue;
+            };
+            let Some(catalog) = inner.catalogs.get(&account.id) else {
+                continue;
+            };
+            for (slug, model) in catalog {
+                if known.contains(slug) {
+                    out.entry(slug.clone()).or_insert_with(|| model.clone());
+                }
+            }
+        }
+        Ok(out.into_values().collect())
     }
 
     /// Records tokens a completed request attributed to this account
@@ -245,24 +328,84 @@ impl Pool {
             .map(|s| s.pin_yield_gap_pp)
             .unwrap_or(20);
         let mut scored = self.scored_candidates(model)?;
-        if !session_key.is_empty() {
-            if let Some(pin) = self.pinned(session_key, model) {
-                if let Some(i) = scored.iter().position(|s| s.acc.id == pin) {
-                    // -1 = sticky-first (pin rides in front, migrate only on
-                    // failure); 0 = water-filling chase (always ride the
-                    // least-used account); >0 = hysteresis band
-                    let keep = if gap < 0 {
-                        true
-                    } else {
-                        scored[i].effective() <= scored[0].effective() + gap as f64
-                    };
-                    if keep && i != 0 {
-                        scored.swap(0, i);
-                    }
-                }
+        self.apply_affinity(&mut scored, session_key, model, gap);
+        Ok(scored.into_iter().map(|s| s.acc).collect())
+    }
+
+    /// Atomically chooses and reserves one account. `excluded` is used by a
+    /// caller's bounded failover loop so a retry does not immediately select
+    /// the same account again. Selection still honors session affinity, but
+    /// the in-flight count breaks ties between otherwise equivalent accounts.
+    pub fn lease(
+        &self,
+        model: &str,
+        session_key: &str,
+        excluded: &BTreeSet<String>,
+    ) -> Result<Option<(Account, PoolLease)>, String> {
+        let accounts = self.shared.st.list_accounts()?;
+        let gap = self
+            .shared
+            .st
+            .get_settings()
+            .map(|s| s.pin_yield_gap_pp)
+            .unwrap_or(20);
+        let now = (self.shared.now)();
+        let mut inner = self.shared.state.lock().unwrap_or_else(|e| e.into_inner());
+        let mut scored = self.scored_candidates_locked(model, now, &mut inner, accounts, excluded);
+        self.apply_affinity_locked(&mut scored, session_key, model, gap, now, &mut inner);
+        let Some(chosen) = scored.first() else {
+            return Ok(None);
+        };
+        let account = chosen.acc.clone();
+        let key = (account.id.clone(), model.to_owned());
+        *inner.in_flight.entry(key).or_default() += 1;
+        inner.last_used.insert(account.id.clone(), now);
+        Ok(Some((
+            account.clone(),
+            PoolLease {
+                shared: self.shared.clone(),
+                account_id: account.id,
+                model: model.to_owned(),
+            },
+        )))
+    }
+
+    /// Reserves a previously selected account for a bounded same-account
+    /// retry. The account is revalidated against the current enabled/catalog
+    /// state before the reservation is granted.
+    pub fn lease_account(
+        &self,
+        account_id: &str,
+        model: &str,
+    ) -> Result<Option<PoolLease>, String> {
+        let accounts = self.shared.st.list_accounts()?;
+        let Some(account) = accounts
+            .into_iter()
+            .find(|account| account.id == account_id)
+        else {
+            return Ok(None);
+        };
+        if account.disabled {
+            return Ok(None);
+        }
+        let mut inner = self.shared.state.lock().unwrap_or_else(|e| e.into_inner());
+        if let Some(models) = inner.models.get(account_id) {
+            if !models.is_empty() && !models.contains(model) {
+                return Ok(None);
             }
         }
-        Ok(scored.into_iter().map(|s| s.acc).collect())
+        *inner
+            .in_flight
+            .entry((account_id.to_owned(), model.to_owned()))
+            .or_default() += 1;
+        inner
+            .last_used
+            .insert(account_id.to_owned(), (self.shared.now)());
+        Ok(Some(PoolLease {
+            shared: self.shared.clone(),
+            account_id: account_id.to_owned(),
+            model: model.to_owned(),
+        }))
     }
 
     fn scored_candidates(&self, model: &str) -> Result<Vec<Scored>, String> {
@@ -270,10 +413,21 @@ impl Pool {
         let now = (self.shared.now)();
         let mut inner = self.shared.state.lock().unwrap_or_else(|e| e.into_inner());
 
+        Ok(self.scored_candidates_locked(model, now, &mut inner, accounts, &BTreeSet::new()))
+    }
+
+    fn scored_candidates_locked(
+        &self,
+        model: &str,
+        now: i64,
+        inner: &mut PoolInner,
+        accounts: Vec<Account>,
+        excluded: &BTreeSet<String>,
+    ) -> Vec<Scored> {
         let mut active: Vec<Scored> = Vec::new();
         let mut cooled: Vec<Scored> = Vec::new();
         for a in accounts {
-            if a.disabled {
+            if a.disabled || excluded.contains(&a.id) {
                 continue;
             }
             let key = (a.id.clone(), model.to_string());
@@ -310,13 +464,18 @@ impl Pool {
             // so "least used" reflects reality, then never lower what the
             // snapshot says (only upward correction, per the reconciliation
             // contract with observe())
-            let burn = Pool::pending_pp(&self.shared.st, &mut inner, &a.id, now);
+            let burn = Pool::pending_pp(&self.shared.st, inner, &a.id, now);
             let s = Scored {
                 acc: a.clone(),
                 primary: primary + burn,
                 secondary,
                 last_used: inner.last_used.get(&a.id).copied().unwrap_or(0),
                 last_failed: f.last_fail,
+                in_flight: inner
+                    .in_flight
+                    .get(&(a.id.clone(), model.to_owned()))
+                    .copied()
+                    .unwrap_or(0),
             };
             if f.until > now {
                 cooled.push(s);
@@ -328,7 +487,65 @@ impl Pool {
             active = cooled; // never blackout: fall back to all
         }
         active.sort_by(|a, b| a.score(b));
-        Ok(active)
+        active
+    }
+
+    fn apply_affinity(&self, scored: &mut [Scored], session_key: &str, model: &str, gap: i64) {
+        if session_key.is_empty() || scored.is_empty() {
+            return;
+        }
+        let mut inner = self.shared.state.lock().unwrap_or_else(|e| e.into_inner());
+        self.apply_affinity_locked(
+            scored,
+            session_key,
+            model,
+            gap,
+            (self.shared.now)(),
+            &mut inner,
+        );
+    }
+
+    fn apply_affinity_locked(
+        &self,
+        scored: &mut [Scored],
+        session_key: &str,
+        model: &str,
+        gap: i64,
+        now: i64,
+        inner: &mut PoolInner,
+    ) {
+        if session_key.is_empty() || scored.is_empty() {
+            return;
+        }
+        let Some(pin) = inner.affinity.get(session_key).cloned() else {
+            return;
+        };
+        if pin.until <= now || pin.model != model {
+            inner.affinity.remove(session_key);
+            return;
+        }
+        let Some(index) = scored.iter().position(|s| s.acc.id == pin.acc_id) else {
+            return;
+        };
+        // Refresh the sliding TTL whenever a valid pin participates in
+        // selection, matching pinned()'s existing behavior.
+        inner.affinity.insert(
+            session_key.to_owned(),
+            Pin {
+                until: now + AFFINITY_TTL,
+                ..pin
+            },
+        );
+        // -1 = sticky-first (pin rides in front, migrate only on
+        // failure); 0 = water-filling; >0 = hysteresis band.
+        let keep = if gap < 0 {
+            true
+        } else {
+            scored[index].effective() <= scored[0].effective() + gap as f64
+        };
+        if keep && index != 0 {
+            scored.swap(0, index);
+        }
     }
 
     /// Hydrates the in-memory quota map from the latest persisted probes —
@@ -425,6 +642,7 @@ struct Scored {
     secondary: f64,
     last_used: i64,
     last_failed: i64,
+    in_flight: usize,
 }
 
 impl Scored {
@@ -439,6 +657,7 @@ impl Scored {
         self.effective()
             .partial_cmp(&other.effective())
             .unwrap_or(Ordering::Equal)
+            .then(self.in_flight.cmp(&other.in_flight))
             .then(self.last_used.cmp(&other.last_used))
             .then(self.last_failed.cmp(&other.last_failed))
     }
@@ -506,6 +725,39 @@ mod tests {
         let got = p.candidates("gpt-5.5").unwrap();
         let ids: Vec<&str> = got.iter().map(|a| a.id.as_str()).collect();
         assert_eq!(ids, vec!["a3", "a2", "a1"]);
+    }
+
+    #[test]
+    fn leases_balance_simultaneous_requests_and_release() {
+        let p = test_pool();
+        seed(&p, &["a1", "a2"]);
+        let excluded = BTreeSet::new();
+
+        let (first, first_lease) = p
+            .lease("gpt-5.5", "", &excluded)
+            .unwrap()
+            .expect("first account");
+        let (second, second_lease) = p
+            .lease("gpt-5.5", "", &excluded)
+            .unwrap()
+            .expect("second account");
+        assert_ne!(first.id, second.id, "in-flight load must break the tie");
+
+        drop(first_lease);
+        let (third, third_lease) = p
+            .lease("gpt-5.5", "", &excluded)
+            .unwrap()
+            .expect("third account");
+        assert_eq!(third.id, first.id, "released account should become idle");
+
+        drop(second_lease);
+        drop(third_lease);
+        let (again, lease) = p
+            .lease("gpt-5.5", "", &excluded)
+            .unwrap()
+            .expect("account after release");
+        assert_eq!(again.id, first.id);
+        drop(lease);
     }
 
     #[test]

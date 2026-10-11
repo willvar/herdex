@@ -407,14 +407,14 @@ pub async fn fetch_latest_codex_version(hc: &reqwest::Client, url: &str) -> Resu
     release_version(&metadata.tag_name)
 }
 
-pub async fn fetch_model_slugs(
+pub async fn fetch_model_catalog(
     hc: &reqwest::Client,
     root: &str,
     token: &str,
     account_id: &str,
     defaults: &std::collections::HashMap<String, String>,
     client_version: &str,
-) -> Result<Vec<String>, String> {
+) -> Result<Vec<serde_json::Value>, String> {
     // Upstream tailors this catalog by client_version: older versions can
     // silently omit newly released models.
     let url = format!(
@@ -455,14 +455,33 @@ pub async fn fetch_model_slugs(
         .and_then(|m| m.as_array())
         .map(|arr| {
             arr.iter()
-                .filter_map(|m| {
-                    m.get("slug")
-                        .and_then(|s| s.as_str())
-                        .map(|s| s.to_string())
-                })
+                .filter(|m| m.get("slug").and_then(|s| s.as_str()).is_some())
+                .cloned()
                 .collect()
         })
         .unwrap_or_default())
+}
+
+pub async fn fetch_model_slugs(
+    hc: &reqwest::Client,
+    root: &str,
+    token: &str,
+    account_id: &str,
+    defaults: &std::collections::HashMap<String, String>,
+    client_version: &str,
+) -> Result<Vec<String>, String> {
+    Ok(
+        fetch_model_catalog(hc, root, token, account_id, defaults, client_version)
+            .await?
+            .into_iter()
+            .filter_map(|model| {
+                model
+                    .get("slug")
+                    .and_then(|slug| slug.as_str())
+                    .map(ToOwned::to_owned)
+            })
+            .collect(),
+    )
 }
 
 #[cfg(test)]
