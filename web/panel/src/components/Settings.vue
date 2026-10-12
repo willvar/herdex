@@ -1,12 +1,13 @@
 <script setup>
 import { ref, watchEffect } from 'vue'
-import { NCard, NButton, NInputNumber, NSelect, useMessage } from 'naive-ui'
+import { NCard, NButton, NInputNumber, NSelect, NSwitch, useMessage } from 'naive-ui'
 import { api } from '../api.js'
 import { store, commitSettings } from '../store.js'
 
 const message = useMessage()
 const cooldown = ref(300)
 const yieldGap = ref(20)
+const autoReset = ref(false)
 
 // only sync server values into the form while the user hasn't typed —
 // the 30s state poll must not clobber an unsaved draft
@@ -17,6 +18,7 @@ watchEffect(() => {
   if (s && !dirty.value) {
     cooldown.value = s.cooldown_seconds ?? 300
     yieldGap.value = s.pin_yield_gap_pp ?? 20
+    autoReset.value = s.auto_reset_enabled ?? false
   }
 })
 function touch() { dirty.value = true }
@@ -44,12 +46,14 @@ async function save() {
     const payload = {
       cooldown_seconds: cooldown.value ?? 0,
       pin_yield_gap_pp: yieldGap.value,
+      auto_reset_enabled: autoReset.value,
     }
     await api('PUT', '/settings', payload)
     commitSettings(payload)
     // Preserve edits made while this particular payload was being saved.
     dirty.value = (cooldown.value ?? 0) !== payload.cooldown_seconds ||
-      yieldGap.value !== payload.pin_yield_gap_pp
+      yieldGap.value !== payload.pin_yield_gap_pp ||
+      autoReset.value !== payload.auto_reset_enabled
     message.success('已保存')
   } catch (e) { message.error(e.message) }
   finally { saving.value = false }
@@ -70,6 +74,13 @@ async function save() {
         v-model:value="cooldown"
         :min="0"
         style="width:120px"
+        size="small"
+        @update:value="touch"
+      />
+      <span style="width:24px" />
+      <span class="muted">额度耗尽自动重置</span>
+      <n-switch
+        v-model:value="autoReset"
         size="small"
         @update:value="touch"
       />
@@ -100,6 +111,12 @@ async function save() {
       <b>0 水填均衡</b>：永远粘在当前已用百分比最低的号上，各号已用%完全对齐、同步逼近 100%——平均分配的极限，首次触顶最晚；多会话分摊/追求均衡时推荐；<br>
       <b>&gt;0 滞后带</b>：介于两者之间——各号已用%保持在一条最厚 N 个百分点的带子里滚动（有界的相对均衡）。例：20 = 粘住的号可以领先别家 20 个百分点，烧满 20 个百分点才搬家。
       迁移次数 ≈ 总消耗 ÷ 该值：值越大迁移越少、越接近黏性优先，越小越接近水填。
+    </div>
+    <div
+      class="muted"
+      style="margin-top:6px;line-height:1.6;font-size:12px"
+    >
+      开启后，仅在实际请求确认额度耗尽、且普通账号切换均未成功时，自动消耗当前账号最早到期的 banked 重置券并重试一次；同一额度耗尽事件不会重复扣卡。
     </div>
     <div
       class="muted"

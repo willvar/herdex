@@ -111,7 +111,11 @@ async fn history_requires_auth_and_returns_retained_anchors_in_api_shape() {
 async fn zero_cooldown_survives_save_and_next_state_poll() {
     let server = Server::new().await;
     let client = reqwest::Client::new();
-    let settings = json!({"cooldown_seconds": 0, "pin_yield_gap_pp": -1});
+    let settings = json!({
+        "cooldown_seconds": 0,
+        "pin_yield_gap_pp": -1,
+        "auto_reset_enabled": false
+    });
     let response = client
         .put(format!("{}/settings", server.url))
         .bearer_auth("test-manage-key")

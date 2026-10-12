@@ -24,14 +24,61 @@ pub struct App {
     /// the same refresh token — OpenAI's replay detection then kills the
     /// whole token family ("already been used" 401s, unrecoverable)
     pub refresh_guards: tokio::sync::Mutex<HashMap<String, Arc<tokio::sync::Mutex<()>>>>,
-    /// Serialize reset-credit selection and consumption per account so two
-    /// panel clicks cannot select the same expiring credit concurrently.
-    pub reset_guards: tokio::sync::Mutex<HashMap<String, Arc<tokio::sync::Mutex<()>>>>,
+    /// Serialize reset-credit selection and consumption per account so panel
+    /// clicks and automatic request recovery cannot select the same credit
+    /// concurrently.
+    pub reset_guards: Mutex<HashMap<String, Arc<ResetCoordinator>>>,
     /// unix day of the last request_log prune (0 = never)
     pub last_prune_day: std::sync::atomic::AtomicI64,
     /// upstream-rejected body params learned from 400s (non-codex clients
     /// get these pre-stripped so steady state costs no extra upstream request)
     pub learned_strips: Mutex<std::collections::HashSet<String>>,
+}
+
+/// Per-account single-flight coordinator for reset-credit operations. The
+/// async gate covers the network operation; the synchronous state is also
+/// readable from usage observation paths without awaiting an async mutex.
+pub struct ResetCoordinator {
+    gate: tokio::sync::Mutex<()>,
+    state: Mutex<ResetState>,
+}
+
+impl Default for ResetCoordinator {
+    fn default() -> Self {
+        Self {
+            gate: tokio::sync::Mutex::new(()),
+            state: Mutex::new(ResetState::default()),
+        }
+    }
+}
+
+#[derive(Default)]
+struct ResetState {
+    generation: u64,
+    last_attempt: Option<ResetAttempt>,
+}
+
+#[derive(Clone)]
+struct ResetAttempt {
+    episode: usage::ExhaustedWindow,
+    succeeded: bool,
+    in_flight: bool,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum AutoResetResult {
+    /// This call consumed one card and may retry the request.
+    Consumed,
+    /// Another request or the panel already restored the account, so retry is
+    /// safe without spending another card.
+    AlreadyReset,
+    /// The account has no currently selectable card.
+    NoCard,
+    /// Automatic reset is disabled or no longer needed.
+    NotNeeded,
+    /// A reset attempt for this exhaustion episode already failed. Do not
+    /// spend another card in the same request/episode.
+    Blocked,
 }
 
 impl App {
@@ -214,6 +261,50 @@ impl App {
         Ok(report)
     }
 
+    fn reset_coordinator(&self, acc_id: &str) -> Arc<ResetCoordinator> {
+        let mut guards = self.reset_guards.lock().unwrap_or_else(|e| e.into_inner());
+        guards
+            .entry(acc_id.to_owned())
+            .or_insert_with(|| Arc::new(ResetCoordinator::default()))
+            .clone()
+    }
+
+    pub fn auto_reset_enabled(&self) -> bool {
+        self.store
+            .get_settings()
+            .map(|settings| settings.auto_reset_enabled)
+            .unwrap_or(false)
+    }
+
+    /// Snapshot the reset generation immediately before an upstream attempt.
+    /// A later generation means another request or the panel completed a
+    /// reset while this request was in flight.
+    pub fn reset_generation(&self, acc_id: &str) -> u64 {
+        self.reset_coordinator(acc_id)
+            .state
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .generation
+    }
+
+    fn note_reset_observation(&self, acc_id: &str, report: &usage::Report) {
+        let coordinator = self.reset_coordinator(acc_id);
+        let mut state = coordinator.state.lock().unwrap_or_else(|e| e.into_inner());
+        let Some(attempt) = state.last_attempt.as_ref() else {
+            return;
+        };
+        if attempt.in_flight {
+            // Do not clear an episode while its consume request is still
+            // unresolved. A concurrent usage probe may already see the
+            // upstream side effect, but the caller still needs the consume
+            // result to advance the generation exactly once.
+            return;
+        }
+        if usage::window_recovered(report, &attempt.episode) {
+            state.last_attempt = None;
+        }
+    }
+
     /// Refreshes one account's full model catalog from the upstream /models
     /// endpoint into the pool's per-account metadata and entitlement sets
     /// (persisted, so restarts keep native discovery).
@@ -295,6 +386,7 @@ impl App {
     /// land here. add_probe dedupes only when the observed quota, metadata
     /// and completed-request watermark are all unchanged.
     pub fn observe_usage(&self, acc_id: &str, report: &usage::Report) {
+        self.note_reset_observation(acc_id, report);
         let now = crate::store::now_secs();
         if report.main.primary.used_pct.is_some()
             || report.main.primary.reset_at.is_some()
@@ -349,20 +441,105 @@ impl App {
     }
 
     /// Consumes the earliest-expiring available banked reset credit.
-    /// Selection and consumption are one per-account flight.
+    /// Selection and consumption are one per-account flight shared with
+    /// automatic request recovery.
     pub async fn consume_reset(&self, acc: &Account) -> Result<(), String> {
-        let guard = {
-            let mut guards = self.reset_guards.lock().await;
-            guards
-                .entry(acc.id.clone())
-                .or_insert_with(|| Arc::new(tokio::sync::Mutex::new(())))
-                .clone()
-        };
-        let _guard = guard.lock().await;
+        let coordinator = self.reset_coordinator(&acc.id);
+        let _guard = coordinator.gate.lock().await;
         let credits = self.fetch_reset_credits(acc).await?;
         let credit = usage::earliest_available_reset_credit(&credits)?;
         let redeem = format!("{}-{}", crate::store::now_secs(), uuid::Uuid::new_v4());
-        usage::consume_reset_credit(
+        let result = usage::consume_reset_credit(
+            &self.http,
+            &self.usage_root,
+            &acc.access_token,
+            &acc.account_id,
+            &self.cfg.header_defaults,
+            &credit.id,
+            &redeem,
+        )
+        .await;
+        if result.is_ok() {
+            let mut state = coordinator.state.lock().unwrap_or_else(|e| e.into_inner());
+            state.generation = state.generation.wrapping_add(1);
+            state.last_attempt = None;
+        }
+        result
+    }
+
+    /// Revalidates an upstream quota exhaustion under the account reset gate,
+    /// consumes at most one card for that exhaustion episode, and lets the
+    /// caller retry the original request once. `seen_generation` is captured
+    /// before the request attempt, so queued requests reuse a completed reset
+    /// instead of selecting another card.
+    pub async fn auto_reset(
+        &self,
+        acc: &Account,
+        model: &str,
+        seen_generation: u64,
+    ) -> Result<AutoResetResult, String> {
+        if !self.auto_reset_enabled() {
+            return Ok(AutoResetResult::NotNeeded);
+        }
+        let coordinator = self.reset_coordinator(&acc.id);
+        let _guard = coordinator.gate.lock().await;
+
+        {
+            let state = coordinator.state.lock().unwrap_or_else(|e| e.into_inner());
+            if state.generation != seen_generation {
+                return Ok(AutoResetResult::AlreadyReset);
+            }
+        }
+
+        // The request's headers may be stale or incomplete. A fresh zero-cost
+        // report inside the gate is the authority before spending an
+        // irreversible card.
+        let report = self.fetch_usage(acc).await?;
+        if !usage::quota_windows_known_for_model(&report, model) {
+            return Ok(AutoResetResult::NotNeeded);
+        }
+        let Some(episode) = usage::exhausted_window_for_model(&report, model) else {
+            // A complete, non-exhausted report means the request's error was
+            // stale or the window recovered naturally. Replay is safe because
+            // this request has not sent any content to the client; an
+            // incomplete report is handled above without replaying.
+            return Ok(AutoResetResult::AlreadyReset);
+        };
+
+        {
+            let state = coordinator.state.lock().unwrap_or_else(|e| e.into_inner());
+            if state.generation != seen_generation {
+                return Ok(AutoResetResult::AlreadyReset);
+            }
+            if let Some(last) = &state.last_attempt {
+                if last.episode.same_episode(&episode) {
+                    return Ok(if last.succeeded {
+                        AutoResetResult::AlreadyReset
+                    } else {
+                        AutoResetResult::Blocked
+                    });
+                }
+            }
+        }
+
+        let credits = self.fetch_reset_credits(acc).await?;
+        let credit = match usage::earliest_available_reset_credit(&credits) {
+            Ok(credit) => credit,
+            Err(error) if error == "no available reset credit" => {
+                return Ok(AutoResetResult::NoCard)
+            }
+            Err(error) => return Err(error),
+        };
+        let redeem = format!("{}-{}", crate::store::now_secs(), uuid::Uuid::new_v4());
+        {
+            let mut state = coordinator.state.lock().unwrap_or_else(|e| e.into_inner());
+            state.last_attempt = Some(ResetAttempt {
+                episode: episode.clone(),
+                succeeded: false,
+                in_flight: true,
+            });
+        }
+        match usage::consume_reset_credit(
             &self.http,
             &self.usage_root,
             &acc.access_token,
@@ -372,6 +549,34 @@ impl App {
             &redeem,
         )
         .await
+        {
+            Ok(()) => {
+                let mut state = coordinator.state.lock().unwrap_or_else(|e| e.into_inner());
+                state.generation = state.generation.wrapping_add(1);
+                if let Some(last) = state.last_attempt.as_mut() {
+                    last.succeeded = true;
+                    last.in_flight = false;
+                }
+                log::info!(
+                    "automatic reset credit consumed for {} ({})",
+                    acc.email,
+                    episode.key()
+                );
+                Ok(AutoResetResult::Consumed)
+            }
+            Err(error) => {
+                let mut state = coordinator.state.lock().unwrap_or_else(|e| e.into_inner());
+                if let Some(last) = state.last_attempt.as_mut() {
+                    last.in_flight = false;
+                }
+                log::warn!(
+                    "automatic reset credit failed for {} ({}): {error}",
+                    acc.email,
+                    episode.key()
+                );
+                Ok(AutoResetResult::Blocked)
+            }
+        }
     }
 
     pub async fn fetch_reset_credits(&self, acc: &Account) -> Result<usage::ResetCredits, String> {

@@ -17,6 +17,11 @@ pub struct Window {
     pub reset_at: Option<i64>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub window_seconds: Option<i64>,
+    /// Internal marker for reports whose upstream payload only supplied a
+    /// relative reset countdown. It must not be serialized as public usage
+    /// data because the absolute `reset_at` above remains the API contract.
+    #[serde(skip)]
+    pub reset_after_seconds: Option<i64>,
 }
 
 #[derive(Serialize, Deserialize, Clone, Default)]
@@ -88,6 +93,26 @@ pub struct Report {
     /// empty so they do not add another upstream request.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub reset_credits: Option<ResetCredits>,
+}
+
+/// A complete quota window that is currently exhausted.  The scope is either
+/// `main` or the normalized name of an additional model-specific limit.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct ExhaustedWindow {
+    pub scope: String,
+    pub slot: String,
+    pub reset_at: i64,
+    pub window_seconds: i64,
+    pub reset_after_seconds: i64,
+}
+
+impl ExhaustedWindow {
+    pub fn key(&self) -> String {
+        format!(
+            "{}:{}:{}:{}",
+            self.scope, self.slot, self.reset_at, self.window_seconds
+        )
+    }
 }
 
 #[derive(Deserialize)]
@@ -162,6 +187,7 @@ fn parse_window(w: &Option<WindowJson>) -> Window {
             (None, Some(after)) if after > 0 => Some(now_secs() + after),
             _ => None,
         },
+        reset_after_seconds: w.reset_after_seconds.filter(|after| *after > 0),
     }
 }
 
@@ -205,6 +231,159 @@ pub fn parse(body: &[u8]) -> Result<Report, String> {
         });
     }
     Ok(report)
+}
+
+fn exhausted_window(scope: &str, slot: &str, window: &Window) -> Option<ExhaustedWindow> {
+    let used_pct = window.used_pct?;
+    if !used_pct.is_finite() || used_pct < 100.0 {
+        return None;
+    }
+    let reset_at = window.reset_at.unwrap_or(0);
+    let window_seconds = window.window_seconds.unwrap_or(0);
+    // A percentage without a usable window identity can be a partial or
+    // stale upstream payload; it is not safe to spend an irreversible card.
+    if reset_at <= 0 && window_seconds <= 0 {
+        return None;
+    }
+    Some(ExhaustedWindow {
+        scope: scope.to_owned(),
+        slot: slot.to_owned(),
+        reset_at,
+        window_seconds,
+        reset_after_seconds: window.reset_after_seconds.unwrap_or(0),
+    })
+}
+
+impl ExhaustedWindow {
+    /// Relative reset countdowns are recalculated on every usage fetch, so
+    /// their derived absolute timestamps are not stable episode identities.
+    pub fn same_episode(&self, other: &Self) -> bool {
+        if self.scope != other.scope || self.slot != other.slot {
+            return false;
+        }
+        if self.window_seconds > 0
+            && other.window_seconds > 0
+            && self.window_seconds != other.window_seconds
+        {
+            return false;
+        }
+        if self.reset_after_seconds > 0 || other.reset_after_seconds > 0 {
+            true
+        } else {
+            self.reset_at == other.reset_at
+        }
+    }
+}
+
+fn scoped_window<'a>(report: &'a Report, scope: &str, slot: &str) -> Option<&'a Window> {
+    let limit = if scope == "main" {
+        Some(&report.main)
+    } else {
+        report
+            .additional
+            .iter()
+            .find(|a| model_key(&a.name) == scope)
+            .map(|a| &a.limit)
+    }?;
+    match slot {
+        "primary" => Some(&limit.primary),
+        "secondary" => Some(&limit.secondary),
+        _ => None,
+    }
+}
+
+fn window_is_known(window: &Window) -> bool {
+    window.used_pct.filter(|pct| pct.is_finite()).is_some()
+        && (window.reset_at.unwrap_or(0) > 0 || window.window_seconds.unwrap_or(0) > 0)
+}
+
+fn window_is_present(window: &Window) -> bool {
+    window.used_pct.is_some() || window.reset_at.is_some() || window.window_seconds.is_some()
+}
+
+/// Whether the usage report contains enough complete window metadata to make
+/// an automatic reset decision for this model. Partial upstream payloads are
+/// deliberately treated as unknown so they cannot cause a card spend or a
+/// same-account replay.
+pub fn quota_windows_known_for_model(report: &Report, model: &str) -> bool {
+    let mut limits = vec![&report.main];
+    let model = model_key(model);
+    limits.extend(
+        report
+            .additional
+            .iter()
+            .filter(|a| model_key(&a.name) == model)
+            .map(|a| &a.limit),
+    );
+    limits.iter().all(|limit| {
+        let windows = [&limit.primary, &limit.secondary];
+        windows.iter().any(|window| window_is_present(window))
+            && windows
+                .iter()
+                .filter(|window| window_is_present(window))
+                .all(|window| window_is_known(window))
+    })
+}
+
+/// Returns the first complete exhausted window relevant to one requested
+/// model. The main account limit is always relevant; model-specific limits are
+/// considered when the upstream names one for this model.
+pub fn exhausted_window_for_model(report: &Report, model: &str) -> Option<ExhaustedWindow> {
+    let mut candidates = Vec::new();
+    for (slot, window) in [
+        ("primary", &report.main.primary),
+        ("secondary", &report.main.secondary),
+    ] {
+        if let Some(exhausted) = exhausted_window("main", slot, window) {
+            candidates.push(exhausted);
+        }
+    }
+    let model = model_key(model);
+    for additional in report
+        .additional
+        .iter()
+        .filter(|a| model_key(&a.name) == model)
+    {
+        for (slot, window) in [
+            ("primary", &additional.limit.primary),
+            ("secondary", &additional.limit.secondary),
+        ] {
+            if let Some(exhausted) = exhausted_window(&model, slot, window) {
+                candidates.push(exhausted);
+            }
+        }
+    }
+    candidates.into_iter().next()
+}
+
+/// Tells the reset coordinator that a previously exhausted window has either
+/// recovered or rolled into a different upstream window.
+pub fn window_recovered(report: &Report, episode: &ExhaustedWindow) -> bool {
+    let Some(window) = scoped_window(report, &episode.scope, &episode.slot) else {
+        return false;
+    };
+    if window
+        .window_seconds
+        .zip((episode.window_seconds > 0).then_some(episode.window_seconds))
+        .is_some_and(|(current, previous)| current > 0 && current != previous)
+    {
+        return true;
+    }
+    // A reset_at derived from reset_after_seconds moves on every fetch and
+    // cannot identify a new window. Only compare absolute timestamps when
+    // both observations came from an explicit upstream reset_at.
+    if window.reset_after_seconds.is_none()
+        && episode.reset_after_seconds <= 0
+        && window
+            .reset_at
+            .is_some_and(|reset_at| reset_at > 0 && reset_at != episode.reset_at)
+    {
+        return true;
+    }
+    window
+        .used_pct
+        .filter(|pct| pct.is_finite())
+        .is_some_and(|pct| pct < 100.0)
 }
 
 fn headers(
@@ -543,6 +722,82 @@ mod tests {
     #[test]
     fn model_key_normalizes_limit_name() {
         assert_eq!(model_key("GPT-5.3-Codex-Spark"), "gpt-5.3-codex-spark");
+    }
+
+    #[test]
+    fn finds_only_complete_exhausted_windows_for_a_model() {
+        let report = parse(
+            br#"{
+                "rate_limit": {
+                    "primary_window": {
+                        "used_percent": 42,
+                        "limit_window_seconds": 604800,
+                        "reset_at": 1893456000
+                    }
+                },
+                "additional_rate_limits": [{
+                    "limit_name": "GPT-5.3-Codex-Spark",
+                    "rate_limit": {
+                        "primary_window": {
+                            "used_percent": 100,
+                            "limit_window_seconds": 18000,
+                            "reset_at": 1893456000
+                        }
+                    }
+                }]
+            }"#,
+        )
+        .unwrap();
+        assert!(exhausted_window_for_model(&report, "gpt-5.5").is_none());
+        let exhausted = exhausted_window_for_model(&report, "gpt-5.3-codex-spark").unwrap();
+        assert_eq!(exhausted.scope, "gpt-5.3-codex-spark");
+        assert_eq!(exhausted.slot, "primary");
+    }
+
+    #[test]
+    fn recovery_requires_the_same_window_to_have_capacity_again() {
+        let report = parse(
+            br#"{
+                "rate_limit": {
+                    "primary_window": {
+                        "used_percent": 42,
+                        "limit_window_seconds": 604800,
+                        "reset_at": 1893456000
+                    }
+                }
+            }"#,
+        )
+        .unwrap();
+        let episode = ExhaustedWindow {
+            scope: "main".into(),
+            slot: "primary".into(),
+            reset_at: 1893456000,
+            window_seconds: 604800,
+            reset_after_seconds: 0,
+        };
+        assert!(window_recovered(&report, &episode));
+    }
+
+    #[test]
+    fn relative_reset_countdowns_do_not_create_new_episodes_on_each_fetch() {
+        let mut first = parse(
+            br#"{
+                "rate_limit": {
+                    "primary_window": {
+                        "used_percent": 100,
+                        "limit_window_seconds": 604800,
+                        "reset_after_seconds": 3600
+                    }
+                }
+            }"#,
+        )
+        .unwrap();
+        let episode = exhausted_window_for_model(&first, "gpt-5.5").unwrap();
+        first.main.primary.reset_at = episode.reset_at.checked_add(10);
+        first.main.primary.reset_after_seconds = Some(3590);
+        let current = exhausted_window_for_model(&first, "gpt-5.5").unwrap();
+        assert!(episode.same_episode(&current));
+        assert!(!window_recovered(&first, &episode));
     }
 
     #[test]

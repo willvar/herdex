@@ -633,7 +633,34 @@ async fn responses(State(app): State<AppHandle>, headers: HeaderMap, body: Bytes
     let mut attempted_accounts = BTreeSet::new();
     let mut retry_account: Option<Account> = None;
     let mut retried_pre_content = false;
-    while attempted_accounts.len() < attempts || retry_account.is_some() {
+    let auto_reset_enabled = app.auto_reset_enabled();
+    let mut reset_candidate: Option<(Account, u64)> = None;
+    let mut auto_reset_attempted = false;
+    while attempted_accounts.len() < attempts
+        || retry_account.is_some()
+        || (!auto_reset_attempted && reset_candidate.is_some())
+    {
+        // Exhaust the ordinary pool first. A reset card is a scarce resource;
+        // only use it when no normal candidate produced a response.
+        if retry_account.is_none() && attempted_accounts.len() >= attempts && !auto_reset_attempted
+        {
+            auto_reset_attempted = true;
+            if let Some((acc, seen_generation)) = reset_candidate.take() {
+                match app.auto_reset(&acc, &model, seen_generation).await {
+                    Ok(crate::app::AutoResetResult::Consumed)
+                    | Ok(crate::app::AutoResetResult::AlreadyReset) => {
+                        retry_account = Some(acc);
+                        continue;
+                    }
+                    Ok(result) => {
+                        log::info!("automatic reset skipped for {}: {:?}", acc.email, result);
+                    }
+                    Err(error) => {
+                        log::warn!("automatic reset check failed for {}: {error}", acc.email);
+                    }
+                }
+            }
+        }
         let selected = if let Some(acc) = retry_account.take() {
             match app.pool.lease_account(&acc.id, &model) {
                 Ok(Some(lease)) => Some((acc, lease)),
@@ -658,6 +685,7 @@ async fn responses(State(app): State<AppHandle>, headers: HeaderMap, body: Bytes
             break;
         };
         attempted_accounts.insert(acc.id.clone());
+        let seen_generation = auto_reset_enabled.then(|| app.reset_generation(&acc.id));
         let mut observed = request_log.begin(&app, &acc, lease);
         if (acc.expires_at - crate::store::now_secs()) < 300 {
             observed.diagnostics().stage = "refresh".into();
@@ -688,10 +716,16 @@ async fn responses(State(app): State<AppHandle>, headers: HeaderMap, body: Bytes
                 status,
                 message,
                 pre_content,
+                quota_exhausted,
             }) => {
                 last_status = status;
                 last_err = message;
-                if !failoverable(last_status, &last_err) {
+                if quota_exhausted {
+                    if let Some(generation) = seen_generation {
+                        reset_candidate.get_or_insert((acc.clone(), generation));
+                    }
+                }
+                if !failoverable(last_status, &last_err) && !quota_exhausted {
                     break;
                 }
                 // A pre-content error sent nothing user-visible, and this
@@ -699,7 +733,11 @@ async fn responses(State(app): State<AppHandle>, headers: HeaderMap, body: Bytes
                 // arrives inside a 200 stream): after the candidate list is
                 // exhausted, retry the same account exactly once. The flag
                 // bounds it — never a second retry.
-                if pre_content && attempted_accounts.len() >= attempts && !retried_pre_content {
+                if pre_content
+                    && !quota_exhausted
+                    && attempted_accounts.len() >= attempts
+                    && !retried_pre_content
+                {
                     retried_pre_content = true;
                     retry_account = Some(acc);
                     continue;
@@ -1036,6 +1074,7 @@ struct AttemptFailure {
     status: u16,
     message: String,
     pre_content: bool,
+    quota_exhausted: bool,
 }
 
 impl AttemptFailure {
@@ -1044,14 +1083,25 @@ impl AttemptFailure {
             status,
             message,
             pre_content: false,
+            quota_exhausted: false,
         }
     }
 
-    fn pre_content(message: String) -> Self {
+    fn pre_content(message: String, quota_exhausted: bool) -> Self {
         Self {
             status: 503,
             message,
             pre_content: true,
+            quota_exhausted,
+        }
+    }
+
+    fn quota(status: u16, message: String) -> Self {
+        Self {
+            status,
+            message,
+            pre_content: false,
+            quota_exhausted: true,
         }
     }
 }
@@ -1260,12 +1310,15 @@ async fn attempt_once(
                     }
                 }
             }
-            if failoverable(status, &snippet) {
+            let quota_exhausted = is_resettable_quota_code(&code);
+            if failoverable(status, &snippet) || quota_exhausted {
                 app.pool.mark_failure(&acc.id, &model);
-                return Err(AttemptFailure::http(
-                    status,
-                    format!("{}: {status} {snippet}", acc.email),
-                ));
+                let message = format!("{}: {status} {snippet}", acc.email);
+                return Err(if quota_exhausted {
+                    AttemptFailure::quota(status, message)
+                } else {
+                    AttemptFailure::http(status, message)
+                });
             }
             // genuine client error: pass through untouched
             let mut out = Response::builder()
@@ -1325,10 +1378,10 @@ async fn attempt_once(
         // whether a coalesced content/error pair can still fail over.
         if let Some(code) = observed.stats.error_before_content.clone() {
             observed.record(None, false);
-            return Err(AttemptFailure::pre_content(format!(
-                "{}: {code}",
-                acc.email
-            )));
+            return Err(AttemptFailure::pre_content(
+                format!("{}: {code}", acc.email),
+                is_resettable_quota_code(&code),
+            ));
         }
         if ended
             || observed.stats.content_seen
@@ -1480,6 +1533,13 @@ fn error_code(code: &str) -> Option<&str> {
         && code.len() <= 80
         && code.bytes().all(|c| c.is_ascii_alphanumeric() || c == b'_'))
     .then_some(code)
+}
+
+/// Only this explicit quota exhaustion is eligible for a banked reset. A
+/// generic 429 may be throttling or a transient service limit and must never
+/// spend an irreversible credit.
+fn is_resettable_quota_code(code: &str) -> bool {
+    matches!(code, "usage_limit_reached")
 }
 
 /// Extracts the error code from one in-stream error event. Current upstream
@@ -1918,11 +1978,13 @@ fn pool_usage_windows(app: &App) -> Option<Vec<PoolUsageWindow>> {
                         used_pct: Some(q.primary_pct),
                         window_seconds: Some(q.primary_window_secs),
                         reset_at: Some(q.primary_reset_at),
+                        ..Default::default()
                     },
                     secondary: Window {
                         used_pct: Some(q.secondary_pct),
                         window_seconds: Some(q.secondary_window_secs),
                         reset_at: Some(q.secondary_reset_at),
+                        ..Default::default()
                     },
                     ..Default::default()
                 },
@@ -2457,6 +2519,7 @@ mod tests {
             used_pct: Some(pct),
             window_seconds: Some(604800),
             reset_at: Some(reset),
+            ..Default::default()
         };
         let windows = aggregate_usage_windows(&[
             (
@@ -2495,6 +2558,7 @@ mod tests {
                 used_pct: pct,
                 window_seconds: seconds,
                 reset_at: Some(100),
+                ..Default::default()
             })
             .is_none());
         }

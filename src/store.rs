@@ -62,6 +62,10 @@ pub struct Settings {
     /// yield when the pin lags the best by more than this many pp
     #[serde(default = "default_yield_gap")]
     pub pin_yield_gap_pp: i64,
+    /// When enabled, an actual pre-content quota exhaustion may spend one
+    /// banked reset credit and retry the request once.
+    #[serde(default)]
+    pub auto_reset_enabled: bool,
 }
 
 fn default_cooldown() -> i64 {
@@ -75,6 +79,7 @@ impl Default for Settings {
         Settings {
             cooldown_seconds: default_cooldown(),
             pin_yield_gap_pp: default_yield_gap(),
+            auto_reset_enabled: false,
         }
     }
 }

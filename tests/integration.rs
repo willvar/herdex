@@ -9,7 +9,7 @@ use herdex::app::App;
 use herdex::config::Config;
 use herdex::pool::Pool;
 use herdex::proxy;
-use herdex::store::{Account, LogEntry, Store, UsageDim};
+use herdex::store::{Account, LogEntry, Settings, Store, UsageDim};
 use serde_json::{json, Value};
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
@@ -27,6 +27,8 @@ struct FakeUp {
     search_behavior: Arc<Mutex<SearchBehavior>>,
     usage: Arc<Mutex<HashMap<String, (StatusCode, Value)>>>,
     response_headers: Arc<Mutex<HeaderMap>>,
+    reset_credits: Arc<Mutex<Value>>,
+    reset_consumes: Arc<Mutex<Vec<Value>>>,
 }
 
 #[derive(Clone)]
@@ -45,6 +47,7 @@ enum Behavior {
     // buffered-prefix error detection through the full proxy path
     StreamErrorFirst(u32),
     BomStreamErrorFirst(u32),
+    QuotaStreamErrorFirst(u32),
     ChunkedErrorFirst(usize),
     JsonResponse(String),
     HttpErrorFirst(u16, String, usize),
@@ -61,6 +64,8 @@ impl FakeUp {
         let search_bodies = self.bodies.clone();
         let search_auths = self.auths.clone();
         let search_behavior = self.search_behavior.clone();
+        let reset_credits = self.reset_credits.clone();
+        let reset_consumes = self.reset_consumes.clone();
         Router::new().route(
             "/backend-api/wham/usage",
             axum::routing::get(move |headers: HeaderMap| async move {
@@ -75,6 +80,20 @@ impl FakeUp {
                     .cloned()
                     .unwrap_or((StatusCode::BAD_GATEWAY, json!({"error": "probe unavailable"})));
                 (status, axum::Json(body)).into_response()
+            }),
+        )
+        .route(
+            "/backend-api/wham/rate-limit-reset-credits",
+            axum::routing::get(move || {
+                let body = reset_credits.lock().unwrap().clone();
+                async move { axum::Json(body) }
+            }),
+        )
+        .route(
+            "/backend-api/wham/rate-limit-reset-credits/consume",
+            axum::routing::post(move |axum::Json(body): axum::Json<Value>| {
+                reset_consumes.lock().unwrap().push(body);
+                async { axum::Json(json!({"ok": true})) }
             }),
         )
         .route(
@@ -183,7 +202,9 @@ impl FakeUp {
                     Behavior::AlwaysFail(_) => true,
                     // the stream-error case is a "successful" 200 whose body
                     // carries the error frame — handled below
-                    Behavior::StreamErrorFirst(k) | Behavior::BomStreamErrorFirst(k) => {
+                    Behavior::StreamErrorFirst(k)
+                    | Behavior::BomStreamErrorFirst(k)
+                    | Behavior::QuotaStreamErrorFirst(k) => {
                         n <= k as usize
                     }
                     Behavior::Streaming { .. } | Behavior::JsonResponse(_) => unreachable!(),
@@ -197,6 +218,13 @@ impl FakeUp {
                             return (
                                 axum::http::StatusCode::OK,
                                 "data: {\"type\": \"error\", \"code\": \"server_is_overloaded\"}\n\n".to_string(),
+                            )
+                                .into_response();
+                        }
+                        Behavior::QuotaStreamErrorFirst(_) => {
+                            return (
+                                axum::http::StatusCode::OK,
+                                "data: {\"type\": \"error\", \"code\": \"usage_limit_reached\"}\n\n".to_string(),
                             )
                                 .into_response();
                         }
@@ -279,6 +307,11 @@ async fn harness_with_search_timeout(accounts: &[&str], search_timeout_seconds: 
         search_behavior: Arc::new(Mutex::new(SearchBehavior::Ok)),
         usage: Default::default(),
         response_headers: Default::default(),
+        reset_credits: Arc::new(Mutex::new(json!({
+            "available_count": 0,
+            "credits": []
+        }))),
+        reset_consumes: Arc::new(Mutex::new(Vec::new())),
     };
     let up_router = upstream.clone().router();
     let up_listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
@@ -313,7 +346,7 @@ async fn harness_with_search_timeout(accounts: &[&str], search_timeout_seconds: 
         last_prune_day: std::sync::atomic::AtomicI64::new(0),
         learned_strips: std::sync::Mutex::new(std::collections::HashSet::new()),
         refresh_guards: tokio::sync::Mutex::new(HashMap::new()),
-        reset_guards: tokio::sync::Mutex::new(HashMap::new()),
+        reset_guards: Mutex::new(HashMap::new()),
     });
     let pr = proxy::router().with_state(app.clone());
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
@@ -1266,6 +1299,340 @@ async fn all_fail_surfaces_real_upstream_error() {
 }
 
 #[tokio::test]
+async fn auto_reset_consumes_one_card_and_retries_an_http_quota_failure() {
+    let h = harness(&["a1"]).await;
+    set_usage(
+        &h,
+        "a1",
+        account_usage(
+            "pro",
+            usage_window(100, 604800, herdex::store::now_secs() + 86400),
+            Value::Null,
+        ),
+    );
+    *h.upstream.reset_credits.lock().unwrap() = json!({
+        "available_count": 1,
+        "credits": [{
+            "id": "credit-early",
+            "status": "available",
+            "expires_at": "2026-10-20T00:00:00Z"
+        }]
+    });
+    h.store
+        .put_settings(&Settings {
+            auto_reset_enabled: true,
+            ..Settings::default()
+        })
+        .unwrap();
+    *h.upstream.behavior.lock().unwrap() = Behavior::HttpErrorFirst(
+        429,
+        json!({"error": {"code": "usage_limit_reached"}}).to_string(),
+        1,
+    );
+
+    let response = send_post(&h, "gpt-5.5", "auto-http").await;
+    assert_eq!(response.status(), 200);
+    response.bytes().await.unwrap();
+    assert_eq!(h.upstream.calls.lock().unwrap().len(), 2);
+    let consumes = h.upstream.reset_consumes.lock().unwrap();
+    assert_eq!(consumes.len(), 1);
+    assert_eq!(consumes[0]["credit_id"], "credit-early");
+    drop(consumes);
+    let logs = h.store.recent_logs(5).unwrap();
+    assert_eq!(logs.len(), 2);
+    assert_eq!(logs[1].error, "usage_limit_reached");
+    assert!(logs[0].error.is_empty());
+}
+
+#[tokio::test]
+async fn auto_reset_handles_a_pre_content_quota_event() {
+    let h = harness(&["a1"]).await;
+    set_usage(
+        &h,
+        "a1",
+        account_usage(
+            "pro",
+            usage_window(100, 604800, herdex::store::now_secs() + 86400),
+            Value::Null,
+        ),
+    );
+    *h.upstream.reset_credits.lock().unwrap() = json!({
+        "available_count": 1,
+        "credits": [{"id": "credit-stream", "status": "available"}]
+    });
+    h.store
+        .put_settings(&Settings {
+            auto_reset_enabled: true,
+            ..Settings::default()
+        })
+        .unwrap();
+    *h.upstream.behavior.lock().unwrap() = Behavior::QuotaStreamErrorFirst(1);
+
+    let response = send_post(&h, "gpt-5.5", "auto-stream").await;
+    assert_eq!(response.status(), 200);
+    response.bytes().await.unwrap();
+    assert_eq!(h.upstream.calls.lock().unwrap().len(), 2);
+    assert_eq!(h.upstream.reset_consumes.lock().unwrap().len(), 1);
+}
+
+#[tokio::test]
+async fn concurrent_quota_failures_share_one_auto_reset() {
+    let h = harness(&["a1"]).await;
+    set_usage(
+        &h,
+        "a1",
+        account_usage(
+            "pro",
+            usage_window(100, 604800, herdex::store::now_secs() + 86400),
+            Value::Null,
+        ),
+    );
+    *h.upstream.reset_credits.lock().unwrap() = json!({
+        "available_count": 2,
+        "credits": [
+            {"id": "credit-1", "status": "available"},
+            {"id": "credit-2", "status": "available"}
+        ]
+    });
+    h.store
+        .put_settings(&Settings {
+            auto_reset_enabled: true,
+            ..Settings::default()
+        })
+        .unwrap();
+    *h.upstream.behavior.lock().unwrap() = Behavior::HttpErrorFirst(
+        429,
+        json!({"error": {"code": "usage_limit_reached"}}).to_string(),
+        2,
+    );
+
+    let (left, right) = tokio::join!(
+        send_post(&h, "gpt-5.5", "auto-concurrent-1"),
+        send_post(&h, "gpt-5.5", "auto-concurrent-2"),
+    );
+    assert_eq!(left.status(), 200);
+    assert_eq!(right.status(), 200);
+    left.bytes().await.unwrap();
+    right.bytes().await.unwrap();
+    assert_eq!(h.upstream.calls.lock().unwrap().len(), 4);
+    assert_eq!(h.upstream.reset_consumes.lock().unwrap().len(), 1);
+}
+
+#[tokio::test]
+async fn one_exhausted_episode_cannot_consume_a_second_card() {
+    let h = harness(&["a1"]).await;
+    set_usage(
+        &h,
+        "a1",
+        account_usage(
+            "pro",
+            usage_window(100, 604800, herdex::store::now_secs() + 86400),
+            Value::Null,
+        ),
+    );
+    *h.upstream.reset_credits.lock().unwrap() = json!({
+        "available_count": 2,
+        "credits": [
+            {"id": "credit-1", "status": "available"},
+            {"id": "credit-2", "status": "available"}
+        ]
+    });
+    h.store
+        .put_settings(&Settings {
+            auto_reset_enabled: true,
+            ..Settings::default()
+        })
+        .unwrap();
+    let account = h.store.get_account("a1").unwrap();
+    let first_generation = h.app.reset_generation("a1");
+    assert_eq!(
+        h.app
+            .auto_reset(&account, "gpt-5.5", first_generation)
+            .await
+            .unwrap(),
+        herdex::app::AutoResetResult::Consumed
+    );
+    let second_generation = h.app.reset_generation("a1");
+    assert!(matches!(
+        h.app
+            .auto_reset(&account, "gpt-5.5", second_generation)
+            .await
+            .unwrap(),
+        herdex::app::AutoResetResult::AlreadyReset | herdex::app::AutoResetResult::Blocked
+    ));
+    assert_eq!(h.upstream.reset_consumes.lock().unwrap().len(), 1);
+}
+
+#[tokio::test]
+async fn generic_rate_limit_error_never_spends_a_reset_card() {
+    let h = harness(&["a1"]).await;
+    set_usage(
+        &h,
+        "a1",
+        account_usage(
+            "pro",
+            usage_window(100, 604800, herdex::store::now_secs() + 86400),
+            Value::Null,
+        ),
+    );
+    *h.upstream.reset_credits.lock().unwrap() = json!({
+        "available_count": 1,
+        "credits": [{"id": "credit-1", "status": "available"}]
+    });
+    h.store
+        .put_settings(&Settings {
+            auto_reset_enabled: true,
+            ..Settings::default()
+        })
+        .unwrap();
+    *h.upstream.behavior.lock().unwrap() = Behavior::HttpErrorFirst(
+        429,
+        json!({"error": {"code": "rate_limit_exceeded"}}).to_string(),
+        1,
+    );
+
+    let response = send_post(&h, "gpt-5.5", "auto-generic-429").await;
+    assert_eq!(response.status(), 429);
+    response.bytes().await.unwrap();
+    assert!(h.upstream.reset_consumes.lock().unwrap().is_empty());
+}
+
+#[tokio::test]
+async fn incomplete_quota_observation_does_not_trigger_auto_reset() {
+    let h = harness(&["a1"]).await;
+    set_usage(
+        &h,
+        "a1",
+        account_usage("pro", json!({"used_percent": 100}), Value::Null),
+    );
+    *h.upstream.reset_credits.lock().unwrap() = json!({
+        "available_count": 1,
+        "credits": [{"id": "credit-1", "status": "available"}]
+    });
+    h.store
+        .put_settings(&Settings {
+            auto_reset_enabled: true,
+            ..Settings::default()
+        })
+        .unwrap();
+    *h.upstream.behavior.lock().unwrap() = Behavior::HttpErrorFirst(
+        429,
+        json!({"error": {"code": "usage_limit_reached"}}).to_string(),
+        1,
+    );
+
+    let response = send_post(&h, "gpt-5.5", "auto-incomplete").await;
+    assert_eq!(response.status(), 429);
+    response.bytes().await.unwrap();
+    assert!(h.upstream.reset_consumes.lock().unwrap().is_empty());
+}
+
+#[tokio::test]
+async fn recovered_quota_retries_without_spending_a_reset_card() {
+    let h = harness(&["a1"]).await;
+    set_usage(
+        &h,
+        "a1",
+        account_usage(
+            "pro",
+            usage_window(20, 604800, herdex::store::now_secs() + 86400),
+            Value::Null,
+        ),
+    );
+    *h.upstream.reset_credits.lock().unwrap() = json!({
+        "available_count": 1,
+        "credits": [{"id": "credit-1", "status": "available"}]
+    });
+    h.store
+        .put_settings(&Settings {
+            auto_reset_enabled: true,
+            ..Settings::default()
+        })
+        .unwrap();
+    *h.upstream.behavior.lock().unwrap() = Behavior::HttpErrorFirst(
+        429,
+        json!({"error": {"code": "usage_limit_reached"}}).to_string(),
+        1,
+    );
+
+    let response = send_post(&h, "gpt-5.5", "auto-recovered").await;
+    assert_eq!(response.status(), 200);
+    response.bytes().await.unwrap();
+    assert_eq!(h.upstream.calls.lock().unwrap().len(), 2);
+    assert!(h.upstream.reset_consumes.lock().unwrap().is_empty());
+}
+
+#[tokio::test]
+async fn auto_reset_is_opt_in() {
+    let h = harness(&["a1"]).await;
+    set_usage(
+        &h,
+        "a1",
+        account_usage(
+            "pro",
+            usage_window(100, 604800, herdex::store::now_secs() + 86400),
+            Value::Null,
+        ),
+    );
+    *h.upstream.reset_credits.lock().unwrap() = json!({
+        "available_count": 1,
+        "credits": [{"id": "credit-1", "status": "available"}]
+    });
+    *h.upstream.behavior.lock().unwrap() = Behavior::HttpErrorFirst(
+        429,
+        json!({"error": {"code": "usage_limit_reached"}}).to_string(),
+        1,
+    );
+
+    let response = send_post(&h, "gpt-5.5", "auto-disabled").await;
+    assert_eq!(response.status(), 429);
+    response.bytes().await.unwrap();
+    assert_eq!(h.upstream.calls.lock().unwrap().len(), 1);
+    assert!(h.upstream.reset_consumes.lock().unwrap().is_empty());
+}
+
+#[tokio::test]
+async fn ordinary_failover_precedes_automatic_reset() {
+    let h = harness(&["a1", "a2"]).await;
+    for id in ["a1", "a2"] {
+        set_usage(
+            &h,
+            id,
+            account_usage(
+                "pro",
+                usage_window(
+                    if id == "a1" { 100 } else { 20 },
+                    604800,
+                    herdex::store::now_secs() + 86400,
+                ),
+                Value::Null,
+            ),
+        );
+    }
+    *h.upstream.reset_credits.lock().unwrap() = json!({
+        "available_count": 1,
+        "credits": [{"id": "credit-1", "status": "available"}]
+    });
+    h.store
+        .put_settings(&Settings {
+            auto_reset_enabled: true,
+            ..Settings::default()
+        })
+        .unwrap();
+    *h.upstream.behavior.lock().unwrap() = Behavior::HttpErrorFirst(
+        429,
+        json!({"error": {"code": "usage_limit_reached"}}).to_string(),
+        1,
+    );
+
+    let response = send_post(&h, "gpt-5.5", "auto-after-failover").await;
+    assert_eq!(response.status(), 200);
+    response.bytes().await.unwrap();
+    assert_eq!(h.upstream.calls.lock().unwrap().len(), 2);
+    assert!(h.upstream.reset_consumes.lock().unwrap().is_empty());
+}
+
+#[tokio::test]
 async fn failed_http_attempts_are_logged_and_linked_without_recording_error_bodies() {
     for status in [400, 401, 429, 503] {
         let h = harness(&["a1", "a2"]).await;
@@ -2000,7 +2367,7 @@ async fn full_router_assembles_and_serves_panel() {
             last_prune_day: std::sync::atomic::AtomicI64::new(0),
             learned_strips: std::sync::Mutex::new(std::collections::HashSet::new()),
             refresh_guards: tokio::sync::Mutex::new(HashMap::new()),
-            reset_guards: tokio::sync::Mutex::new(HashMap::new()),
+            reset_guards: Mutex::new(HashMap::new()),
         })
     });
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();

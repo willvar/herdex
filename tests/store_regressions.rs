@@ -820,4 +820,9 @@ fn explicit_zero_cooldown_survives_roundtrip_and_does_not_exclude_accounts() {
             .cooldown_seconds,
         300
     );
+    assert!(
+        !serde_json::from_str::<Settings>("{}")
+            .unwrap()
+            .auto_reset_enabled
+    );
 }

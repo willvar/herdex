@@ -20,6 +20,16 @@ vi.mock('naive-ui', async () => {
       }),
     },
     NSelect: { render: () => h('div') },
+    NSwitch: {
+      props: ['value'],
+      emits: ['update:value'],
+      setup: (props, { emit }) => () => h('input', {
+        'data-testid': 'switch',
+        type: 'checkbox',
+        checked: props.value,
+        onChange: event => emit('update:value', event.target.checked),
+      }),
+    },
     NButton: {
       name: 'NButton',
       props: ['disabled', 'loading'],
@@ -47,7 +57,7 @@ enableAutoUnmount(afterEach)
 describe('Settings draft protection', () => {
   beforeEach(() => {
     api.mockReset().mockResolvedValue({})
-    store.st = { settings: { cooldown_seconds: 300, pin_yield_gap_pp: 20 } }
+    store.st = { settings: { cooldown_seconds: 300, pin_yield_gap_pp: 20, auto_reset_enabled: false } }
   })
 
   it('keeps the saved values in the form and sends them again on a second save', async () => {
@@ -60,7 +70,7 @@ describe('Settings draft protection', () => {
     await wrapper.get('button').trigger('click')
     await flushPromises()
 
-    const saved = { cooldown_seconds: 60, pin_yield_gap_pp: 5 }
+    const saved = { cooldown_seconds: 60, pin_yield_gap_pp: 5, auto_reset_enabled: false }
     expect(store.st.settings).toEqual(saved)
     expect(cooldown.element.value).toBe('60')
     expect(yieldGap.element.value).toBe('5')
@@ -73,13 +83,27 @@ describe('Settings draft protection', () => {
     expect(api).toHaveBeenNthCalledWith(2, 'PUT', '/settings', saved)
   })
 
+  it('persists the automatic reset switch', async () => {
+    const wrapper = mount(Settings)
+    await wrapper.get('[data-testid="switch"]').setValue(true)
+    await wrapper.get('button').trigger('click')
+    await flushPromises()
+
+    expect(api).toHaveBeenCalledWith('PUT', '/settings', {
+      cooldown_seconds: 300,
+      pin_yield_gap_pp: 20,
+      auto_reset_enabled: true,
+    })
+    expect(store.st.settings.auto_reset_enabled).toBe(true)
+  })
+
   it('preserves both unsaved inputs when the periodic poll updates the store', async () => {
     const wrapper = mount(Settings)
     const [cooldown, yieldGap] = wrapper.findAll('[data-testid="number"]')
     await cooldown.setValue('120')
     await yieldGap.setValue('7')
 
-    api.mockResolvedValueOnce({ settings: { cooldown_seconds: 600, pin_yield_gap_pp: 30 } })
+    api.mockResolvedValueOnce({ settings: { cooldown_seconds: 600, pin_yield_gap_pp: 30, auto_reset_enabled: false } })
     await loadState()
     await nextTick()
 
@@ -91,7 +115,7 @@ describe('Settings draft protection', () => {
 
   it('still syncs a server update before the user starts editing', async () => {
     const wrapper = mount(Settings)
-    store.st = { settings: { cooldown_seconds: 600, pin_yield_gap_pp: 30 } }
+    store.st = { settings: { cooldown_seconds: 600, pin_yield_gap_pp: 30, auto_reset_enabled: false } }
     await nextTick()
 
     const [cooldown, yieldGap] = wrapper.findAll('[data-testid="number"]')
@@ -107,7 +131,7 @@ describe('Settings draft protection', () => {
     await wrapper.get('button').trigger('click')
     await flushPromises()
 
-    store.st = { settings: { cooldown_seconds: 300, pin_yield_gap_pp: 20 } }
+    store.st = { settings: { cooldown_seconds: 300, pin_yield_gap_pp: 20, auto_reset_enabled: false } }
     await nextTick()
 
     expect(cooldown.element.value).toBe('60')
@@ -128,22 +152,26 @@ describe('Settings draft protection', () => {
     expect(api).toHaveBeenCalledTimes(1)
     await cooldown.setValue('120')
     await yieldGap.setValue('7')
-    response.resolve({ cooldown_seconds: 60, pin_yield_gap_pp: 20 })
+    response.resolve({ cooldown_seconds: 60, pin_yield_gap_pp: 20, auto_reset_enabled: false })
     await flushPromises()
 
     expect(cooldown.element.value).toBe('120')
     expect(yieldGap.element.value).toBe('7')
     expect(wrapper.get('button').element.disabled).toBe(false)
-    expect(store.st.settings).toEqual({ cooldown_seconds: 60, pin_yield_gap_pp: 20 })
+    expect(store.st.settings).toEqual({ cooldown_seconds: 60, pin_yield_gap_pp: 20, auto_reset_enabled: false })
 
-    api.mockResolvedValueOnce({ settings: { cooldown_seconds: 60, pin_yield_gap_pp: 20 } })
+    api.mockResolvedValueOnce({ settings: { cooldown_seconds: 60, pin_yield_gap_pp: 20, auto_reset_enabled: false } })
     await loadState()
     await nextTick()
     expect(cooldown.element.value).toBe('120')
 
     await wrapper.get('button').trigger('click')
     await flushPromises()
-    expect(api).toHaveBeenLastCalledWith('PUT', '/settings', { cooldown_seconds: 120, pin_yield_gap_pp: 7 })
+    expect(api).toHaveBeenLastCalledWith('PUT', '/settings', {
+      cooldown_seconds: 120,
+      pin_yield_gap_pp: 7,
+      auto_reset_enabled: false,
+    })
   })
 
   it.each(['before save', 'during save'])('rejects stale settings from a poll started %s', async (pollTiming) => {
@@ -158,9 +186,9 @@ describe('Settings draft protection', () => {
     await wrapper.get('button').trigger('click')
     if (pollTiming === 'during save') polling = loadState()
 
-    saveResponse.resolve({ cooldown_seconds: 60, pin_yield_gap_pp: 20 })
+    saveResponse.resolve({ cooldown_seconds: 60, pin_yield_gap_pp: 20, auto_reset_enabled: false })
     await flushPromises()
-    pollResponse.resolve({ accounts: [{ id: 'fresh-account' }], settings: { cooldown_seconds: 300, pin_yield_gap_pp: 20 } })
+    pollResponse.resolve({ accounts: [{ id: 'fresh-account' }], settings: { cooldown_seconds: 300, pin_yield_gap_pp: 20, auto_reset_enabled: false } })
     await polling
     await nextTick()
 
@@ -169,7 +197,7 @@ describe('Settings draft protection', () => {
     expect(cooldown.element.value).toBe('60')
 
     // A genuinely later poll must still reflect external settings changes.
-    api.mockResolvedValueOnce({ settings: { cooldown_seconds: 90, pin_yield_gap_pp: 20 } })
+    api.mockResolvedValueOnce({ settings: { cooldown_seconds: 90, pin_yield_gap_pp: 20, auto_reset_enabled: false } })
     await loadState()
     await nextTick()
     expect(cooldown.element.value).toBe('90')
