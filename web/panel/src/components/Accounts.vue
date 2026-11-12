@@ -2,6 +2,7 @@
 import { computed, h, reactive } from 'vue'
 import { NCard, NDataTable, NButton, NSwitch, NTag, NPopconfirm, useMessage } from 'naive-ui'
 import { api } from '../api.js'
+import { planLabel } from '../plans.js'
 import { store, loadState, fetchQuota } from '../store.js'
 
 const message = useMessage()
@@ -180,7 +181,8 @@ function renderQuota(row) {
 const columns = [
   { type: 'expand', expandable: () => true, renderExpand: renderQuota },
   { title: '邮箱', key: 'email', minWidth: 180 },
-  { title: 'Plan', key: 'plan_type', width: 80 },
+  { title: 'Plan', key: 'plan_type', minWidth: 140, render: r =>
+    h('span', { title: r.plan_type }, planLabel(r.plan_type)) },
   { title: 'Token 过期', key: 'expires_at', width: 140 },
   { title: '状态', key: 'status', width: 170, render: (r) => {
     if (r.disabled) return h(NTag, { type: 'error', size: 'small' }, { default: () => '已禁用' })

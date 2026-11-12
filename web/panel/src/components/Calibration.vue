@@ -1,6 +1,7 @@
 <script setup>
 import { computed, h } from 'vue'
 import { NCard, NDataTable } from 'naive-ui'
+import { planLabel } from '../plans.js'
 import { store } from '../store.js'
 
 const cal = computed(() => store.calibration || {})
@@ -31,7 +32,8 @@ function fmtTokens(v) {
 
 const columns = [
   { title: '账号', key: 'email', minWidth: 170 },
-  { title: 'Plan', key: 'plan_type', width: 80 },
+  { title: 'Plan', key: 'plan_type', minWidth: 140, render: a =>
+    h('span', { title: a.plan_type }, planLabel(a.plan_type)) },
   { title: '已用', key: 'used_pct', width: 70, render: a => a.used_pct != null ? `${a.used_pct}%` : '—' },
   { title: '实测容量', key: 'cap', width: 120, render: a => a.tokens_per_pct != null ? `${fmtTokens(a.tokens_per_pct)} tok/%` : '—' },
   { title: '剩余', key: 'rem', width: 90, render: a => a.remaining_tokens != null ? fmtTokens(a.remaining_tokens) : '—' },

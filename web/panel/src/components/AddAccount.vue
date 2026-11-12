@@ -2,6 +2,7 @@
 import { ref } from 'vue'
 import { NCard, NButton, NInput, useMessage } from 'naive-ui'
 import { api } from '../api.js'
+import { planLabel } from '../plans.js'
 import { loadState } from '../store.js'
 
 const message = useMessage()
@@ -29,7 +30,7 @@ async function copyLink() {
 async function loginFinish() {
   try {
     const r = await api('POST', '/login/finish', { callback_url: cbUrl.value })
-    message.success(`已添加 ${r.email} (${r.plan_type})`)
+    message.success(`已添加 ${r.email} (${planLabel(r.plan_type)})`)
     cbUrl.value = ''
     loadState()
   } catch (e) { message.error(e.message) }
