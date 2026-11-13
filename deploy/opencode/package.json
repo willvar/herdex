@@ -3,6 +3,9 @@
   "private": true,
   "type": "module",
   "main": "index.js",
+  "scripts": {
+    "test": "node --test"
+  },
   "dependencies": {
     "@opencode/plugin": "2.0.16"
   }

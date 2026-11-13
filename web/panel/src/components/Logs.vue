@@ -20,6 +20,7 @@ function hasError(log) {
 function tierLabel(tier) {
   if (tier == null) return '未记录'
   if (tier === 'priority' || tier === 'fast') return 'Fast'
+  if (tier === 'ultrafast') return 'Ultrafast'
   return tier || '未指定'
 }
 

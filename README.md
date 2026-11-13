@@ -27,7 +27,10 @@ codex 专用账号池网关（Rust）。把多个 ChatGPT 账号聚合成一个 
 - **PAT 虚拟账号**：CLI 用 codex 的 PersonalAccessToken 认证模式接入，whoami 由
   网关应答——无需任何真实 OAuth，账号身份（`pool@herdex.local`）只存在于网关侧
 - **零成本用量探针**：定时探测 `wham/usage`（不消耗模型配额），各窗口全部入池
-- **会话粘性**：Session-Id → 账号，TTL 1h 滑动窗口，失败自动重钉
+- **会话粘性**：Responses 入口将 `session-id`／`session_id` 及 `thread-id`／`thread_id` 明确归一化；重复、冲突或越界的路由头返回 400，不发往上游。原有选号粘性仍为 TTL 1h 滑动窗口，失败自动重钉，不保证缓存命中。
+- **回合路由隔离**：`x-codex-turn-state` 绑定调用方 key、会话、模型、后端及实际服务账号／凭据。同一归属保留首个状态；未知、过期或换号后的旧值不直接转发。换号取得新状态后，可将客户端仍保留的旧别名映射到新账号自己的状态，不把旧账号的不透明值发给新账号。
+  绑定仅在内存保存，最多 256 项，空闲 30 分钟过期，单个状态最多 8 KiB；重启不恢复旧值。客户端负责在新的用户回合清理自己的状态，网关不根据提示词内容猜回合边界。
+- **路由诊断边界**：静态 `header-defaults` 不注入会话／回合路由头；限额日志不打印不透明路由状态。请求体及原生回放内容不因该机制而截断或改写。
 - **TLS 指纹同源**：出站栈 pin 到 codex-rs Cargo.lock 的逐版本组合
   （reqwest 0.12.28 + rustls 0.23.36 + aws-lc-rs）
 - **身份策略**：真 codex 客户端（CLI/App/IDE）自身 UA/Originator/Version 原样透传；非 codex 客户端套 `header-defaults` 伪装壳（防第三方 UA 触发 Cloudflare 挑战）
@@ -54,10 +57,13 @@ codex 专用账号池网关（Rust）。把多个 ChatGPT 账号聚合成一个 
   `usage_limit_reached` 且首个内容尚未发出时，先完成普通账号 failover；全部候选都未成功时，
   在账号级 single-flight 锁内重新确认额度，消耗最早到期的可用券并将原请求重试一次。
   同一账号/额度窗口的并发请求共享一次重置结果；列表失败、额度无法确认、重置失败或已输出内容时不继续扣卡。
-- **请求档位记录**：请求日志保存客户端的 `service_tier`，`priority` 表示请求 Fast；
+- **请求档位记录**：请求日志保存客户端的 `service_tier`，`priority` 表示请求 Fast，
+  `ultrafast` 表示请求 Ultrafast；
   历史未记录与新请求未指定档位分开表示。不保存请求正文，也不据此推定实际消费倍率
   或调整原始 token 数量、容量校准
-- **令牌自维护**：后台 proactive refresh，过期前自动续
+- **令牌自维护**：后台约每 2 分钟检查一次，剩余有效期不超过 10 分钟时自动刷新，
+  已过期令牌也会尝试恢复。启用和禁用账号均参与，刷新不会自动启用账号；
+  禁用账号仍不参与请求调度、后台额度查询或模型目录采集
 - **搜索并发调度**：standalone `alpha/search` 使用账号级 in-flight lease，
   并发请求优先分散到空闲的可用账号；每次尝试记录首字节、完整响应、字节数和上游
   request ID，不记录查询正文。单次搜索超时后在有限候选内 failover，避免一个账号永久占住请求。
@@ -66,12 +72,24 @@ codex 专用账号池网关（Rust）。把多个 ChatGPT 账号聚合成一个 
   `{"models": [...]}` 模型元数据，`/v1/models` 返回 OpenAI-compatible 的
   `{"object":"list","data":[...]}` canonical 模型 ID 视图。无 `models`
   配置过滤时，两者均以启用账号目录的并集为基础，禁用或删除账号立即不参与合并；
-  `-fast` Key 过滤为支持 Fast 的 canonical 模型子集，原生目录保留完整对象。
-  Fast Key 的请求自动使用 `service_tier: "priority"`。
+  `models` 配置只缩小清单，不能凭空赋予模型或速度权限。
+  `-fast` / `-ultrafast` Key 分别筛选有合资格账号支持的模型，并强制
+  `service_tier: "priority"` / `"ultrafast"`，原生目录合并同名模型的速度能力。
   旧的 `gpt-*-fast` 请求仍作为兼容入口接受。
   调度跳过目录明确不支持模型的账号；启动时先从磁盘恢复上次已采集目录，
   首个刷新周期前路由与两个目录接口即保持正确。
   版本源不可用时两个目录接口返回 503，不清除已有目录、用量或中断现有推理请求
+- **账号级档位准入**：尊重目录的 `available_in_plans` 套餐范围，并按每个账号对应模型的
+  `service_tiers` 判断速度权限；不按模型名前缀、Plus/Pro 名称或套餐价格猜测。
+  只认原生 `service_tiers` 对象；弃用的 `additional_speed_tiers` 不参与准入，也不对外输出。
+  缺失、空值、空数组或无效的档位对象均不能授予加速权限；未知速度能力不进入加速池，
+  不能因普通池里有同名模型而放行。
+  模型发现、推理与独立搜索选号、会话粘性、失败重试和重置券重试共用能力过滤；
+  普通 Key 显式请求速度档位同样受约束。派生 Key 的池级用量和响应头仅聚合对应速度池。
+  不剥离明确请求的速度字段来重试普通模式；无合资格账号时返回 503
+  `no_eligible_account`，冲突的速度选择器返回 400 `conflicting_service_tiers`。
+  权限以上次成功采集的账号目录为准，新目录撤回能力、账号禁用/删除会更新清单和调度；
+  成功的空目录会清除缓存，格式错误或网络失败仍保留上次有效目录。
 
 ## 构建
 
@@ -197,7 +215,7 @@ herdex 上，凭据始终是 herdex API key，无客户端 OAuth。
 - `POST /v1/responses`、`POST /backend-api/codex/responses` —— SSE 流式透传
 - `POST /v1/alpha/search`（及 `/api/codex/alpha/search`）—— Codex Responses Lite
   的独立 `web.run` 搜索代理，使用池内账号凭据访问上游
-- `GET  /v1/models` —— 启用账号的 canonical 模型并集；Key 以 `-fast` 结尾时筛出 Fast 模型
+- `GET  /v1/models` —— 启用账号的 canonical 模型并集；`-fast` / `-ultrafast` Key 分别筛出对应档位模型
 - `GET  /models` —— 启用账号完整 Codex 模型目录并集（codex CLI 使用）
 - `GET  /api/codex/usage`（及 `/v1/api/codex/usage`、`/wham/usage`）—— 池子聚合用量
 - `GET  /v1/user-auth-credential/whoami` —— PAT 虚拟身份
@@ -213,22 +231,41 @@ Codex 全局配置控制。Lite 模型的搜索请求会单独访问上面的 `a
 注意：herdex 是 CLI 的认证依赖；网关不可达、API key 无效或禁用、HTTPS 证书不受
 信任时，codex 会在身份获取或工作区发现阶段拒绝启动（fail-closed）。
 
-Fast Provider 不需要第二条数据库 Key：若普通 Key 为 `<key>`，下游 Provider 使用
-`<key>-fast` 即可。两种形式共享同一 Key 的启用/禁用和删除状态；`-fast` 只是 Provider
-模式选择，不是独立权限边界。
+Fast / Ultrafast Provider 不需要额外数据库 Key：若普通 Key 为 `<key>`，下游 Provider
+分别使用 `<key>-fast` / `<key>-ultrafast` 即可。三种形式共享同一 Key 的启用/禁用和删除状态；
+后缀只是 Provider 模式选择，不是独立权限边界。没有对应能力的账号不会被选中；
+订阅名称本身不授予速度档位。Ultrafast 路径有模拟上游回归，尚未用具备权限的真实订阅做端到端验收。
+
+### 速度协议依据
+
+- 上游每个模型的 `service_tiers` 为对象数组，元素的 `id`、`name`、`description` 均为字符串。
+  Fast 的请求 ID 是 `priority`，Ultrafast 是 `ultrafast`；名称和描述保留该账号上游返回的内容，
+  不根据套餐或客户端目录补写权限。`default_service_tier` 是可省略的字符串/空值，只选择默认项，
+  不单独授予任何档位能力。普通模式不要求目录中出现一个虚构的 `standard` 档位。
+- Codex 官方 [`ModelServiceTier` 定义](https://github.com/openai/codex/blob/1a604d58da344c84528fecd5b5154105f597d70b/codex-rs/protocol/src/openai_models.rs#L240-L245)
+  给出目录结构；同文件明确标记 `additional_speed_tiers` 为弃用字段。
+- OpenCode V2 的 [OpenAI 选项](https://github.com/anomalyco/opencode/blob/394d49d487584fbd6cd1d0184973b2420c4c3fd9/packages/ai/src/providers/openai-options.ts#L8-L16)
+  接受 `serviceTier: "ultrafast"`，并在 [Responses 请求构造](https://github.com/anomalyco/opencode/blob/394d49d487584fbd6cd1d0184973b2420c4c3fd9/packages/ai/src/protocols/open-responses.ts#L835-L840)
+  中映射为 `service_tier`。其[公开模型目录](https://models.opencode.ai/experimental/v2.0/api.json?type=chat)
+  的 GPT-6 Astra / GPT-6.1 Sol 均有 `experimental.modes.ultrafast.body.service_tier = "ultrafast"`。
+  这些信息确认客户端协议，不是某个 Pro $500 账号的完整目录回包或授权证明。
+- 模型目录由后台逐启用账号查询，每轮工作结束后等待 120 秒；请求读取内存缓存，
+  重启先恢复磁盘缓存。上游查询失败保留最近有效目录，不保证权限变动被即时发现。
 
 ## OpenCode v2 接入
 
 配套插件位于 [`deploy/opencode/`](deploy/opencode/README.md)：
-  启动时从 herdex 拉取普通与 Fast 两套模型清单，每分钟刷新，继承 OpenCode 目录中的
+  启动时从 herdex 拉取普通、Fast、Ultrafast 三套模型清单，每分钟刷新，继承 OpenCode 目录中的
   同名模型显示名、推理强度、能力与限制；模型 ID 始终使用 canonical ID。选择
   `herdex-fast` Provider 后，herdex 通过 `<key>-fast` 自动使用
-  `service_tier: "priority"`。使用 Responses API，可通过
+  `service_tier: "priority"`；`herdex-ultrafast` 使用 `<key>-ultrafast` 和
+  `service_tier: "ultrafast"`。推理强度与速度选择分开，不继承会覆盖速度的 variants。
+  使用 Responses API，可通过
  `http://<herdex-host>:<listen 端口>/v1` 连接，无需证书配置或手动维护模型列表。
 安装与配置步骤见插件目录的 README。
 
 只支持 `model` 字段的 OpenAI-compatible 客户端使用普通 Key 请求 canonical 模型 ID；
-需要 Fast 时，将 Bearer Key 写成 `<key>-fast`，模型 ID 保持不变。旧的
+需要 Fast / Ultrafast 时，将 Bearer Key 写成 `<key>-fast` / `<key>-ultrafast`，模型 ID 保持不变。旧的
 `gpt-*-fast` 请求 ID 仍会被兼容处理。
 
 ## 测试
@@ -237,12 +274,16 @@ Fast Provider 不需要第二条数据库 Key：若普通 Key 为 `<key>`，下�
 cargo fmt --check
 cargo clippy --all-targets --locked -- -D warnings
 cargo test --locked   # 单测 + HTTP 集成：假上游 + 真实 axum 链路
+npm ci --prefix deploy/opencode --omit=peer --ignore-scripts
+npm test --prefix deploy/opencode
 cd web/panel && npm ci && npm run lint && npm test && npm run build
 ```
 
 前端回归覆盖设置保存与轮询的并发、额度查询失败/重试、重置券确认/防重复提交/结果反馈、同邮箱账号容量隔离、
 空闲日预测和图表卸载；后端覆盖重置券消耗结果、慢速 SSE 分块、前缀预算、同秒请求归属、
 未知套餐、旧数据库迁移、断连收尾，以及历史清理后的容量统计。
+速度回归覆盖 Plus 权限撤回、混合套餐、未知能力、同名模型档位合并、缓存重载、
+显式速度透传、参数自愈不降档、重试前权限复核，以及三个 Provider 的发现/刷新/卸载。
 
 核心语义不变式（逐条测试锁定）：
 - 429 永不熔断全池；全部冷却时仍返回候选（按上次失败时间最早者优先），而不是直接报错

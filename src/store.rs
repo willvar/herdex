@@ -838,7 +838,7 @@ impl Store {
 
     /// Replaces one account's full native Codex model catalog. The slug table
     /// is kept alongside it for the fast entitlement check in the request
-    /// path. Empty input keeps the previous known-good catalog.
+    /// path. A successful empty catalog withdraws previously known models.
     pub fn set_account_catalog(
         &self,
         account_id: &str,
@@ -852,8 +852,8 @@ impl Store {
             let serialized = serde_json::to_string(model).map_err(|e| e.to_string())?;
             entries.insert(slug.to_owned(), serialized);
         }
-        if entries.is_empty() {
-            return Ok(());
+        if entries.is_empty() && !models.is_empty() {
+            return Err("model catalog contains no valid model entries".into());
         }
 
         let mut conn = self.conn.lock().unwrap_or_else(|e| e.into_inner());

@@ -3,6 +3,10 @@ import { Plugin, Provider, Model } from "@opencode/plugin"
 const REFRESH_MS = 60_000
 const METADATA = ["name", "family", "capabilities", "limit", "cost", "time"]
 const isFastAlias = (id) => /^gpt-.+-fast$/i.test(id)
+const isSpeedVariant = (variant) =>
+  /(^|[ -])(fast|ultrafast)([ -]|$)/i.test(variant.id) ||
+  (variant.settings?.serviceTier != null &&
+    !["", "default", "auto"].includes(variant.settings.serviceTier))
 
 // Used only when the catalog and endpoint supply no display name.
 const prettyName = (id) => id
@@ -31,7 +35,7 @@ export default Plugin.define({
         throw new Error("/models returned an invalid model list")
       }
       // Older herdex versions may still advertise generated aliases. OpenCode
-      // has separate providers for Fast, so only canonical IDs belong here.
+      // has separate speed providers, so only canonical IDs belong here.
       return body.data.filter((entry) => !isFastAlias(entry.id))
     }
 
@@ -50,26 +54,31 @@ export default Plugin.define({
       return catalog
     }
 
-    const discover = async () => {
-      const [normal, fast] = await Promise.allSettled([
+    const discover = async (previous) => {
+      const [normal, fast, ultrafast] = await Promise.allSettled([
         fetchModels(apiKey),
         fetchModels(`${apiKey}-fast`),
+        fetchModels(`${apiKey}-ultrafast`),
       ])
       if (normal.status === "rejected") throw normal.reason
 
       if (fast.status === "rejected") {
-        console.error("herdex-models: Fast provider discovery failed; keeping it empty")
+        console.error("herdex-models: Fast provider discovery failed; keeping the last model list")
+      }
+      if (ultrafast.status === "rejected") {
+        console.error("herdex-models: Ultrafast provider discovery failed; keeping the last model list")
       }
       return {
         normal: normal.value,
-        fast: fast.status === "fulfilled" ? fast.value : [],
+        fast: fast.status === "fulfilled" ? fast.value : previous.fast,
+        ultrafast: ultrafast.status === "fulfilled" ? ultrafast.value : previous.ultrafast,
         catalog: await readCatalog(),
       }
     }
 
-    let source = { normal: [], fast: [], catalog: new Map() }
+    let source = { normal: [], fast: [], ultrafast: [], catalog: new Map() }
     try {
-      source = await discover()
+      source = await discover(source)
     } catch {
       console.error("herdex-models: initial discovery failed; retrying in 60s")
     }
@@ -85,17 +94,17 @@ export default Plugin.define({
             if (catalog[field] !== undefined) model[field] = structuredClone(catalog[field])
           }
         }
-        // Inherit semantic choices, but keep Fast as a provider choice rather
+        // Inherit semantic choices, but keep speed as a provider choice rather
         // than a variant that could accidentally use the ordinary API key.
-        const variants = (catalog?.variants ?? []).map((variant) => {
+        const variants = (catalog?.variants ?? []).filter((variant) => !isSpeedVariant(variant)).map((variant) => {
           const settings = {}
-          for (const field of ["reasoningEffort", "reasoningSummary", "include", "serviceTier"]) {
+          for (const field of ["reasoningEffort", "reasoningSummary", "include"]) {
             if (variant.settings?.[field] !== undefined) {
               settings[field] = structuredClone(variant.settings[field])
             }
           }
           return { id: variant.id, settings }
-        }).filter((variant) => variant.id !== "fast" && !variant.id.endsWith(" fast"))
+        })
         model.variants = variants
         model.name = catalog?.name || entry.name || prettyName(entry.id)
         return model
@@ -117,12 +126,13 @@ export default Plugin.define({
 
       addProvider("herdex", "Herdex Pool", apiKey, source.normal)
       addProvider("herdex-fast", "Herdex Pool (Fast)", `${apiKey}-fast`, source.fast)
+      addProvider("herdex-ultrafast", "Herdex Pool (Ultrafast)", `${apiKey}-ultrafast`, source.ultrafast)
     })
 
     let stopped = false
     const refresh = async () => {
       try {
-        const next = await discover()
+        const next = await discover(source)
         if (stopped) return
         source = next
         await ctx.provider.reload()

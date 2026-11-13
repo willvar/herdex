@@ -83,6 +83,7 @@ async fn async_main(cfg: config::Config) {
         reset_guards: Mutex::new(HashMap::new()),
         last_prune_day: std::sync::atomic::AtomicI64::new(0),
         learned_strips: std::sync::Mutex::new(herdex::app::App::load_learned_strips(&cfg)),
+        routing: Default::default(),
     });
 
     // routing and both discovery endpoints must be correct from the first

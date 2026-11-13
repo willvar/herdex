@@ -15,6 +15,8 @@ struct Upstream {
     status: StatusCode,
     release: String,
     queries: Vec<(String, String)>,
+    catalog_overrides: HashMap<String, Value>,
+    usage_plan: String,
 }
 
 struct Fixture {
@@ -35,11 +37,16 @@ fn catalog_model(slug: &str) -> Value {
         "use_responses_lite": slug != "gpt-5.5",
         "web_search_tool_type": "text_and_image",
         "catalog_marker": format!("marker-{slug}"),
+        "service_tiers": [{"id": "priority", "name": "Fast", "description": "Synthetic Fast capability."}],
     })
 }
 
 impl Fixture {
     async fn new() -> Self {
+        Self::with_models(Vec::new()).await
+    }
+
+    async fn with_models(models: Vec<String>) -> Self {
         let root = std::env::temp_dir().join(format!("herdex-release-{}", uuid::Uuid::new_v4()));
         let store = Store::open(root.to_str().unwrap()).unwrap();
         store.add_api_key("test-key", "test").unwrap();
@@ -60,6 +67,8 @@ impl Fixture {
             status: StatusCode::SERVICE_UNAVAILABLE,
             release: "unavailable".into(),
             queries: Vec::new(),
+            catalog_overrides: HashMap::new(),
+            usage_plan: "pro".into(),
         }));
         let upstream_router = Router::new()
             .route(
@@ -93,6 +102,9 @@ impl Fixture {
                             .unwrap()
                             .queries
                             .push((account.clone(), version.clone()));
+                        if let Some(payload) = s.lock().unwrap().catalog_overrides.get(&account).cloned() {
+                            return Json(payload);
+                        }
                         let mut models = vec![catalog_model("gpt-6-sol")];
                         if account != "a4" {
                             models.push(catalog_model("gpt-reserve"));
@@ -103,6 +115,14 @@ impl Fixture {
                         Json(json!({"models": models}))
                     },
                 ),
+            )
+            .route(
+                "/backend-api/wham/usage",
+                get(|State(s): State<Arc<Mutex<Upstream>>>| async move {
+                    Json(json!({"plan_type":s.lock().unwrap().usage_plan, "rate_limit":{
+                        "primary_window":{"used_percent":12,"limit_window_seconds":604800,"reset_at":1893456000}
+                    }}))
+                }),
             )
             .route(
                 "/responses",
@@ -118,6 +138,7 @@ impl Fixture {
         });
 
         let cfg = Config {
+            models,
             upstream: UpstreamCfg {
                 base_url: upstream_url.clone(),
                 standalone_search_timeout_seconds: 45,
@@ -145,6 +166,7 @@ impl Fixture {
             reset_guards: Default::default(),
             last_prune_day: Default::default(),
             learned_strips: Default::default(),
+            routing: Default::default(),
         });
         let gateway_listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let gateway_url = format!("http://{}", gateway_listener.local_addr().unwrap());
@@ -376,6 +398,260 @@ async fn fast_key_filters_to_canonical_fast_capable_model_ids() {
         assert_eq!(ids(&normal, native), normal_expected, "{path}");
         assert_eq!(ids(&fast, native), ["gpt-6-sol", "gpt-reserve"], "{path}");
         assert!(ids(&fast, native).iter().all(|id| !id.ends_with("-fast")));
+    }
+}
+
+#[tokio::test]
+async fn speed_discovery_merges_account_capabilities_and_tracks_plan_lifecycle() {
+    let f = Fixture::new().await;
+    *f.app.model_version.write().unwrap() = Some("0.159.1".into());
+    for (id, plan, tiers) in [
+        (
+            "a1",
+            "plus",
+            json!([{"id":"priority","name":"Fast","description":"Synthetic Fast capability."}]),
+        ),
+        (
+            "a2",
+            "pro",
+            json!([{"id":"priority","name":"Fast","description":"Synthetic Fast capability."}]),
+        ),
+        (
+            "a3",
+            "promax",
+            json!([{"id":"ultrafast","name":"Ultrafast","description":"Synthetic Ultrafast capability."}]),
+        ),
+        ("a4", "promax", Value::Null),
+    ] {
+        f.store.set_account_plan(id, plan).unwrap();
+        let mut model = catalog_model("gpt-6-astra");
+        model["service_tiers"] = tiers.clone();
+        model["available_in_plans"] = json!(["plus", "pro", "promax"]);
+        let mut models = vec![model];
+        if id == "a1" {
+            models.push(catalog_model("o3"));
+        }
+        f.app.pool.set_account_catalog(id, &models);
+    }
+    for (key, expected, tier) in [
+        ("test-key", vec!["gpt-6-astra", "o3"], None),
+        ("test-key-fast", vec!["gpt-6-astra", "o3"], Some("priority")),
+        ("test-key-ultrafast", vec!["gpt-6-astra"], Some("ultrafast")),
+    ] {
+        for (path, field, id_field) in [("/models", "models", "slug"), ("/v1/models", "data", "id")]
+        {
+            let response = f.list_with_key(path, key).await;
+            assert_eq!(response.status(), 200);
+            let body: Value = response.json().await.unwrap();
+            let models = body[field].as_array().unwrap();
+            let ids: Vec<_> = models
+                .iter()
+                .map(|m| m[id_field].as_str().unwrap())
+                .collect();
+            assert_eq!(ids, expected, "{key} {path}");
+            if path == "/models" {
+                if let Some(tier) = tier {
+                    for model in models {
+                        assert_eq!(model["default_service_tier"], tier);
+                        assert_eq!(model["service_tiers"].as_array().unwrap().len(), 1);
+                        assert_eq!(model["service_tiers"][0]["id"], tier);
+                    }
+                } else {
+                    assert_eq!(models[0]["service_tiers"].as_array().unwrap().len(), 2);
+                }
+            }
+        }
+    }
+
+    // Withdraw Plus Fast; deprecated fields never grant capability.
+    let mut astra = catalog_model("gpt-6-astra");
+    astra["service_tiers"] = json!([]);
+    astra["additional_speed_tiers"] = json!(["fast"]);
+    let mut o3 = catalog_model("o3");
+    o3["service_tiers"] = json!([]);
+    f.app.pool.set_account_catalog("a1", &[astra, o3]);
+    let fast: Value = f
+        .list_with_key("/v1/models", "test-key-fast")
+        .await
+        .json()
+        .await
+        .unwrap();
+    assert_eq!(fast["data"].as_array().unwrap().len(), 1);
+    f.store.set_account_disabled("a3", true).unwrap();
+    let ultra: Value = f
+        .list_with_key("/models", "test-key-ultrafast")
+        .await
+        .json()
+        .await
+        .unwrap();
+    assert_eq!(ultra["models"], json!([]));
+    f.store.delete_account("a2").unwrap();
+    let fast: Value = f
+        .list_with_key("/models", "test-key-fast")
+        .await
+        .json()
+        .await
+        .unwrap();
+    assert_eq!(fast["models"], json!([]));
+    f.assert_models(&["gpt-6-astra", "o3"]).await;
+}
+
+#[tokio::test]
+async fn deprecated_speed_fields_neither_grant_capability_nor_appear_in_native_discovery() {
+    let f = Fixture::new().await;
+    *f.app.model_version.write().unwrap() = Some("0.159.1".into());
+    for id in ["a2", "a3", "a4"] {
+        f.store.set_account_disabled(id, true).unwrap();
+    }
+    for native in [
+        None,
+        Some(json!([])),
+        Some(Value::Null),
+        Some(json!([{"id":"ultrafast"}])),
+    ] {
+        let mut model = catalog_model("gpt-6-astra");
+        model.as_object_mut().unwrap().remove("service_tiers");
+        model["additional_speed_tiers"] = json!(["fast", "ultrafast"]);
+        if let Some(native) = native {
+            model["service_tiers"] = native;
+        }
+        f.store.set_account_catalog("a1", &[model]).unwrap();
+        f.app.load_cached_catalogs();
+
+        let ordinary: Value = f.list("/models").await.json().await.unwrap();
+        let model = &ordinary["models"][0];
+        assert_eq!(model["slug"], "gpt-6-astra");
+        assert_eq!(model["service_tiers"], json!([]));
+        assert!(model.get("additional_speed_tiers").is_none());
+        for key in ["test-key-fast", "test-key-ultrafast"] {
+            for (path, field) in [("/models", "models"), ("/v1/models", "data")] {
+                let response: Value = f.list_with_key(path, key).await.json().await.unwrap();
+                assert_eq!(response[field], json!([]));
+            }
+        }
+    }
+}
+
+#[tokio::test]
+async fn a_config_model_filter_cannot_manufacture_speed_or_model_permissions() {
+    let f = Fixture::with_models(vec!["gpt-6-sol".into(), "o3".into(), "invented".into()]).await;
+    *f.app.model_version.write().unwrap() = Some("0.159.1".into());
+    let mut model = catalog_model("gpt-6-sol");
+    model["service_tiers"] = json!([]);
+    f.app.pool.set_account_catalog("a1", &[model]);
+    f.app.pool.set_account_models("a2", &["o3".into()]);
+    f.assert_v1_models(&["gpt-6-sol", "o3"]).await;
+    f.assert_codex_models(&["gpt-6-sol"]).await;
+    for key in ["test-key-fast", "test-key-ultrafast"] {
+        for (path, field) in [("/models", "models"), ("/v1/models", "data")] {
+            let body: Value = f.list_with_key(path, key).await.json().await.unwrap();
+            assert_eq!(body[field], json!([]));
+        }
+    }
+}
+
+#[tokio::test]
+async fn withdrawn_speed_and_empty_catalogs_do_not_reappear_from_persisted_metadata() {
+    let f = Fixture::new().await;
+    *f.app.model_version.write().unwrap() = Some("0.159.1".into());
+    for id in ["a2", "a3", "a4"] {
+        f.store.set_account_disabled(id, true).unwrap();
+    }
+    f.store.set_account_plan("a1", "promax").unwrap();
+    let account = f.store.get_account("a1").unwrap();
+    let mut model = catalog_model("gpt-6-astra");
+    model["service_tiers"] = json!([{"id":"ultrafast","name":"Ultrafast","description":"Synthetic Ultrafast capability."}]);
+    f.upstream
+        .lock()
+        .unwrap()
+        .catalog_overrides
+        .insert("a1".into(), json!({"models":[model]}));
+    f.app.refresh_models(&account).await;
+    f.app.pool.set_account_catalog("a1", &[]);
+    f.app.load_cached_catalogs();
+    assert_eq!(
+        f.app.pool.union_models_for_tier(Some("ultrafast")).unwrap(),
+        ["gpt-6-astra"]
+    );
+
+    model["service_tiers"] = json!([]);
+    f.upstream
+        .lock()
+        .unwrap()
+        .catalog_overrides
+        .insert("a1".into(), json!({"models":[model]}));
+    f.app.refresh_models(&account).await;
+    f.app.load_cached_catalogs();
+    assert!(f
+        .app
+        .pool
+        .union_models_for_tier(Some("ultrafast"))
+        .unwrap()
+        .is_empty());
+    assert_eq!(
+        f.store.account_model_catalog("a1").unwrap()[0]["service_tiers"],
+        json!([])
+    );
+
+    f.upstream
+        .lock()
+        .unwrap()
+        .catalog_overrides
+        .insert("a1".into(), json!({"models":[]}));
+    f.app.refresh_models(&account).await;
+    f.app.load_cached_catalogs();
+    assert!(f.store.account_model_catalog("a1").unwrap().is_empty());
+    assert!(f.store.account_models("a1").unwrap().is_empty());
+    f.assert_models(&[]).await;
+}
+
+#[tokio::test]
+async fn usage_polls_keep_plan_eligibility_current_without_replacing_unknown_values() {
+    let f = Fixture::new().await;
+    for id in ["a2", "a3", "a4"] {
+        f.store.set_account_disabled(id, true).unwrap();
+    }
+    let mut model = catalog_model("gpt-6-astra");
+    model["available_in_plans"] = json!(["pro"]);
+    f.app.pool.set_account_catalog("a1", &[model]);
+    assert_eq!(
+        f.app.pool.union_models_for_tier(Some("priority")).unwrap(),
+        ["gpt-6-astra"]
+    );
+    f.upstream.lock().unwrap().usage_plan = "plus".into();
+    f.app
+        .fetch_usage(&f.store.get_account("a1").unwrap())
+        .await
+        .unwrap();
+    assert_eq!(f.store.get_account("a1").unwrap().plan_type, "plus");
+    assert!(f
+        .app
+        .pool
+        .union_models_for_tier(Some("priority"))
+        .unwrap()
+        .is_empty());
+    f.upstream.lock().unwrap().usage_plan = String::new();
+    f.app
+        .fetch_usage(&f.store.get_account("a1").unwrap())
+        .await
+        .unwrap();
+    assert_eq!(f.store.get_account("a1").unwrap().plan_type, "plus");
+}
+
+#[tokio::test]
+async fn malformed_catalog_responses_are_not_treated_as_a_successful_empty_catalog() {
+    let f = Fixture::new().await;
+    *f.app.model_version.write().unwrap() = Some("0.159.1".into());
+    let account = f.store.get_account("a1").unwrap();
+    f.app.refresh_models(&account).await;
+    for payload in [json!({}), json!({"models":null}), json!({"models":[{}]})] {
+        f.upstream
+            .lock()
+            .unwrap()
+            .catalog_overrides
+            .insert("a1".into(), payload);
+        f.app.refresh_models(&account).await;
+        assert!(!f.store.account_model_catalog("a1").unwrap().is_empty());
     }
 }
 

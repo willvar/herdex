@@ -33,6 +33,7 @@ pub struct App {
     /// upstream-rejected body params learned from 400s (non-codex clients
     /// get these pre-stripped so steady state costs no extra upstream request)
     pub learned_strips: Mutex<std::collections::HashSet<String>>,
+    pub routing: Mutex<crate::routing::RoutingBindings>,
 }
 
 /// Per-account single-flight coordinator for reset-credit operations. The
@@ -174,6 +175,17 @@ impl App {
     ) -> reqwest::RequestBuilder {
         let mut rb = rb;
         for (k, v) in &self.cfg.header_defaults {
+            if matches!(
+                k.to_ascii_lowercase().as_str(),
+                "session-id"
+                    | "session_id"
+                    | "thread-id"
+                    | "thread_id"
+                    | "x-client-request-id"
+                    | "x-codex-turn-state"
+            ) {
+                continue;
+            }
             rb = rb.header(k, v);
         }
         if Self::is_codex_client(client_headers) {
@@ -183,7 +195,7 @@ impl App {
                 }
             }
         }
-        for k in ["Session-Id", "X-Client-Request-Id"] {
+        for k in ["Session-Id", "Thread-Id", "X-Client-Request-Id"] {
             if let Some(v) = client_headers.get(k) {
                 rb = rb.header(k, v);
             }
@@ -242,9 +254,23 @@ impl App {
         Ok(())
     }
 
+    /// Maintain credentials even when an account is disabled for routing.
+    async fn refresh_tokens(&self) {
+        let accounts = self.store.list_accounts().unwrap_or_default();
+        for mut a in accounts {
+            let expires_in = a.expires_at - crate::store::now_secs();
+            if expires_in > 600 {
+                continue;
+            }
+            if let Err(e) = self.refresh_expired(&mut a).await {
+                log::warn!("proactive refresh failed for {}: {e}", a.email);
+            }
+        }
+    }
+
     /// Probes the zero-cost usage endpoint for one account and records the
     /// windows into the pool ("default" for the main limit, per-model for
-    /// additional limits like spark). Backfills missing plan_type.
+    /// additional limits like spark). Keeps plan eligibility current.
     pub async fn fetch_usage(&self, acc: &Account) -> Result<usage::Report, String> {
         let report = usage::fetch(
             &self.http,
@@ -254,7 +280,7 @@ impl App {
             &self.cfg.header_defaults,
         )
         .await?;
-        if acc.plan_type.is_empty() && !report.plan_type.is_empty() {
+        if !report.plan_type.is_empty() && acc.plan_type != report.plan_type {
             let _ = self.store.set_account_plan(&acc.id, &report.plan_type);
         }
         self.observe_usage(&acc.id, &report);
@@ -322,13 +348,12 @@ impl App {
         )
         .await
         {
-            Ok(models) if !models.is_empty() => {
+            Ok(models) => {
                 self.pool.set_account_catalog(&a.id, &models);
                 if let Err(e) = self.store.set_account_catalog(&a.id, &models) {
                     log::warn!("model catalog store {}: {e}", a.email);
                 }
             }
-            Ok(_) => {} // empty catalog: keep previous
             Err(e) => log::warn!("models fetch {}: {e}", a.email),
         }
     }
@@ -478,6 +503,17 @@ impl App {
         model: &str,
         seen_generation: u64,
     ) -> Result<AutoResetResult, String> {
+        self.auto_reset_for_tier(acc, model, seen_generation, None)
+            .await
+    }
+
+    pub async fn auto_reset_for_tier(
+        &self,
+        acc: &Account,
+        model: &str,
+        seen_generation: u64,
+        tier: Option<&str>,
+    ) -> Result<AutoResetResult, String> {
         if !self.auto_reset_enabled() {
             return Ok(AutoResetResult::NotNeeded);
         }
@@ -529,6 +565,12 @@ impl App {
                 return Ok(AutoResetResult::NoCard)
             }
             Err(error) => return Err(error),
+        };
+        // Quota/credit queries and waiting for the reset gate can outlive the
+        // account's model/tier eligibility. Recheck after those awaits, before
+        // recording an episode or spending an irreversible credit.
+        let Some(_lease) = self.pool.lease_account_for_tier(&acc.id, model, tier)? else {
+            return Ok(AutoResetResult::NotNeeded);
         };
         let redeem = format!("{}-{}", crate::store::now_secs(), uuid::Uuid::new_v4());
         {
@@ -737,7 +779,7 @@ pub fn build_router(app: AppHandle) -> axum::Router {
 }
 
 /// Background proactive token refresh: every 2 minutes, refresh accounts
-/// whose tokens expire within 10 minutes.
+/// whose tokens expire within 10 minutes, including disabled accounts.
 pub fn spawn_refresh_loop(app: AppHandle) {
     tokio::spawn(async move {
         let mut last_version_check: Option<tokio::time::Instant> = None;
@@ -797,16 +839,7 @@ pub fn spawn_refresh_loop(app: AppHandle) {
                         .store(today, std::sync::atomic::Ordering::Relaxed);
                 }
             }
-            let accounts = app.store.list_accounts().unwrap_or_default();
-            for mut a in accounts {
-                let expires_in = a.expires_at - crate::store::now_secs();
-                if a.disabled || expires_in > 600 {
-                    continue;
-                }
-                if let Err(e) = app.refresh_expired(&mut a).await {
-                    log::warn!("proactive refresh failed for {}: {e}", a.email);
-                }
-            }
+            app.refresh_tokens().await;
             tokio::time::sleep(Duration::from_secs(120)).await;
         }
     });
@@ -819,6 +852,139 @@ fn version_check_due(last: Option<tokio::time::Instant>, now: tokio::time::Insta
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[tokio::test]
+    async fn proactive_refresh_maintains_disabled_tokens_without_enabling_accounts() {
+        use axum::http::StatusCode;
+        use axum::response::IntoResponse;
+        use axum::routing::post;
+        use axum::Json;
+
+        let calls = Arc::new(Mutex::new(Vec::new()));
+        let recorded = calls.clone();
+        let router = Router::new().route(
+            "/oauth/token",
+            post(move |body: String| {
+                let form: HashMap<String, String> = url::form_urlencoded::parse(body.as_bytes())
+                    .into_owned()
+                    .collect();
+                assert_eq!(form["grant_type"], "refresh_token");
+                assert_eq!(form["client_id"], "test-client");
+                let id = form["refresh_token"]
+                    .strip_prefix("test-refresh-")
+                    .unwrap()
+                    .to_owned();
+                recorded.lock().unwrap().push(id.clone());
+                async move {
+                    if id == "disabled-failure" {
+                        return (
+                            StatusCode::BAD_REQUEST,
+                            Json(json!({"error": "invalid_grant"})),
+                        )
+                            .into_response();
+                    }
+                    Json(json!({
+                        "access_token": format!("test-new-access-{id}"),
+                        "refresh_token": format!("test-new-refresh-{id}"),
+                        "expires_in": 3600
+                    }))
+                    .into_response()
+                }
+            }),
+        );
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let issuer = format!("http://{}", listener.local_addr().unwrap());
+        let task = tokio::spawn(async move { axum::serve(listener, router).await.unwrap() });
+        let root = std::env::temp_dir().join(format!("herdex-refresh-{}", uuid::Uuid::new_v4()));
+        let store = Store::open(root.to_str().unwrap()).unwrap();
+        let now = crate::store::now_secs();
+        let accounts = [
+            ("disabled-failure", true, 300),
+            ("enabled-due", false, 300),
+            ("disabled-due", true, 600),
+            ("disabled-expired", true, -60),
+            ("enabled-fresh", false, 7200),
+            ("disabled-fresh", true, 7200),
+        ];
+        for (id, disabled, expires_in) in accounts {
+            store
+                .upsert_account(&Account {
+                    id: id.into(),
+                    email: format!("{id}@example.test"),
+                    access_token: format!("test-access-{id}"),
+                    refresh_token: format!("test-refresh-{id}"),
+                    expires_at: now + expires_in,
+                    disabled,
+                    ..Default::default()
+                })
+                .unwrap();
+        }
+        let app = App {
+            cfg: Config {
+                oauth: crate::config::OAuthCfg {
+                    issuer,
+                    client_id: "test-client".into(),
+                },
+                ..Default::default()
+            },
+            store: store.clone(),
+            pool: Pool::new(store.clone()),
+            http: reqwest::Client::builder()
+                .no_proxy()
+                .timeout(Duration::from_secs(5))
+                .build()
+                .unwrap(),
+            model_version: Default::default(),
+            usage_root: String::new(),
+            pending: Default::default(),
+            refresh_guards: Default::default(),
+            reset_guards: Default::default(),
+            last_prune_day: Default::default(),
+            learned_strips: Default::default(),
+            routing: Default::default(),
+        };
+
+        app.refresh_tokens().await;
+
+        let mut received = calls.lock().unwrap().clone();
+        received.sort();
+        assert_eq!(
+            received,
+            [
+                "disabled-due",
+                "disabled-expired",
+                "disabled-failure",
+                "enabled-due"
+            ]
+        );
+        for (id, disabled, expires_in) in accounts {
+            let account = store.get_account(id).unwrap();
+            assert_eq!(account.disabled, disabled, "{id}");
+            if expires_in <= 600 && id != "disabled-failure" {
+                assert_eq!(account.access_token, format!("test-new-access-{id}"));
+                assert_eq!(account.refresh_token, format!("test-new-refresh-{id}"));
+                assert!(account.expires_at >= now + 3600);
+                assert!(account.expires_at <= crate::store::now_secs() + 3600);
+            } else {
+                assert_eq!(account.access_token, format!("test-access-{id}"));
+                assert_eq!(account.refresh_token, format!("test-refresh-{id}"));
+                assert_eq!(account.expires_at, now + expires_in);
+            }
+        }
+        let candidates = app.pool.candidates("gpt-5.5").unwrap();
+        assert_eq!(candidates.len(), 2);
+        assert!(candidates.iter().all(|account| !account.disabled));
+        assert!(app
+            .pool
+            .lease_account("disabled-due", "gpt-5.5")
+            .unwrap()
+            .is_none());
+
+        task.abort();
+        drop(app);
+        drop(store);
+        std::fs::remove_dir_all(root).unwrap();
+    }
 
     #[test]
     fn check_release_on_start_hourly_when_healthy_and_next_cycle_after_failure() {

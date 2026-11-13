@@ -5,6 +5,7 @@
 
 use crate::app::{App, AppHandle};
 use crate::pool;
+use crate::speed;
 use crate::store::{Account, LogEntry, RequestDiagnostics, Store};
 use crate::usage::{Limit, Window};
 use axum::body::{Body, Bytes};
@@ -31,13 +32,13 @@ const MAX_PREFIX_BYTES: usize = 2 * 1024 * 1024;
 const MAX_OBSERVATION_BYTES: usize = 8 * 1024 * 1024;
 const FAST_MODEL_SUFFIX: &str = "-fast";
 const FAST_KEY_SUFFIX: &str = "-fast";
-const FAST_SERVICE_TIER: &str = "priority";
+const ULTRAFAST_KEY_SUFFIX: &str = "-ultrafast";
 
 pub fn router() -> axum::Router<AppHandle> {
     axum::Router::new()
         // /models is the native Codex catalog; /v1/models is the compact
-        // OpenAI-compatible view. A key ending in -fast receives only
-        // Fast-capable models; its requests are forced to the Fast tier.
+        // OpenAI-compatible view. Derived keys expose only models with an
+        // eligible account for their required speed tier.
         .route("/models", axum::routing::get(models))
         .route("/v1/models", axum::routing::get(v1_models))
         .route("/v1/responses", axum::routing::post(responses))
@@ -88,7 +89,7 @@ pub fn router() -> axum::Router<AppHandle> {
 #[derive(Clone, Debug, PartialEq, Eq)]
 struct ApiAuth {
     key: String,
-    fast: bool,
+    tier: Option<&'static str>,
 }
 
 #[allow(clippy::result_large_err)]
@@ -104,23 +105,33 @@ fn auth_check(app: &App, headers: &HeaderMap) -> Result<ApiAuth, Response> {
     }
 
     // The suffix is a mode selector, not a second stored credential. Validate
-    // the base key before accepting the derived Fast form, so disabling or
-    // deleting one stored key controls both provider forms.
-    let (key, fast) = if let Some(base) = supplied.strip_suffix(FAST_KEY_SUFFIX) {
-        if !base.is_empty() {
+    // the base key before accepting a derived speed form, so disabling or
+    // deleting one stored key controls all three provider forms.
+    for (suffix, tier) in [
+        (ULTRAFAST_KEY_SUFFIX, speed::ULTRAFAST),
+        (FAST_KEY_SUFFIX, speed::FAST),
+    ] {
+        if let Some(base) = supplied
+            .strip_suffix(suffix)
+            .filter(|base| !base.is_empty())
+        {
             match app.store.api_key_valid(base) {
-                Ok(true) => (base.to_string(), true),
-                Ok(false) => (supplied.clone(), false),
+                Ok(true) => {
+                    return Ok(ApiAuth {
+                        key: base.to_string(),
+                        tier: Some(tier),
+                    })
+                }
+                Ok(false) => {}
                 Err(e) => return Err((StatusCode::INTERNAL_SERVER_ERROR, e).into_response()),
             }
-        } else {
-            (supplied.clone(), false)
         }
-    } else {
-        (supplied, false)
-    };
-    match app.store.api_key_valid(&key) {
-        Ok(true) => Ok(ApiAuth { key, fast }),
+    }
+    match app.store.api_key_valid(&supplied) {
+        Ok(true) => Ok(ApiAuth {
+            key: supplied,
+            tier: None,
+        }),
         Ok(false) => Err((StatusCode::UNAUTHORIZED, "invalid api key").into_response()),
         Err(e) => Err((StatusCode::INTERNAL_SERVER_ERROR, e).into_response()),
     }
@@ -133,8 +144,8 @@ async fn models(State(app): State<AppHandle>, headers: HeaderMap) -> Response {
     codex_model_list(app, headers).await
 }
 
-/// OpenAI-compatible model discovery: canonical model IDs. A `-fast` API key
-/// receives only the subset that can use the Fast service tier.
+/// OpenAI-compatible model discovery: canonical IDs, filtered to the speed
+/// tier selected by a derived API key.
 async fn v1_models(State(app): State<AppHandle>, headers: HeaderMap) -> Response {
     compatible_model_list(app, headers).await
 }
@@ -154,7 +165,7 @@ async fn codex_model_list(app: AppHandle, headers: HeaderMap) -> Response {
 
     let allowed = (!app.cfg.models.is_empty())
         .then(|| app.cfg.models.iter().cloned().collect::<BTreeSet<_>>());
-    let mut models = match app.pool.union_model_catalog() {
+    let mut models = match app.pool.union_model_catalog_for_tier(auth.tier) {
         Ok(models) => models,
         Err(e) => return (StatusCode::INTERNAL_SERVER_ERROR, e).into_response(),
     };
@@ -165,13 +176,12 @@ async fn codex_model_list(app: AppHandle, headers: HeaderMap) -> Response {
         allowed
             .as_ref()
             .is_none_or(|allowed| allowed.contains(slug))
-            && (!auth.fast || is_fast_capable_model(slug))
     });
     axum::Json(serde_json::json!({"models": models})).into_response()
 }
 
-/// OpenAI-compatible model discovery: canonical model IDs. A `-fast` API key
-/// receives only the subset that can use the Fast service tier.
+/// OpenAI-compatible model discovery: canonical IDs, filtered to the speed
+/// tier selected by a derived API key.
 async fn compatible_model_list(app: AppHandle, headers: HeaderMap) -> Response {
     let auth = match auth_check(&app, &headers) {
         Ok(auth) => auth,
@@ -184,23 +194,14 @@ async fn compatible_model_list(app: AppHandle, headers: HeaderMap) -> Response {
         )
             .into_response();
     }
-    // priority: config override > upstream-discovered union
-    // No hardcoded fallback: return an empty list when no enabled account
-    // has a known catalog. The background loop collects catalogs on startup
-    // and each cycle.
-    let slugs: Vec<String> = if app.cfg.models.is_empty() {
-        match app.pool.union_models() {
-            Ok(models) => models,
-            Err(e) => return (StatusCode::INTERNAL_SERVER_ERROR, e).into_response(),
-        }
-    } else {
-        app.cfg.models.clone()
+    // Config can narrow discovery, never manufacture account capabilities.
+    let mut model_ids = match app.pool.union_models_for_tier(auth.tier) {
+        Ok(models) => models,
+        Err(e) => return (StatusCode::INTERNAL_SERVER_ERROR, e).into_response(),
     };
-    let model_ids = if auth.fast {
-        fast_model_ids(&slugs)
-    } else {
-        slugs
-    };
+    if !app.cfg.models.is_empty() {
+        model_ids.retain(|model| app.cfg.models.contains(model));
+    }
     let data: Vec<serde_json::Value> = model_ids
         .iter()
         .map(|m| serde_json::json!({"id": m, "object": "model", "owned_by": "openai"}))
@@ -208,23 +209,13 @@ async fn compatible_model_list(app: AppHandle, headers: HeaderMap) -> Response {
     axum::Json(serde_json::json!({"object": "list", "data": data})).into_response()
 }
 
-fn is_fast_capable_model(model: &str) -> bool {
-    matches!(model.get(..4), Some(prefix) if prefix.eq_ignore_ascii_case("gpt-"))
-        && matches!(model.get(4..), Some(rest) if !rest.is_empty())
-        && !model.ends_with(FAST_MODEL_SUFFIX)
-}
-
 fn fast_alias_base(model: &str) -> Option<&str> {
     let base = model.strip_suffix(FAST_MODEL_SUFFIX)?;
-    is_fast_capable_model(base).then_some(base)
-}
-
-fn fast_model_ids(slugs: &[String]) -> Vec<String> {
-    slugs
-        .iter()
-        .filter(|slug| is_fast_capable_model(slug))
-        .cloned()
-        .collect()
+    (matches!(base.get(..4), Some(prefix) if prefix.eq_ignore_ascii_case("gpt-"))
+        && base.len() > 4
+        && !base.ends_with(FAST_MODEL_SUFFIX)
+        && !base.ends_with(ULTRAFAST_KEY_SUFFIX))
+    .then_some(base)
 }
 
 #[derive(Clone, Copy)]
@@ -329,8 +320,8 @@ fn pool_usage_payload(windows: &[PoolUsageWindow], allowed: bool, now: i64) -> s
 
 /// Probe enabled accounts and aggregate each duration independently. Percentages,
 /// calibration weights and the earliest reset all belong to the same group.
-async fn codex_usage_pool(app: &App) -> Response {
-    let accounts = match app.store.list_accounts() {
+async fn codex_usage_pool(app: &App, tier: Option<&str>) -> Response {
+    let accounts = match app.pool.accounts_for_tier(tier) {
         Ok(accounts) => accounts,
         Err(e) => return (StatusCode::INTERNAL_SERVER_ERROR, e).into_response(),
     };
@@ -352,10 +343,7 @@ async fn codex_usage_pool(app: &App) -> Response {
             }
         };
         if let Ok(report) = crate::usage::parse(body.as_bytes()) {
-            if !a.plan_type.is_empty()
-                && !report.plan_type.is_empty()
-                && report.plan_type != a.plan_type
-            {
+            if !report.plan_type.is_empty() && report.plan_type != a.plan_type {
                 log::info!(
                     "plan changed for {}: {} -> {}",
                     a.email,
@@ -367,6 +355,13 @@ async fn codex_usage_pool(app: &App) -> Response {
             app.observe_usage(&a.id, &report);
             collected.push((a.clone(), report));
         }
+    }
+    if tier.is_some() {
+        let eligible = match app.pool.accounts_for_tier(tier) {
+            Ok(accounts) => accounts.into_iter().map(|a| a.id).collect::<BTreeSet<_>>(),
+            Err(error) => return (StatusCode::INTERNAL_SERVER_ERROR, error).into_response(),
+        };
+        collected.retain(|(account, _)| eligible.contains(&account.id));
     }
     if collected.is_empty() {
         return (StatusCode::BAD_GATEWAY, "no account usage probe succeeded").into_response();
@@ -476,7 +471,10 @@ async fn codex_usage(State(app): State<AppHandle>, headers: HeaderMap) -> Respon
             .and_then(|v| v.to_str().ok())
             .unwrap_or("-")
     );
-    codex_usage_pool(&app).await
+    // Preserve the legacy LAN usage-auth contract; valid derived gateway keys
+    // additionally select their own capability-filtered speed pool.
+    let tier = auth_check(&app, &headers).ok().and_then(|auth| auth.tier);
+    codex_usage_pool(&app, tier).await
 }
 
 /// Decides whether one account's failure should move to the next.
@@ -504,13 +502,15 @@ struct PreparedRequest {
 
 enum PrepareError {
     Invalid,
-    FastUnsupported(String),
+    ConflictingTiers,
 }
 
-/// Reads the request metadata while preserving ordinary request bytes. A
-/// `-fast` model alias is the one deliberate exception: it becomes the base
-/// model and forces the upstream Fast service tier.
-fn prepare_request(body: &[u8], fast_mode: bool) -> Result<PreparedRequest, PrepareError> {
+/// Preserves ordinary request bytes. Derived speed keys force their tier;
+/// legacy `-fast` model aliases also normalize the model to its canonical ID.
+fn prepare_request(
+    body: &[u8],
+    forced_tier: Option<&str>,
+) -> Result<PreparedRequest, PrepareError> {
     let mut value: serde_json::Value =
         serde_json::from_slice(body).map_err(|_| PrepareError::Invalid)?;
     let requested_model = value
@@ -524,41 +524,35 @@ fn prepare_request(body: &[u8], fast_mode: bool) -> Result<PreparedRequest, Prep
         _ => None,
     };
 
-    let Some(base_model) = fast_alias_base(&requested_model) else {
-        if fast_mode && !is_fast_capable_model(&requested_model) {
-            return Err(PrepareError::FastUnsupported(requested_model));
-        }
-        if !fast_mode {
-            return Ok(PreparedRequest {
-                model: requested_model,
-                service_tier,
-                body: body.to_vec(),
-            });
-        }
-        let object = value.as_object_mut().ok_or(PrepareError::Invalid)?;
-        object.insert(
-            "service_tier".into(),
-            serde_json::Value::String(FAST_SERVICE_TIER.into()),
-        );
+    let alias = fast_alias_base(&requested_model);
+    if alias.is_some() && forced_tier.is_some_and(|tier| tier != speed::FAST) {
+        return Err(PrepareError::ConflictingTiers);
+    };
+    let tier = forced_tier.or(alias.map(|_| speed::FAST));
+    let Some(tier) = tier else {
         return Ok(PreparedRequest {
             model: requested_model,
-            service_tier: Some(FAST_SERVICE_TIER.into()),
-            body: serde_json::to_vec(&value).map_err(|_| PrepareError::Invalid)?,
+            service_tier,
+            body: body.to_vec(),
         });
     };
-
+    if service_tier
+        .as_deref()
+        .filter(|tier| !matches!(*tier, "" | "default" | "auto"))
+        .is_some_and(|requested| speed::canonical_tier(requested) != tier)
+    {
+        return Err(PrepareError::ConflictingTiers);
+    }
+    let model = alias.unwrap_or(&requested_model).to_owned();
     let object = value.as_object_mut().ok_or(PrepareError::Invalid)?;
-    object.insert(
-        "model".into(),
-        serde_json::Value::String(base_model.to_owned()),
-    );
+    object.insert("model".into(), serde_json::Value::String(model.clone()));
     object.insert(
         "service_tier".into(),
-        serde_json::Value::String(FAST_SERVICE_TIER.into()),
+        serde_json::Value::String(tier.into()),
     );
     Ok(PreparedRequest {
-        model: base_model.to_owned(),
-        service_tier: Some(FAST_SERVICE_TIER.into()),
+        model,
+        service_tier: Some(tier.into()),
         body: serde_json::to_vec(&value).map_err(|_| PrepareError::Invalid)?,
     })
 }
@@ -568,23 +562,28 @@ async fn responses(State(app): State<AppHandle>, headers: HeaderMap, body: Bytes
         Ok(auth) => auth,
         Err(res) => return res,
     };
+    let headers = match crate::routing::normalize_headers(&headers) {
+        Ok(headers) => headers,
+        Err(_) => return (StatusCode::BAD_REQUEST, axum::Json(serde_json::json!({"error": {"code": "invalid_routing_headers", "message": "invalid, duplicate or conflicting routing headers"}}))).into_response(),
+    };
     let PreparedRequest {
         model,
         service_tier,
         body: request_body,
-    } = match prepare_request(&body, auth.fast) {
+    } = match prepare_request(&body, auth.tier) {
         Ok(request) => request,
         Err(PrepareError::Invalid) => return (
             StatusCode::BAD_REQUEST,
             r#"{"error":{"message":"missing \"model\" in request body","type":"server_error"}}"#,
         )
             .into_response(),
-        Err(PrepareError::FastUnsupported(model)) => {
+        Err(PrepareError::ConflictingTiers) => {
             return (
                 StatusCode::BAD_REQUEST,
                 axum::Json(serde_json::json!({
                     "error": {
-                        "message": format!("model {model} does not support Fast mode"),
+                        "message": "conflicting service tier selectors; choose one speed mode",
+                        "code": "conflicting_service_tiers",
                         "type": "invalid_request_error"
                     }
                 })),
@@ -598,16 +597,21 @@ async fn responses(State(app): State<AppHandle>, headers: HeaderMap, body: Bytes
         .and_then(|v| v.to_str().ok())
         .unwrap_or("")
         .to_string();
-    let candidates = match app.pool.select(&model, &session_key) {
+    let routing_tier = speed::required_tier(service_tier.as_deref()).map(str::to_owned);
+    let candidates = match app
+        .pool
+        .select_for_tier(&model, &session_key, routing_tier.as_deref())
+    {
         Ok(c) => c,
         Err(e) => return (StatusCode::INTERNAL_SERVER_ERROR, e).into_response(),
     };
     if candidates.is_empty() {
-        return (
-            StatusCode::SERVICE_UNAVAILABLE,
-            format!("no enabled account can serve model {model}"),
-        )
-            .into_response();
+        return (StatusCode::SERVICE_UNAVAILABLE, axum::Json(serde_json::json!({
+            "error": {
+                "message": format!("no enabled account can serve model {model} at service tier {}", routing_tier.as_deref().unwrap_or("default")),
+                "type": "server_error", "code": "no_eligible_account"
+            }
+        }))).into_response();
     }
     // never-blackout: every eligible candidate gets exactly one attempt;
     // cooled accounts are re-tried only after the pool is exhausted once
@@ -646,7 +650,10 @@ async fn responses(State(app): State<AppHandle>, headers: HeaderMap, body: Bytes
         {
             auto_reset_attempted = true;
             if let Some((acc, seen_generation)) = reset_candidate.take() {
-                match app.auto_reset(&acc, &model, seen_generation).await {
+                match app
+                    .auto_reset_for_tier(&acc, &model, seen_generation, routing_tier.as_deref())
+                    .await
+                {
                     Ok(crate::app::AutoResetResult::Consumed)
                     | Ok(crate::app::AutoResetResult::AlreadyReset) => {
                         retry_account = Some(acc);
@@ -662,7 +669,10 @@ async fn responses(State(app): State<AppHandle>, headers: HeaderMap, body: Bytes
             }
         }
         let selected = if let Some(acc) = retry_account.take() {
-            match app.pool.lease_account(&acc.id, &model) {
+            match app
+                .pool
+                .lease_account_for_tier(&acc.id, &model, routing_tier.as_deref())
+            {
                 Ok(Some(lease)) => Some((acc, lease)),
                 Ok(None) => None,
                 Err(error) => {
@@ -672,7 +682,12 @@ async fn responses(State(app): State<AppHandle>, headers: HeaderMap, body: Bytes
                 }
             }
         } else {
-            match app.pool.lease(&model, &session_key, &attempted_accounts) {
+            match app.pool.lease_for_tier(
+                &model,
+                &session_key,
+                &attempted_accounts,
+                routing_tier.as_deref(),
+            ) {
                 Ok(lease) => lease,
                 Err(error) => {
                     last_status = 500;
@@ -765,7 +780,7 @@ async fn standalone_search(
     headers: HeaderMap,
     body: Bytes,
 ) -> Response {
-    let _auth = match auth_check(&app, &headers) {
+    let auth = match auth_check(&app, &headers) {
         Ok(auth) => auth,
         Err(response) => return response,
     };
@@ -793,7 +808,7 @@ async fn standalone_search(
         .get("Session-Id")
         .and_then(|value| value.to_str().ok())
         .unwrap_or("");
-    let candidates = match app.pool.select(&model, session_key) {
+    let candidates = match app.pool.select_for_tier(&model, session_key, auth.tier) {
         Ok(candidates) => candidates,
         Err(error) => return (StatusCode::INTERNAL_SERVER_ERROR, error).into_response(),
     };
@@ -818,14 +833,18 @@ async fn standalone_search(
     let mut attempted_accounts = BTreeSet::new();
     let mut attempt_number = 0u32;
     while attempted_accounts.len() < attempts {
-        let selected = match app.pool.lease(&model, session_key, &attempted_accounts) {
-            Ok(selected) => selected,
-            Err(error) => {
-                last_status = 500;
-                last_error = error;
-                break;
-            }
-        };
+        let selected =
+            match app
+                .pool
+                .lease_for_tier(&model, session_key, &attempted_accounts, auth.tier)
+            {
+                Ok(selected) => selected,
+                Err(error) => {
+                    last_status = 500;
+                    last_error = error;
+                    break;
+                }
+            };
         let Some((mut account, _lease)) = selected else {
             break;
         };
@@ -1116,6 +1135,8 @@ async fn attempt_once(
     mut observed: StreamLog,
 ) -> AttemptResult {
     let model = request_log.entry.model.clone();
+    let routing_tier =
+        speed::required_tier(request_log.entry.service_tier.as_deref()).map(str::to_owned);
     let url = format!(
         "{}/responses",
         app.cfg.upstream.base_url.trim_end_matches('/')
@@ -1124,12 +1145,25 @@ async fn attempt_once(
     // and retry the same account. Genuine codex requests are accepted as-is,
     // so the byte-for-byte passthrough invariant is untouched in practice.
     let mut body = body.to_vec();
+    let route_scope = crate::routing::scope(
+        &request_log.entry.api_key,
+        session_key,
+        &model,
+        &app.cfg.upstream.base_url,
+    );
+    let route_owner = crate::routing::owner(&acc.id, &acc.account_id, &acc.access_token);
+    let incoming_state = client_headers
+        .get("x-codex-turn-state")
+        .and_then(|v| v.to_str().ok());
     let codex_client = App::is_codex_client(client_headers);
     if !codex_client {
         // apply learned strips up-front so steady state costs no extra
         // upstream request (only the first request after each discovery pays)
         let learned = app.learned_strips.lock().unwrap().clone();
         for p in &learned {
+            if routing_tier.is_some() && (p == "service_tier" || p.starts_with("service_tier.")) {
+                continue;
+            }
             if let Some(nb) = remove_param(&body, p) {
                 body = nb;
             }
@@ -1156,7 +1190,15 @@ async fn attempt_once(
             )
             .bearer_auth(&acc.access_token)
             .header("Chatgpt-Account-Id", &acc.account_id);
-        let rb = app.apply_identity(rb, client_headers);
+        let mut rb = app.apply_identity(rb, client_headers);
+        if let Some(token) = app
+            .routing
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .request_token(&route_scope, incoming_state, &route_owner)
+        {
+            rb = rb.header("x-codex-turn-state", token);
+        }
         let res = rb.body(body.clone()).send().await;
         let mut res = match res {
             Ok(r) => r,
@@ -1184,8 +1226,7 @@ async fn attempt_once(
             let mut rl = String::new();
             for (k, v) in res.headers() {
                 let name = k.as_str();
-                if name.starts_with("x-codex")
-                    || name.contains("used-percent")
+                if name.contains("used-percent")
                     || name.contains("window-minutes")
                     || name.contains("reset-at")
                     || name.contains("reset-after")
@@ -1290,12 +1331,21 @@ async fn attempt_once(
             observed.record(Some(&code), false);
             if status == 400 {
                 if let Some(param) = rejected_param(&snippet) {
-                    if let Some(nb) = remove_param(&body, &param) {
+                    let protected_tier = routing_tier.is_some()
+                        && (param == "service_tier" || param.starts_with("service_tier."));
+                    if let Some(nb) = (!protected_tier)
+                        .then(|| remove_param(&body, &param))
+                        .flatten()
+                    {
                         if !codex_client {
                             app.learn_strip(param);
                         }
                         body = nb;
-                        let lease = match app.pool.lease_account(&acc.id, &model) {
+                        let lease = match app.pool.lease_account_for_tier(
+                            &acc.id,
+                            &model,
+                            routing_tier.as_deref(),
+                        ) {
                             Ok(Some(lease)) => lease,
                             Ok(None) => {
                                 return Err(AttemptFailure::http(
@@ -1331,7 +1381,26 @@ async fn attempt_once(
         break res;
     };
     let status = res.status().as_u16();
-    let resp_headers = res.headers().clone();
+    let mut resp_headers = res.headers().clone();
+    if status == 200 {
+        if let Some(returned) = res
+            .headers()
+            .get("x-codex-turn-state")
+            .and_then(|v| v.to_str().ok())
+        {
+            let canonical = app
+                .routing
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .remember(&route_scope, incoming_state, &route_owner, returned);
+            resp_headers.remove("x-codex-turn-state");
+            if let Some(value) =
+                canonical.and_then(|token| reqwest::header::HeaderValue::from_str(&token).ok())
+            {
+                resp_headers.insert("x-codex-turn-state", value);
+            }
+        }
+    }
 
     // success status, BUT the upstream may carry in-stream error events
     // inside 200 streams (chatgpt.com sends server_is_overloaded/slow_down
@@ -1425,7 +1494,7 @@ async fn attempt_once(
     {
         rewrite_pool_usage_headers(
             out.headers_mut().unwrap(),
-            &pool_usage_windows(app).unwrap_or_default(),
+            &pool_usage_windows(app, routing_tier.as_deref()).unwrap_or_default(),
             crate::store::now_secs(),
         );
     }
@@ -1960,8 +2029,8 @@ fn weighted_used(entries: &[(f64, Option<f64>)]) -> f64 {
 
 /// Outbound headers use the latest account-level probe snapshots and the same
 /// duration grouping as the usage endpoint, ignoring disabled/deleted accounts.
-fn pool_usage_windows(app: &App) -> Option<Vec<PoolUsageWindow>> {
-    let accounts = app.store.list_accounts().ok()?;
+fn pool_usage_windows(app: &App, tier: Option<&str>) -> Option<Vec<PoolUsageWindow>> {
+    let accounts = app.pool.accounts_for_tier(tier).ok()?;
     let snap = app.pool.snapshot();
     let mut entries = Vec::new();
     for acc in accounts.into_iter().filter(|a| !a.disabled) {
@@ -2396,16 +2465,11 @@ mod tests {
     }
 
     #[test]
-    fn fast_filter_is_gpt_only_and_aliases_are_not_recursive() {
-        let slugs = [
-            "o3".to_string(),
-            "gpt-5.5".to_string(),
-            "gpt-5.5-fast".to_string(),
-        ];
-        assert_eq!(fast_model_ids(&slugs), ["gpt-5.5"]);
+    fn legacy_fast_aliases_are_not_recursive() {
         assert_eq!(fast_alias_base("gpt-5.5-fast"), Some("gpt-5.5"));
         assert_eq!(fast_alias_base("o3-fast"), None);
         assert_eq!(fast_alias_base("gpt-5.5-fast-fast"), None);
+        assert_eq!(fast_alias_base("gpt-6-astra-ultrafast-fast"), None);
     }
 
     #[test]

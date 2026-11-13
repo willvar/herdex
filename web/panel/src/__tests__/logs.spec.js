@@ -58,11 +58,11 @@ enableAutoUnmount(afterEach)
 describe('Request tier display', () => {
   it('distinguishes Fast requests, omitted tiers, and unrecorded history', () => {
     store.st = {
-      logs: ['priority', 'fast', 'default', '', null, undefined, 'flex'].map(service_tier => ({ service_tier })),
+      logs: ['priority', 'fast', 'ultrafast', 'default', '', null, undefined, 'flex'].map(service_tier => ({ service_tier })),
     }
     const wrapper = mount(Logs)
     expect(wrapper.findAll('[data-testid="tier"]').map(cell => cell.text())).toEqual([
-      'Fast', 'Fast', 'default', '未指定', '未记录', '未记录', 'flex',
+      'Fast', 'Fast', 'Ultrafast', 'default', '未指定', '未记录', '未记录', 'flex',
     ])
   })
 

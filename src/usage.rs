@@ -645,15 +645,19 @@ pub async fn fetch_model_catalog(
     }
     let v: serde_json::Value =
         serde_json::from_str(&body).map_err(|e| format!("models decode: {e}"))?;
-    Ok(v.get("models")
-        .and_then(|m| m.as_array())
-        .map(|arr| {
-            arr.iter()
-                .filter(|m| m.get("slug").and_then(|s| s.as_str()).is_some())
-                .cloned()
-                .collect()
-        })
-        .unwrap_or_default())
+    let models = v
+        .get("models")
+        .and_then(serde_json::Value::as_array)
+        .ok_or_else(|| "models response has no model array".to_owned())?;
+    if models.iter().any(|model| {
+        model
+            .get("slug")
+            .and_then(serde_json::Value::as_str)
+            .is_none_or(str::is_empty)
+    }) {
+        return Err("models response contains an invalid model entry".into());
+    }
+    Ok(models.clone())
 }
 
 pub async fn fetch_model_slugs(

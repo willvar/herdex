@@ -17,18 +17,21 @@ use std::time::Duration;
 use tokio::sync::mpsc;
 
 type StreamChunk = Result<Bytes, std::io::Error>;
+type ResponseHook = Arc<dyn Fn() + Send + Sync>;
 
 #[derive(Clone)]
 struct FakeUp {
     calls: Arc<Mutex<Vec<String>>>, // chatgpt-account-id seen per call
     bodies: Arc<Mutex<Vec<String>>>,
     auths: Arc<Mutex<Vec<String>>>,
+    request_headers: Arc<Mutex<Vec<HeaderMap>>>,
     behavior: Arc<Mutex<Behavior>>,
     search_behavior: Arc<Mutex<SearchBehavior>>,
     usage: Arc<Mutex<HashMap<String, (StatusCode, Value)>>>,
     response_headers: Arc<Mutex<HeaderMap>>,
     reset_credits: Arc<Mutex<Value>>,
     reset_consumes: Arc<Mutex<Vec<Value>>>,
+    on_response: Arc<Mutex<Option<ResponseHook>>>,
 }
 
 #[derive(Clone)]
@@ -140,7 +143,11 @@ impl FakeUp {
                     .to_string();
                 self.calls.lock().unwrap().push(acct);
                 self.bodies.lock().unwrap().push(body.clone());
+                self.request_headers.lock().unwrap().push(headers.clone());
                 let behavior = self.behavior.lock().unwrap().clone();
+                if let Some(hook) = self.on_response.lock().unwrap().clone() {
+                    hook();
+                }
                 let n = self.calls.lock().unwrap().len();
                 if let Behavior::HttpErrorFirst(status, text, count) = &behavior {
                     if n <= *count {
@@ -298,11 +305,21 @@ async fn harness_with_search_timeout(accounts: &[&str], search_timeout_seconds: 
             .unwrap();
     }
     let pool = Pool::new(store.clone());
+    for id in accounts {
+        pool.set_account_catalog(
+            id,
+            &[json!({
+                "slug": "gpt-5.5",
+                "service_tiers": [{"id": "priority", "name": "Fast", "description": "Synthetic Fast capability."}]
+            })],
+        );
+    }
 
     let upstream = FakeUp {
         calls: Arc::new(Mutex::new(Vec::new())),
         bodies: Arc::new(Mutex::new(Vec::new())),
         auths: Arc::new(Mutex::new(Vec::new())),
+        request_headers: Default::default(),
         behavior: Arc::new(Mutex::new(Behavior::Ok)),
         search_behavior: Arc::new(Mutex::new(SearchBehavior::Ok)),
         usage: Default::default(),
@@ -312,6 +329,7 @@ async fn harness_with_search_timeout(accounts: &[&str], search_timeout_seconds: 
             "credits": []
         }))),
         reset_consumes: Arc::new(Mutex::new(Vec::new())),
+        on_response: Default::default(),
     };
     let up_router = upstream.clone().router();
     let up_listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
@@ -345,6 +363,7 @@ async fn harness_with_search_timeout(accounts: &[&str], search_timeout_seconds: 
         pending: Mutex::new(Default::default()),
         last_prune_day: std::sync::atomic::AtomicI64::new(0),
         learned_strips: std::sync::Mutex::new(std::collections::HashSet::new()),
+        routing: Default::default(),
         refresh_guards: tokio::sync::Mutex::new(HashMap::new()),
         reset_guards: Mutex::new(HashMap::new()),
     });
@@ -1201,14 +1220,468 @@ async fn fast_key_rejects_a_model_outside_the_fast_catalog() {
         .unwrap();
     let status = response.status();
     let text = response.text().await.unwrap();
-    assert_eq!(status, StatusCode::BAD_REQUEST, "response body: {text}");
+    assert_eq!(
+        status,
+        StatusCode::SERVICE_UNAVAILABLE,
+        "response body: {text}"
+    );
     let body: Value = serde_json::from_str(&text).unwrap();
-    assert_eq!(body["error"]["type"], "invalid_request_error");
+    assert_eq!(body["error"]["code"], "no_eligible_account");
     assert!(body["error"]["message"]
         .as_str()
         .unwrap()
-        .contains("does not support Fast mode"));
+        .contains("service tier priority"));
     assert!(h.upstream.bodies.lock().unwrap().is_empty());
+}
+
+fn set_speed_catalog(h: &Harness, id: &str, plan: &str, model: &str, tiers: &[&str]) {
+    h.store.set_account_plan(id, plan).unwrap();
+    h.pool.set_account_catalog(id, &[json!({
+        "slug": model,
+        "available_in_plans": [plan],
+        "service_tiers": tiers.iter().map(|id| json!({"id":id,"name":id,"description":"Synthetic capability fixture."})).collect::<Vec<_>>()
+    })]);
+}
+
+#[tokio::test]
+async fn ultrafast_filters_mixed_plans_and_preserves_the_tier_during_failover() {
+    let h = harness(&["plus", "small", "pro", "max-a", "max-b", "unknown"]).await;
+    for (id, plan, tiers) in [
+        ("plus", "plus", vec!["priority"]),
+        ("small", "prolite", vec!["priority"]),
+        ("pro", "pro", vec!["priority"]),
+        ("max-a", "promax", vec!["priority", "ultrafast"]),
+        ("max-b", "promax", vec!["ultrafast"]),
+        ("unknown", "promax", vec![]),
+    ] {
+        set_speed_catalog(&h, id, plan, "gpt-6-astra", &tiers);
+    }
+    h.pool.pin("shared", "plus", "gpt-6-astra");
+    *h.upstream.behavior.lock().unwrap() = Behavior::StreamErrorFirst(1);
+    let response = reqwest::Client::new()
+        .post(format!("{}/v1/responses", h.proxy_url))
+        .bearer_auth("sk-test-ultrafast")
+        .header("Session-Id", "shared")
+        .json(&json!({"model":"gpt-6-astra","input":"hi"}))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(response.status(), 200);
+    response.bytes().await.unwrap();
+    let calls = h.upstream.calls.lock().unwrap();
+    assert_eq!(calls.len(), 2);
+    assert!(calls.iter().all(|id| id.starts_with("chat-max-")));
+    assert_ne!(calls[0], calls[1]);
+    drop(calls);
+    for body in h.upstream.bodies.lock().unwrap().iter() {
+        assert_eq!(
+            serde_json::from_str::<Value>(body).unwrap()["service_tier"],
+            "ultrafast"
+        );
+    }
+    let logs = h.store.recent_logs(5).unwrap();
+    assert_eq!(logs.len(), 2);
+    assert!(logs
+        .iter()
+        .all(|log| log.api_key == "sk-test" && log.service_tier.as_deref() == Some("ultrafast")));
+}
+
+#[tokio::test]
+async fn fast_support_can_be_withdrawn_from_plus_without_changing_plan_policy() {
+    let h = harness(&["plus", "pro"]).await;
+    set_speed_catalog(&h, "plus", "plus", "gpt-5.5", &["priority"]);
+    set_speed_catalog(&h, "pro", "pro", "gpt-5.5", &[]);
+    let client = reqwest::Client::new();
+    for key in ["sk-test", "sk-test-fast"] {
+        let response = client
+            .post(format!("{}/v1/responses", h.proxy_url))
+            .bearer_auth(key)
+            .json(&json!({"model":"gpt-5.5","input":"hi","service_tier":"priority"}))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(response.status(), 200);
+        response.bytes().await.unwrap();
+        set_speed_catalog(&h, "plus", "plus", "gpt-5.5", &[]);
+        set_speed_catalog(&h, "pro", "pro", "gpt-5.5", &["priority"]);
+    }
+    assert_eq!(*h.upstream.calls.lock().unwrap(), ["chat-plus", "chat-pro"]);
+    set_speed_catalog(&h, "pro", "pro", "gpt-5.5", &[]);
+    let response = client
+        .post(format!("{}/v1/responses", h.proxy_url))
+        .bearer_auth("sk-test-fast")
+        .json(&json!({"model":"gpt-5.5","input":"hi"}))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(response.status(), 503);
+    assert_eq!(
+        response.json::<Value>().await.unwrap()["error"]["code"],
+        "no_eligible_account"
+    );
+    assert_eq!(h.upstream.calls.lock().unwrap().len(), 2);
+    let response = send_post(&h, "gpt-5.5", "ordinary").await;
+    assert_eq!(response.status(), 200);
+    response.bytes().await.unwrap();
+}
+
+#[tokio::test]
+async fn accelerated_tiers_cannot_be_removed_by_parameter_healing_or_old_learned_strips() {
+    for (key, tier) in [
+        ("sk-test-fast", "priority"),
+        ("sk-test-ultrafast", "ultrafast"),
+    ] {
+        for learned in [false, true] {
+            let h = harness(&["a1"]).await;
+            set_speed_catalog(&h, "a1", "promax", "gpt-6-astra", &[tier]);
+            if learned {
+                h.app
+                    .learned_strips
+                    .lock()
+                    .unwrap()
+                    .insert("service_tier".into());
+            }
+            *h.upstream.behavior.lock().unwrap() = Behavior::HttpErrorFirst(
+                400,
+                json!({"error":{"message":"Unsupported parameter: service_tier"}}).to_string(),
+                1,
+            );
+            let response = reqwest::Client::new()
+                .post(format!("{}/v1/responses", h.proxy_url))
+                .bearer_auth(key)
+                .json(&json!({"model":"gpt-6-astra","input":"hi"}))
+                .send()
+                .await
+                .unwrap();
+            assert_eq!(response.status(), 400);
+            response.bytes().await.unwrap();
+            let bodies = h.upstream.bodies.lock().unwrap();
+            assert_eq!(bodies.len(), 1, "must not retry at a different speed");
+            assert_eq!(
+                serde_json::from_str::<Value>(&bodies[0]).unwrap()["service_tier"],
+                tier
+            );
+            assert_eq!(
+                h.app
+                    .learned_strips
+                    .lock()
+                    .unwrap()
+                    .contains("service_tier"),
+                learned
+            );
+        }
+    }
+}
+
+#[tokio::test]
+async fn conflicting_speed_selectors_are_rejected_without_an_upstream_request() {
+    let h = harness(&["a1"]).await;
+    for (key, model, tier) in [
+        ("sk-test-fast", "gpt-5.5", "ultrafast"),
+        ("sk-test-ultrafast", "gpt-5.5", "priority"),
+        ("sk-test-ultrafast", "gpt-5.5-fast", "default"),
+    ] {
+        let response = reqwest::Client::new()
+            .post(format!("{}/v1/responses", h.proxy_url))
+            .bearer_auth(key)
+            .json(&json!({"model":model,"service_tier":tier,"input":"hi"}))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(response.status(), 400);
+        assert_eq!(
+            response.json::<Value>().await.unwrap()["error"]["code"],
+            "conflicting_service_tiers"
+        );
+    }
+    assert!(h.upstream.calls.lock().unwrap().is_empty());
+}
+
+#[tokio::test]
+async fn all_speed_keys_share_base_key_revocation() {
+    let h = harness(&["a1"]).await;
+    h.store.set_api_key_disabled("sk-test", true).unwrap();
+    for deleted in [false, true] {
+        if deleted {
+            h.store.delete_api_key("sk-test").unwrap();
+        }
+        for key in ["sk-test", "sk-test-fast", "sk-test-ultrafast"] {
+            let response = reqwest::Client::new()
+                .post(format!("{}/v1/responses", h.proxy_url))
+                .bearer_auth(key)
+                .json(&json!({"model":"gpt-5.5","input":"hi"}))
+                .send()
+                .await
+                .unwrap();
+            assert_eq!(response.status(), 401);
+        }
+    }
+    assert!(h.upstream.calls.lock().unwrap().is_empty());
+}
+
+#[tokio::test]
+async fn a_non_gpt_model_can_use_fast_when_the_account_catalog_advertises_it() {
+    let h = harness(&["plus"]).await;
+    set_speed_catalog(&h, "plus", "plus", "o3", &["priority"]);
+    let response = reqwest::Client::new()
+        .post(format!("{}/v1/responses", h.proxy_url))
+        .bearer_auth("sk-test-fast")
+        .json(&json!({"model":"o3","input":"hi"}))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(response.status(), 200);
+    response.bytes().await.unwrap();
+    assert_eq!(
+        serde_json::from_str::<Value>(&h.upstream.bodies.lock().unwrap()[0]).unwrap()
+            ["service_tier"],
+        "priority"
+    );
+}
+
+#[tokio::test]
+async fn retries_and_auto_reset_recheck_speed_capability_before_reusing_an_account() {
+    for behavior in [
+        Behavior::StreamErrorFirst(1),
+        Behavior::HttpErrorFirst(
+            400,
+            json!({"error":{"message":"Unsupported parameter: max_output_tokens"}}).to_string(),
+            1,
+        ),
+        Behavior::HttpErrorFirst(
+            429,
+            json!({"error":{"code":"usage_limit_reached"}}).to_string(),
+            1,
+        ),
+    ] {
+        let h = harness(&["a1"]).await;
+        set_speed_catalog(&h, "a1", "promax", "gpt-6-astra", &["ultrafast"]);
+        h.store
+            .put_settings(&Settings {
+                auto_reset_enabled: true,
+                ..Default::default()
+            })
+            .unwrap();
+        set_usage(
+            &h,
+            "a1",
+            account_usage(
+                "promax",
+                usage_window(100, 604800, herdex::store::now_secs() + 86400),
+                Value::Null,
+            ),
+        );
+        *h.upstream.reset_credits.lock().unwrap() =
+            json!({"available_count":1,"credits":[{"id":"test-credit","status":"available"}]});
+        let pool = h.pool.clone();
+        *h.upstream.on_response.lock().unwrap() = Some(Arc::new(move || {
+            pool.set_account_catalog("a1", &[json!({"slug":"gpt-6-astra","service_tiers":[]})]);
+        }));
+        *h.upstream.behavior.lock().unwrap() = behavior;
+        let response = reqwest::Client::new()
+            .post(format!("{}/v1/responses", h.proxy_url))
+            .bearer_auth("sk-test-ultrafast")
+            .json(&json!({"model":"gpt-6-astra","input":"hi","max_output_tokens":10}))
+            .send()
+            .await
+            .unwrap();
+        assert!(!response.status().is_success());
+        response.bytes().await.unwrap();
+        assert_eq!(h.upstream.calls.lock().unwrap().len(), 1);
+        assert!(h.upstream.reset_consumes.lock().unwrap().is_empty());
+    }
+}
+
+#[tokio::test]
+async fn automatic_reset_rechecks_speed_eligibility_after_its_fresh_usage_poll() {
+    for (reported_plan, expected_status, expected_consumes) in
+        [("promax", 200, 1), ("plus", 429, 0)]
+    {
+        let h = harness(&["max"]).await;
+        set_speed_catalog(&h, "max", "promax", "gpt-6-astra", &["ultrafast"]);
+        h.store
+            .put_settings(&Settings {
+                auto_reset_enabled: true,
+                ..Default::default()
+            })
+            .unwrap();
+        set_usage(
+            &h,
+            "max",
+            account_usage(
+                reported_plan,
+                usage_window(100, 604800, herdex::store::now_secs() + 86400),
+                Value::Null,
+            ),
+        );
+        *h.upstream.reset_credits.lock().unwrap() =
+            json!({"available_count":1,"credits":[{"id":"test-credit","status":"available"}]});
+        *h.upstream.behavior.lock().unwrap() = Behavior::HttpErrorFirst(
+            429,
+            json!({"error":{"code":"usage_limit_reached"}}).to_string(),
+            1,
+        );
+        let response = reqwest::Client::new()
+            .post(format!("{}/v1/responses", h.proxy_url))
+            .bearer_auth("sk-test-ultrafast")
+            .json(&json!({"model":"gpt-6-astra","input":"hi"}))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(response.status(), expected_status, "{reported_plan}");
+        response.bytes().await.unwrap();
+        assert_eq!(h.store.get_account("max").unwrap().plan_type, reported_plan);
+        assert_eq!(
+            h.upstream.reset_consumes.lock().unwrap().len(),
+            expected_consumes
+        );
+        assert_eq!(
+            h.upstream.calls.lock().unwrap().len(),
+            1 + expected_consumes
+        );
+        for body in h.upstream.bodies.lock().unwrap().iter() {
+            assert_eq!(
+                serde_json::from_str::<Value>(body).unwrap()["service_tier"],
+                "ultrafast"
+            );
+        }
+    }
+}
+
+#[tokio::test]
+async fn an_explicit_ultrafast_tier_on_the_normal_key_needs_positive_capability_data() {
+    let h = harness(&["max"]).await;
+    set_speed_catalog(&h, "max", "promax", "gpt-6-astra", &[]);
+    let client = reqwest::Client::new();
+    let body = json!({"model":"gpt-6-astra","input":"hi","service_tier":"ultrafast"});
+    let response = client
+        .post(format!("{}/v1/responses", h.proxy_url))
+        .bearer_auth("sk-test")
+        .json(&body)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(response.status(), 503);
+    assert!(h.upstream.calls.lock().unwrap().is_empty());
+    h.pool.set_account_catalog(
+        "max",
+        &[json!({"slug":"gpt-6-astra","additional_speed_tiers":["ultrafast"]})],
+    );
+    for key in ["sk-test", "sk-test-ultrafast"] {
+        let response = client
+            .post(format!("{}/v1/responses", h.proxy_url))
+            .bearer_auth(key)
+            .json(&body)
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(
+            response.status(),
+            503,
+            "deprecated fields grant no capability"
+        );
+    }
+    assert!(h.upstream.calls.lock().unwrap().is_empty());
+    set_speed_catalog(&h, "max", "promax", "gpt-6-astra", &["ultrafast"]);
+    let response = client
+        .post(format!("{}/v1/responses", h.proxy_url))
+        .bearer_auth("sk-test")
+        .json(&body)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(response.status(), 200);
+    response.bytes().await.unwrap();
+    assert_eq!(
+        serde_json::from_str::<Value>(&h.upstream.bodies.lock().unwrap()[0]).unwrap(),
+        body
+    );
+}
+
+#[tokio::test]
+async fn speed_pool_usage_and_response_headers_exclude_ineligible_account_capacity() {
+    let h = harness(&["plus", "max"]).await;
+    set_speed_catalog(&h, "plus", "plus", "gpt-6-astra", &["priority"]);
+    set_speed_catalog(&h, "max", "promax", "gpt-6-astra", &["ultrafast"]);
+    let reset = herdex::store::now_secs() + 86400;
+    set_usage(
+        &h,
+        "plus",
+        account_usage("plus", usage_window(10, 604800, reset), Value::Null),
+    );
+    set_usage(
+        &h,
+        "max",
+        account_usage("promax", usage_window(80, 604800, reset), Value::Null),
+    );
+    let client = reqwest::Client::new();
+    for (key, expected) in [
+        ("sk-test", 45.0),
+        ("sk-test-fast", 10.0),
+        ("sk-test-ultrafast", 80.0),
+    ] {
+        let response = client
+            .get(format!("{}/api/codex/usage", h.proxy_url))
+            .bearer_auth(key)
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(response.status(), 200);
+        let body: Value = response.json().await.unwrap();
+        assert_eq!(
+            body["rate_limit"]["primary_window"]["used_percent"].as_f64(),
+            Some(expected)
+        );
+    }
+    h.upstream
+        .response_headers
+        .lock()
+        .unwrap()
+        .insert("x-codex-primary-used-percent", "11".parse().unwrap());
+    let response = client
+        .post(format!("{}/v1/responses", h.proxy_url))
+        .bearer_auth("sk-test-ultrafast")
+        .json(&json!({"model":"gpt-6-astra","input":"hi"}))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(response.status(), 200);
+    assert_eq!(response.headers()["x-codex-primary-used-percent"], "80");
+    response.bytes().await.unwrap();
+    set_speed_catalog(&h, "max", "promax", "gpt-6-astra", &[]);
+    let response = client
+        .get(format!("{}/api/codex/usage", h.proxy_url))
+        .bearer_auth("sk-test-ultrafast")
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(
+        response.status(),
+        502,
+        "an empty speed pool is not zero usage"
+    );
+}
+
+#[tokio::test]
+async fn standalone_search_uses_the_speed_pool_without_inventing_a_search_service_tier() {
+    let h = harness(&["plus", "max"]).await;
+    set_speed_catalog(&h, "plus", "plus", "gpt-6-astra", &["priority"]);
+    set_speed_catalog(&h, "max", "promax", "gpt-6-astra", &["ultrafast"]);
+    let body = json!({"model":"gpt-6-astra","commands":{"search_query":[{"q":"example"}]}});
+    let response = reqwest::Client::new()
+        .post(format!("{}/v1/alpha/search", h.proxy_url))
+        .bearer_auth("sk-test-ultrafast")
+        .json(&body)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(response.status(), 200);
+    response.bytes().await.unwrap();
+    assert_eq!(*h.upstream.calls.lock().unwrap(), ["chat-max"]);
+    assert_eq!(
+        serde_json::from_str::<Value>(&h.upstream.bodies.lock().unwrap()[0]).unwrap(),
+        body
+    );
 }
 
 #[tokio::test]
@@ -2366,6 +2839,7 @@ async fn full_router_assembles_and_serves_panel() {
             pending: Mutex::new(Default::default()),
             last_prune_day: std::sync::atomic::AtomicI64::new(0),
             learned_strips: std::sync::Mutex::new(std::collections::HashSet::new()),
+            routing: Default::default(),
             refresh_guards: tokio::sync::Mutex::new(HashMap::new()),
             reset_guards: Mutex::new(HashMap::new()),
         })
@@ -2527,4 +3001,129 @@ fn retention_days_config_default_and_zero() {
         0
     );
     let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[tokio::test]
+async fn routing_aliases_are_normalized_and_conflicts_never_reach_upstream() {
+    tokio::time::timeout(Duration::from_secs(10), async {
+        let h = harness(&["account-a"]).await;
+        let client = reqwest::Client::new();
+        let response = client
+            .post(format!("{}/v1/responses", h.proxy_url))
+            .bearer_auth("sk-test")
+            .header("session_id", "conversation")
+            .header("thread_id", "thread")
+            .json(&json!({"model":"gpt-5.5", "input":"fixture"}))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        response.text().await.unwrap();
+        {
+            let seen = h.upstream.request_headers.lock().unwrap();
+            assert_eq!(seen[0]["session-id"], "conversation");
+            assert_eq!(seen[0]["thread-id"], "thread");
+            assert!(!seen[0].contains_key("session_id"));
+        }
+        let response = client
+            .post(format!("{}/v1/responses", h.proxy_url))
+            .bearer_auth("sk-test")
+            .header("session-id", "a")
+            .header("session_id", "b")
+            .json(&json!({"model":"gpt-5.5", "input":"fixture"}))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+        assert_eq!(h.upstream.calls.lock().unwrap().len(), 1);
+    })
+    .await
+    .expect("routing header test timed out");
+}
+
+#[tokio::test]
+async fn routing_first_state_survives_continuations_but_not_account_or_caller_changes() {
+    tokio::time::timeout(Duration::from_secs(15), async {
+        let h = harness(&["account-a", "account-b"]).await;
+        let client = reqwest::Client::new();
+        let send = |key: &str, session: &str, token: Option<&str>| {
+            let mut request = client
+                .post(format!("{}/v1/responses", h.proxy_url))
+                .bearer_auth(key)
+                .header("Session-Id", session)
+                .json(&json!({"model":"gpt-5.5", "input":"fixture"}));
+            if let Some(token) = token {
+                request = request.header("x-codex-turn-state", token);
+            }
+            request.send()
+        };
+        h.upstream
+            .response_headers
+            .lock()
+            .unwrap()
+            .insert("x-codex-turn-state", "state-a".parse().unwrap());
+        let response = send("sk-test", "conversation", None).await.unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        assert_eq!(response.headers()["x-codex-turn-state"], "state-a");
+        response.text().await.unwrap();
+        let first_account = h.upstream.calls.lock().unwrap()[0].clone();
+        h.upstream
+            .response_headers
+            .lock()
+            .unwrap()
+            .insert("x-codex-turn-state", "later-state".parse().unwrap());
+        let response = send("sk-test", "conversation", Some("state-a"))
+            .await
+            .unwrap();
+        assert_eq!(response.headers()["x-codex-turn-state"], "state-a");
+        response.text().await.unwrap();
+        assert_eq!(
+            h.upstream.request_headers.lock().unwrap()[1]["x-codex-turn-state"],
+            "state-a"
+        );
+        let first_id = h
+            .store
+            .list_accounts()
+            .unwrap()
+            .into_iter()
+            .find(|account| account.account_id == first_account)
+            .unwrap()
+            .id;
+        h.store.set_account_disabled(&first_id, true).unwrap();
+        h.upstream
+            .response_headers
+            .lock()
+            .unwrap()
+            .insert("x-codex-turn-state", "state-b".parse().unwrap());
+        let response = send("sk-test", "conversation", Some("state-a"))
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        assert_eq!(response.headers()["x-codex-turn-state"], "state-b");
+        response.text().await.unwrap();
+        assert!(!h.upstream.request_headers.lock().unwrap()[2].contains_key("x-codex-turn-state"));
+        assert_ne!(h.upstream.calls.lock().unwrap()[2], first_account);
+        // The client can keep its first value; the gateway maps it only to this owner.
+        let response = send("sk-test", "conversation", Some("state-a"))
+            .await
+            .unwrap();
+        response.text().await.unwrap();
+        assert_eq!(
+            h.upstream.request_headers.lock().unwrap()[3]["x-codex-turn-state"],
+            "state-b"
+        );
+        let response = send("sk-test", "other-conversation", Some("state-a"))
+            .await
+            .unwrap();
+        response.text().await.unwrap();
+        assert!(!h.upstream.request_headers.lock().unwrap()[4].contains_key("x-codex-turn-state"));
+        h.store.add_api_key("sk-other", "isolated caller").unwrap();
+        let response = send("sk-other", "conversation", Some("state-a"))
+            .await
+            .unwrap();
+        response.text().await.unwrap();
+        assert!(!h.upstream.request_headers.lock().unwrap()[5].contains_key("x-codex-turn-state"));
+    })
+    .await
+    .expect("routing ownership test timed out");
 }

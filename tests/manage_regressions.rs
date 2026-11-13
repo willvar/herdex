@@ -41,6 +41,7 @@ impl Server {
             reset_guards: Default::default(),
             last_prune_day: Default::default(),
             learned_strips: Default::default(),
+            routing: Default::default(),
         });
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let url = format!("http://{}/manage/api", listener.local_addr().unwrap());

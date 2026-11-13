@@ -9,6 +9,7 @@
 //!   - when a model has no specific observation, the account-level "default"
 //!     observation (from the zero-cost usage probe) influences ordering
 
+use crate::speed;
 use crate::store::{Account, Store};
 #[cfg(test)]
 use rand::RngCore;
@@ -179,7 +180,7 @@ impl Pool {
                 Some((slug, model.clone()))
             })
             .collect();
-        if catalog.is_empty() {
+        if catalog.is_empty() && !models.is_empty() {
             return;
         }
         let slugs = catalog.keys().cloned().collect();
@@ -193,12 +194,40 @@ impl Pool {
     /// still filters by each account's own catalog. Sorted for a stable
     /// response.
     pub fn union_models(&self) -> Result<Vec<String>, String> {
+        self.union_models_for_tier(None)
+    }
+
+    /// Accounts contributing to the selected speed pool, across its models.
+    /// Ordinary pool usage retains the existing all-enabled-account scope.
+    pub fn accounts_for_tier(&self, tier: Option<&str>) -> Result<Vec<Account>, String> {
+        let accounts = self.shared.st.list_accounts()?;
+        let inner = self.shared.state.lock().unwrap_or_else(|e| e.into_inner());
+        Ok(accounts
+            .into_iter()
+            .filter(|account| {
+                !account.disabled
+                    && tier.is_none_or(|tier| {
+                        inner.models.get(&account.id).is_some_and(|models| {
+                            models.iter().any(|model| {
+                                Self::account_eligible(&inner, account, model, Some(tier))
+                            })
+                        })
+                    })
+            })
+            .collect())
+    }
+
+    pub fn union_models_for_tier(&self, tier: Option<&str>) -> Result<Vec<String>, String> {
         let accounts = self.shared.st.list_accounts()?;
         let inner = self.shared.state.lock().unwrap_or_else(|e| e.into_inner());
         let mut out = BTreeSet::new();
         for a in accounts.into_iter().filter(|a| !a.disabled) {
             if let Some(set) = inner.models.get(&a.id) {
-                out.extend(set.iter().cloned());
+                out.extend(
+                    set.iter()
+                        .filter(|model| Self::account_eligible(&inner, &a, model, tier))
+                        .cloned(),
+                );
             }
         }
         Ok(out.into_iter().collect())
@@ -207,9 +236,17 @@ impl Pool {
     /// Full native Codex model objects available from at least one enabled
     /// account. Duplicate slugs are represented once, with stable ordering.
     pub fn union_model_catalog(&self) -> Result<Vec<serde_json::Value>, String> {
+        self.union_model_catalog_for_tier(None)
+    }
+
+    pub fn union_model_catalog_for_tier(
+        &self,
+        tier: Option<&str>,
+    ) -> Result<Vec<serde_json::Value>, String> {
         let accounts = self.shared.st.list_accounts()?;
         let inner = self.shared.state.lock().unwrap_or_else(|e| e.into_inner());
-        let mut out = BTreeMap::new();
+        let mut out: BTreeMap<String, serde_json::Value> = BTreeMap::new();
+        let mut tiers: BTreeMap<String, BTreeMap<String, serde_json::Value>> = BTreeMap::new();
         for account in accounts.into_iter().filter(|account| !account.disabled) {
             let Some(known) = inner.models.get(&account.id) else {
                 continue;
@@ -218,12 +255,59 @@ impl Pool {
                 continue;
             };
             for (slug, model) in catalog {
-                if known.contains(slug) {
+                if known.contains(slug) && Self::account_eligible(&inner, &account, slug, tier) {
                     out.entry(slug.clone()).or_insert_with(|| model.clone());
+                    for (id, metadata) in speed::catalog_tiers(model) {
+                        if tier.is_none_or(|requested| speed::canonical_tier(requested) == id) {
+                            tiers
+                                .entry(slug.clone())
+                                .or_default()
+                                .entry(id)
+                                .or_insert(metadata);
+                        }
+                    }
                 }
             }
         }
+        for (slug, model) in &mut out {
+            let supported = tiers.remove(slug).unwrap_or_default();
+            if let Some(object) = model.as_object_mut() {
+                object.remove("additional_speed_tiers");
+            }
+            let default = tier
+                .map(speed::canonical_tier)
+                .or_else(|| {
+                    model
+                        .get("default_service_tier")
+                        .and_then(serde_json::Value::as_str)
+                })
+                .filter(|id| supported.contains_key(*id))
+                .map(str::to_owned);
+            model["default_service_tier"] = serde_json::json!(default);
+            model["service_tiers"] = serde_json::json!(supported.into_values().collect::<Vec<_>>());
+        }
         Ok(out.into_values().collect())
+    }
+
+    fn account_eligible(
+        inner: &PoolInner,
+        account: &Account,
+        model: &str,
+        tier: Option<&str>,
+    ) -> bool {
+        if let Some(models) = inner.models.get(&account.id) {
+            if !models.is_empty() && !models.contains(model) {
+                return false;
+            }
+        }
+        let metadata = inner
+            .catalogs
+            .get(&account.id)
+            .and_then(|catalog| catalog.get(model));
+        if metadata.is_some_and(|model| !speed::model_allows_plan(model, &account.plan_type)) {
+            return false;
+        }
+        tier.is_none_or(|tier| metadata.is_some_and(|model| speed::supports_tier(model, tier)))
     }
 
     /// Records tokens a completed request attributed to this account
@@ -321,13 +405,22 @@ impl Pool {
     /// pinned account is moved to the front unless its effective score lags
     /// the best candidate by more than 20pp (then the pin is left to expire).
     pub fn select(&self, model: &str, session_key: &str) -> Result<Vec<Account>, String> {
+        self.select_for_tier(model, session_key, None)
+    }
+
+    pub fn select_for_tier(
+        &self,
+        model: &str,
+        session_key: &str,
+        tier: Option<&str>,
+    ) -> Result<Vec<Account>, String> {
         let gap = self
             .shared
             .st
             .get_settings()
             .map(|s| s.pin_yield_gap_pp)
             .unwrap_or(20);
-        let mut scored = self.scored_candidates(model)?;
+        let mut scored = self.scored_candidates_for_tier(model, tier)?;
         self.apply_affinity(&mut scored, session_key, model, gap);
         Ok(scored.into_iter().map(|s| s.acc).collect())
     }
@@ -342,6 +435,16 @@ impl Pool {
         session_key: &str,
         excluded: &BTreeSet<String>,
     ) -> Result<Option<(Account, PoolLease)>, String> {
+        self.lease_for_tier(model, session_key, excluded, None)
+    }
+
+    pub fn lease_for_tier(
+        &self,
+        model: &str,
+        session_key: &str,
+        excluded: &BTreeSet<String>,
+        tier: Option<&str>,
+    ) -> Result<Option<(Account, PoolLease)>, String> {
         let accounts = self.shared.st.list_accounts()?;
         let gap = self
             .shared
@@ -351,7 +454,8 @@ impl Pool {
             .unwrap_or(20);
         let now = (self.shared.now)();
         let mut inner = self.shared.state.lock().unwrap_or_else(|e| e.into_inner());
-        let mut scored = self.scored_candidates_locked(model, now, &mut inner, accounts, excluded);
+        let mut scored =
+            self.scored_candidates_locked(model, now, &mut inner, accounts, excluded, tier);
         self.apply_affinity_locked(&mut scored, session_key, model, gap, now, &mut inner);
         let Some(chosen) = scored.first() else {
             return Ok(None);
@@ -378,6 +482,15 @@ impl Pool {
         account_id: &str,
         model: &str,
     ) -> Result<Option<PoolLease>, String> {
+        self.lease_account_for_tier(account_id, model, None)
+    }
+
+    pub fn lease_account_for_tier(
+        &self,
+        account_id: &str,
+        model: &str,
+        tier: Option<&str>,
+    ) -> Result<Option<PoolLease>, String> {
         let accounts = self.shared.st.list_accounts()?;
         let Some(account) = accounts
             .into_iter()
@@ -389,10 +502,8 @@ impl Pool {
             return Ok(None);
         }
         let mut inner = self.shared.state.lock().unwrap_or_else(|e| e.into_inner());
-        if let Some(models) = inner.models.get(account_id) {
-            if !models.is_empty() && !models.contains(model) {
-                return Ok(None);
-            }
+        if !Self::account_eligible(&inner, &account, model, tier) {
+            return Ok(None);
         }
         *inner
             .in_flight
@@ -409,13 +520,22 @@ impl Pool {
     }
 
     fn scored_candidates(&self, model: &str) -> Result<Vec<Scored>, String> {
+        self.scored_candidates_for_tier(model, None)
+    }
+
+    fn scored_candidates_for_tier(
+        &self,
+        model: &str,
+        tier: Option<&str>,
+    ) -> Result<Vec<Scored>, String> {
         let accounts = self.shared.st.list_accounts()?;
         let now = (self.shared.now)();
         let mut inner = self.shared.state.lock().unwrap_or_else(|e| e.into_inner());
 
-        Ok(self.scored_candidates_locked(model, now, &mut inner, accounts, &BTreeSet::new()))
+        Ok(self.scored_candidates_locked(model, now, &mut inner, accounts, &BTreeSet::new(), tier))
     }
 
+    #[allow(clippy::too_many_arguments)]
     fn scored_candidates_locked(
         &self,
         model: &str,
@@ -423,11 +543,15 @@ impl Pool {
         inner: &mut PoolInner,
         accounts: Vec<Account>,
         excluded: &BTreeSet<String>,
+        tier: Option<&str>,
     ) -> Vec<Scored> {
         let mut active: Vec<Scored> = Vec::new();
         let mut cooled: Vec<Scored> = Vec::new();
         for a in accounts {
-            if a.disabled || excluded.contains(&a.id) {
+            if a.disabled
+                || excluded.contains(&a.id)
+                || !Self::account_eligible(inner, &a, model, tier)
+            {
                 continue;
             }
             let key = (a.id.clone(), model.to_string());
@@ -451,13 +575,6 @@ impl Pool {
                 (None, Some(d)) => d.secondary_pct,
                 (None, None) => 0.0,
             };
-            // model entitlement: an account whose discovered catalog
-            // provably lacks the requested model is skipped up front
-            if let Some(set) = inner.models.get(&a.id) {
-                if !set.is_empty() && !set.contains(&model.to_string()) {
-                    continue;
-                }
-            }
             let f = inner.failures.get(&key).copied().unwrap_or_default();
             // shadow ledger: the snapshot may be minutes stale during heavy
             // sessions — add the locally-attributed, not-yet-reported burn
@@ -695,6 +812,183 @@ mod tests {
                 ..Default::default()
             })
             .unwrap();
+        }
+    }
+
+    #[test]
+    fn speed_selection_uses_account_capabilities_not_subscription_price_names() {
+        use serde_json::json;
+        let p = test_pool();
+        let st = st_of(&p);
+        let plans = [
+            ("plus", "plus"),
+            ("small", "prolite"),
+            ("pro", "pro"),
+            ("max", "promax"),
+            ("unknown", "promax"),
+        ];
+        for (id, plan) in plans {
+            seed(&p, &[id]);
+            let mut account = st.get_account(id).unwrap();
+            account.plan_type = plan.into();
+            st.upsert_account(&account).unwrap();
+            let tiers = match id {
+                "max" => json!([
+                    {"id":"priority", "name":"Fast", "description":"Synthetic Fast capability."},
+                    {"id":"ultrafast", "name":"Ultrafast", "description":"Synthetic Ultrafast capability."}
+                ]),
+                "unknown" => serde_json::Value::Null,
+                _ => {
+                    json!([{"id":"priority", "name":"Fast", "description":"Synthetic Fast capability."}])
+                }
+            };
+            p.set_account_catalog(
+                id,
+                &[json!({"slug":"non-gpt-model", "service_tiers":tiers})],
+            );
+        }
+        let ids = |tier| {
+            let mut ids: Vec<_> = p
+                .select_for_tier("non-gpt-model", "shared", tier)
+                .unwrap()
+                .into_iter()
+                .map(|a| a.id)
+                .collect();
+            ids.sort();
+            ids
+        };
+        assert_eq!(ids(Some(speed::FAST)), ["max", "plus", "pro", "small"]);
+        assert_eq!(ids(Some(speed::ULTRAFAST)), ["max"]);
+        p.pin("shared", "plus", "non-gpt-model");
+        assert_eq!(
+            p.select_for_tier("non-gpt-model", "shared", Some(speed::ULTRAFAST))
+                .unwrap()[0]
+                .id,
+            "max"
+        );
+
+        // A later catalog can withdraw Plus Fast without any local plan table.
+        p.set_account_catalog("plus", &[json!({"slug":"non-gpt-model", "service_tiers":[], "additional_speed_tiers":["fast"]})]);
+        assert_eq!(ids(Some(speed::FAST)), ["max", "pro", "small"]);
+        assert!(p
+            .lease_account_for_tier("plus", "non-gpt-model", Some(speed::FAST))
+            .unwrap()
+            .is_none());
+        assert!(p.lease_account("plus", "non-gpt-model").unwrap().is_some());
+
+        // Cooling every eligible account must never admit an ineligible one.
+        p.mark_failure("max", "non-gpt-model");
+        let (chosen, lease) = p
+            .lease_for_tier(
+                "non-gpt-model",
+                "shared",
+                &BTreeSet::new(),
+                Some(speed::ULTRAFAST),
+            )
+            .unwrap()
+            .unwrap();
+        assert_eq!(chosen.id, "max");
+        drop(lease);
+        p.set_account_catalog("max", &[]);
+        assert!(ids(Some(speed::ULTRAFAST)).is_empty());
+        assert!(p
+            .lease_for_tier(
+                "non-gpt-model",
+                "shared",
+                &BTreeSet::new(),
+                Some(speed::ULTRAFAST)
+            )
+            .unwrap()
+            .is_none());
+    }
+
+    #[test]
+    fn native_catalog_merges_speed_capabilities_and_withdraws_disabled_accounts() {
+        use serde_json::json;
+        let p = test_pool();
+        let st = st_of(&p);
+        seed(&p, &["ordinary", "fast", "ultra"]);
+        for (id, tiers) in [
+            ("ordinary", json!([])),
+            (
+                "fast",
+                json!([{"id":"priority", "name":"Fast", "description":"Synthetic Fast capability."}]),
+            ),
+            (
+                "ultra",
+                json!([{"id":"ultrafast", "name":"Ultrafast", "description":"Synthetic Ultrafast capability."}]),
+            ),
+        ] {
+            p.set_account_catalog(id, &[json!({"slug":"gpt-6-astra", "service_tiers":tiers, "default_service_tier":null, "catalog_marker":"preserved"})]);
+        }
+        let model = &p.union_model_catalog().unwrap()[0];
+        assert_eq!(model["catalog_marker"], "preserved");
+        assert_eq!(model["service_tiers"].as_array().unwrap().len(), 2);
+        let accelerated = p
+            .union_model_catalog_for_tier(Some(speed::ULTRAFAST))
+            .unwrap();
+        assert_eq!(accelerated[0]["service_tiers"].as_array().unwrap().len(), 1);
+        assert_eq!(accelerated[0]["default_service_tier"], "ultrafast");
+        assert!(accelerated[0].get("additional_speed_tiers").is_none());
+        st.set_account_disabled("ultra", true).unwrap();
+        assert!(p
+            .union_models_for_tier(Some(speed::ULTRAFAST))
+            .unwrap()
+            .is_empty());
+        assert!(p
+            .union_model_catalog_for_tier(Some(speed::ULTRAFAST))
+            .unwrap()
+            .is_empty());
+        st.delete_account("fast").unwrap();
+        assert!(p.union_model_catalog().unwrap()[0]["service_tiers"]
+            .as_array()
+            .unwrap()
+            .is_empty());
+    }
+
+    #[test]
+    fn model_plan_restrictions_apply_to_discovery_selection_and_retry_leases() {
+        use serde_json::json;
+        let p = test_pool();
+        let st = st_of(&p);
+        seed(&p, &["a"]);
+        let model = json!({"slug":"gpt-6-astra", "available_in_plans":["pro"], "service_tiers":[{"id":"priority", "name":"Fast", "description":"Synthetic Fast capability."}]});
+        p.set_account_catalog("a", &[model]);
+        assert_eq!(
+            p.union_models_for_tier(Some(speed::FAST)).unwrap(),
+            ["gpt-6-astra"]
+        );
+        st.set_account_plan("a", "plus").unwrap();
+        for tier in [None, Some(speed::FAST), Some(speed::ULTRAFAST)] {
+            assert!(p.union_models_for_tier(tier).unwrap().is_empty());
+            assert!(p.union_model_catalog_for_tier(tier).unwrap().is_empty());
+            assert!(p
+                .select_for_tier("gpt-6-astra", "", tier)
+                .unwrap()
+                .is_empty());
+            assert!(p
+                .lease_account_for_tier("a", "gpt-6-astra", tier)
+                .unwrap()
+                .is_none());
+        }
+    }
+
+    #[test]
+    fn slug_only_catalogs_never_imply_fast_or_ultrafast_support() {
+        let p = test_pool();
+        seed(&p, &["a"]);
+        p.set_account_models("a", &["gpt-6-astra".into()]);
+        assert_eq!(p.union_models().unwrap(), ["gpt-6-astra"]);
+        for tier in [speed::FAST, speed::ULTRAFAST] {
+            assert!(p.union_models_for_tier(Some(tier)).unwrap().is_empty());
+            assert!(p
+                .select_for_tier("gpt-6-astra", "", Some(tier))
+                .unwrap()
+                .is_empty());
+            assert!(p
+                .lease_account_for_tier("a", "gpt-6-astra", Some(tier))
+                .unwrap()
+                .is_none());
         }
     }
 
