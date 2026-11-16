@@ -235,9 +235,20 @@ impl App {
             &acc.refresh_token,
         )
         .await?;
-        self.store.record_account_error(&acc.id, "");
         let mut exp = acc.expires_at;
         if let Ok(claims) = oauth::parse_id_token(&ts.id_token) {
+            let workspace = claims.account_id();
+            if !workspace.is_empty() && !acc.account_id.is_empty() && workspace != acc.account_id {
+                return Err("refreshed credentials belong to another workspace; stored identity was not changed".into());
+            }
+            if let Some(user) = claims.user_id() {
+                if !acc.user_id.is_empty()
+                    && user.split_once(':').map(|p| p.0) == acc.user_id.split_once(':').map(|p| p.0)
+                    && user != acc.user_id
+                {
+                    return Err("refreshed credentials belong to another user; stored identity was not changed".into());
+                }
+            }
             exp = claims.exp;
         }
         let exp = if ts.expires_in > 0 {
@@ -247,6 +258,7 @@ impl App {
         };
         self.store
             .update_tokens(&acc.id, &ts.access_token, &ts.refresh_token, exp)?;
+        self.store.record_account_error(&acc.id, "");
         acc.access_token = ts.access_token;
         acc.refresh_token = ts.refresh_token;
         acc.expires_at = exp;
@@ -441,6 +453,9 @@ impl App {
                         .and(report.main.secondary.window_seconds)
                         .unwrap_or(0),
                     observed_at: now,
+                    observed_seq: 0,
+                    primary_known: Some(report.main.primary.used_pct.is_some()),
+                    secondary_known: Some(report.main.secondary.used_pct.is_some()),
                 },
             );
         }
@@ -456,6 +471,9 @@ impl App {
                     primary_window_secs: a.limit.primary.window_seconds.unwrap_or(0),
                     secondary_window_secs: a.limit.secondary.window_seconds.unwrap_or(0),
                     observed_at: now,
+                    observed_seq: 0,
+                    primary_known: Some(a.limit.primary.used_pct.is_some()),
+                    secondary_known: Some(a.limit.secondary.used_pct.is_some()),
                 },
             );
         }
@@ -632,16 +650,14 @@ impl App {
         .await
     }
 
-    pub fn state_json(&self) -> serde_json::Value {
-        let accounts: Vec<serde_json::Value> = self
-            .store
-            .list_accounts()
-            .unwrap_or_default()
+    pub fn state_json(&self) -> Result<serde_json::Value, String> {
+        let records = self.store.list_accounts()?;
+        let accounts: Vec<serde_json::Value> = records
             .iter()
             .map(|a| {
                 json!({
                     "id": a.id, "email": a.email, "plan_type": a.plan_type,
-                    "disabled": a.disabled,
+                    "disabled": a.disabled, "workspace_id": a.account_id,
                     "expires_at": rfc3339(a.expires_at),
                     "last_error": a.last_error,
                     "last_error_at": rfc3339_or_empty(a.last_error_at),
@@ -650,43 +666,31 @@ impl App {
             .collect();
         let keys: Vec<serde_json::Value> = self
             .store
-            .list_api_keys()
-            .unwrap_or_default()
+            .list_api_keys()?
             .iter()
             .map(|k| json!({"key": k.key, "comment": k.comment, "created_at": rfc3339(k.created_at), "disabled": k.disabled}))
             .collect();
         let quota = self.pool.snapshot();
-        let email_of: HashMap<String, String> = self
-            .store
-            .list_accounts()
-            .unwrap_or_default()
+        let ids: std::collections::HashSet<String> = records.into_iter().map(|a| a.id).collect();
+        let quota_by_id: serde_json::Map<String, serde_json::Value> = quota
             .into_iter()
-            .map(|a| (a.id, a.email))
+            .filter(|(id, _)| ids.contains(id))
+            .map(|(id, models)| (id, serde_json::to_value(models).unwrap_or_default()))
             .collect();
-        let mut quota_by_email = serde_json::Map::new();
-        for (acc_id, models) in &quota {
-            if let Some(email) = email_of.get(acc_id) {
-                let mut mm = serde_json::Map::new();
-                for (model, q) in models {
-                    mm.insert(model.clone(), serde_json::to_value(q).unwrap_or_default());
-                }
-                quota_by_email.insert(email.clone(), serde_json::Value::Object(mm));
-            }
-        }
         let logs: Vec<serde_json::Value> = self
             .store
-            .recent_logs(100)
-            .unwrap_or_default()
+            .recent_logs(100)?
             .iter()
             .map(|l| serde_json::to_value(l).unwrap_or_default())
             .collect();
-        json!({
+        Ok(json!({
             "accounts": accounts,
             "api_keys": keys,
-            "settings": self.store.get_settings().unwrap_or_default(),
+            "settings": self.store.get_settings()?,
             "logs": logs,
-            "quota": quota_by_email,
-        })
+            "quota": quota_by_id,
+            "observed_at": crate::store::now_secs(),
+        }))
     }
 }
 

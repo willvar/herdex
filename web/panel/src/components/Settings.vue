@@ -65,6 +65,12 @@ async function save() {
     title="设置（池参数）"
     size="small"
   >
+    <p
+      :class="dirty ? 'err' : 'muted'"
+      role="status"
+    >
+      {{ dirty ? '有未保存的修改，保存后才生效' : '当前显示已保存设置' }}
+    </p>
     <div
       class="row"
       style="margin-top:0"
@@ -106,9 +112,9 @@ async function save() {
       class="muted"
       style="margin-top:10px;line-height:1.6;font-size:12px"
     >
-      迁移策略决定会话何时离开粘住的账号（迁移会废弃该会话的 prompt cache）。三个档位是同一根轴上的连续取舍：<b>均衡度</b>（各号已用%是否齐步）↔ <b>cache 损失</b>（迁移次数）↔ <b>首次 429 时间</b>：<br>
-      <b>-1 黏性优先</b>：只在一个号 429/失败时才迁移——cache 零损失，消耗串行集中（一次只烧一个号），首次触顶最早；单会话/重 cache 场景推荐；<br>
-      <b>0 水填均衡</b>：永远粘在当前已用百分比最低的号上，各号已用%完全对齐、同步逼近 100%——平均分配的极限，首次触顶最晚；多会话分摊/追求均衡时推荐；<br>
+      迁移策略决定会话何时离开粘住的账号（迁移可能降低该会话的 prompt cache 命中）。三个档位是同一根轴上的连续取舍：<b>均衡度</b>（各号已用%是否齐步）↔ <b>cache 损失</b>（迁移次数）↔ <b>首次 429 时间</b>：<br>
+      <b>-1 黏性优先</b>：只在一个号 429/失败时才迁移——减少迁移带来的 cache 损失，消耗串行集中（一次只烧一个号），首次触顶最早；单会话/重 cache 场景推荐；<br>
+      <b>0 水填均衡</b>：永远粘在当前已用百分比最低的号上，倾向于拉齐各号已用百分比——平均分配的极限，可能推迟首次触顶；多会话分摊/追求均衡时推荐；<br>
       <b>&gt;0 滞后带</b>：介于两者之间——各号已用%保持在一条最厚 N 个百分点的带子里滚动（有界的相对均衡）。例：20 = 粘住的号可以领先别家 20 个百分点，烧满 20 个百分点才搬家。
       迁移次数 ≈ 总消耗 ÷ 该值：值越大迁移越少、越接近黏性优先，越小越接近水填。
     </div>
@@ -123,7 +129,7 @@ async function save() {
       style="margin-top:6px;line-height:1.6;font-size:12px"
     >
       statusline 固定显示<b>号池虚拟账号</b>的进度：已用% = 各账号已用%按实测容量（tokens/百分点）加权平均——
-      校准数据积累越多越精确，未校准阶段退化为等权平均。panel 此处的逐账号百分比始终是真实值。
+      校准数据积累越多越精确，未校准阶段退化为等权平均。panel 此处的逐账号百分比来自上次上游观测，可能存在延迟。
     </div>
     <div class="row">
       <n-button
@@ -132,6 +138,12 @@ async function save() {
         @click="save"
       >
         保存
+      </n-button>
+      <n-button
+        :disabled="!dirty || saving"
+        @click="dirty = false"
+      >
+        放弃未保存修改
       </n-button>
     </div>
   </n-card>

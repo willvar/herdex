@@ -1,5 +1,5 @@
-//! Single SQLite database. Migrations preserve existing account, request,
-//! and probe history while newer observations carry explicit ordering.
+//! Single SQLite database with an explicit, fresh-schema contract.
+//! Credential records, users and upstream workspaces have distinct identities.
 
 use rusqlite::{Connection, OptionalExtension};
 use serde::{Deserialize, Serialize};
@@ -33,6 +33,8 @@ pub struct Store {
 #[derive(Clone, Default)]
 pub struct Account {
     pub id: String,
+    pub issuer: String,
+    pub user_id: String,
     pub email: String,
     pub plan_type: String,
     pub account_id: String,
@@ -171,9 +173,54 @@ pub fn now_secs() -> i64 {
         .as_secs() as i64
 }
 
+/// Base credentials cannot use the reserved derived-provider suffixes.
+pub fn validate_api_key(key: &str) -> Result<(), String> {
+    if key.is_empty() || key.len() > 4096 || !key.bytes().all(|b| (33..=126).contains(&b)) {
+        return Err(
+            "API key must contain 1–4096 visible ASCII characters without whitespace".into(),
+        );
+    }
+    if key.ends_with("-fast") || key.ends_with("-ultrafast") {
+        return Err(
+            "-fast and -ultrafast are reserved provider suffixes, not independent API keys".into(),
+        );
+    }
+    Ok(())
+}
+
+#[derive(Default, Deserialize)]
+pub struct LogQuery {
+    pub page: Option<i64>,
+    pub limit: Option<i64>,
+    pub account_id: Option<String>,
+    pub model: Option<String>,
+    pub api_key: Option<String>,
+    pub service_tier: Option<String>,
+    pub errors_only: Option<bool>,
+    pub since: Option<i64>,
+    pub until: Option<i64>,
+    pub request_id: Option<String>,
+}
+
+#[derive(Serialize)]
+pub struct LogRecord {
+    pub seq: i64,
+    #[serde(flatten)]
+    pub entry: LogEntry,
+}
+#[derive(Serialize)]
+pub struct LogPage {
+    pub items: Vec<LogRecord>,
+    pub total: i64,
+    pub page: i64,
+    pub limit: i64,
+}
+
 const SCHEMA: &str = r#"
 CREATE TABLE IF NOT EXISTS accounts (
 	id           TEXT PRIMARY KEY,
+	issuer       TEXT NOT NULL DEFAULT '',
+	user_id      TEXT NOT NULL DEFAULT '',
 	email        TEXT NOT NULL,
 	plan_type    TEXT NOT NULL,
 	account_id   TEXT NOT NULL,
@@ -185,6 +232,8 @@ CREATE TABLE IF NOT EXISTS accounts (
 	last_error_at INTEGER NOT NULL DEFAULT 0,
 	created_at   INTEGER NOT NULL
 );
+CREATE UNIQUE INDEX IF NOT EXISTS idx_account_identity ON accounts(issuer,user_id,account_id)
+    WHERE issuer<>'' AND user_id<>'' AND account_id<>'';
 CREATE TABLE IF NOT EXISTS api_keys (
 	key        TEXT PRIMARY KEY,
 	comment    TEXT NOT NULL DEFAULT '',
@@ -200,6 +249,7 @@ CREATE TABLE IF NOT EXISTS request_log (
 	ts     INTEGER NOT NULL,
 	account_id TEXT NOT NULL DEFAULT '',
 	account_email TEXT NOT NULL DEFAULT '',
+	api_key TEXT NOT NULL DEFAULT '',
 	model  TEXT NOT NULL,
 	service_tier TEXT,
 	status INTEGER NOT NULL,
@@ -230,7 +280,10 @@ CREATE TABLE IF NOT EXISTS usage_probes (
 	plan       TEXT NOT NULL DEFAULT '',
 	log_seq    INTEGER
 );
-CREATE INDEX IF NOT EXISTS idx_request_log_account_ts ON request_log(account_email, ts);
+CREATE INDEX IF NOT EXISTS idx_request_log_account_ts ON request_log(account_id, ts);
+CREATE INDEX IF NOT EXISTS idx_usage_probes_account_seq ON usage_probes(account_id,seq);
+CREATE INDEX IF NOT EXISTS idx_request_log_account_id_seq ON request_log(account_id,seq);
+CREATE INDEX IF NOT EXISTS idx_request_log_ts ON request_log(ts);
 "#;
 
 impl Store {
@@ -240,117 +293,74 @@ impl Store {
         let conn = Connection::open(&path).map_err(|e| e.to_string())?;
         conn.busy_timeout(std::time::Duration::from_millis(5000))
             .map_err(|e| e.to_string())?;
+        let tables: i64 = conn.query_row(
+            "SELECT COUNT(*) FROM sqlite_master WHERE type='table' AND name NOT LIKE 'sqlite_%'",
+            [], |row| row.get(0),
+        ).map_err(|e| e.to_string())?;
+        let version: i64 = conn
+            .pragma_query_value(None, "user_version", |row| row.get(0))
+            .map_err(|e| e.to_string())?;
+        if tables > 0 && version != 1 {
+            return Err("unsupported database schema; use a new state directory (no automatic migration or reset)".into());
+        }
+        if tables == 0 {
+            conn.execute_batch(&format!("BEGIN;{SCHEMA}PRAGMA user_version=1;COMMIT;"))
+                .map_err(|e| format!("initialize schema: {e}"))?;
+        }
         conn.pragma_update(None, "journal_mode", "WAL")
             .map_err(|e| e.to_string())?;
-        let store = Store {
+        Ok(Store {
             conn: Arc::new(Mutex::new(conn)),
-        };
-        store.migrate()?;
-        Ok(store)
+        })
     }
 
-    fn migrate(&self) -> Result<(), String> {
+    /// Update one verified user/workspace identity, retaining local ID and policy.
+    pub fn save_oauth_account(&self, a: &Account) -> Result<(String, bool), String> {
+        if [&a.issuer, &a.user_id, &a.account_id]
+            .iter()
+            .any(|v| v.is_empty() || v.trim() != v.as_str())
+        {
+            return Err("verified issuer, user and workspace identities are required".into());
+        }
         let mut conn = self.conn.lock().unwrap_or_else(|e| e.into_inner());
-        conn.execute_batch(SCHEMA)
-            .map_err(|e| format!("migrate: {e}"))?;
-        // v1: api_keys.label renamed to comment (data-preserving on old DBs)
-        let _ = conn.execute("ALTER TABLE api_keys RENAME COLUMN label TO comment", []);
-        // v2: token usage stats need the api_key dimension on request_log
-        let cols: Vec<String> = {
-            let mut stmt = conn
-                .prepare("PRAGMA table_info(request_log)")
-                .map_err(|e| e.to_string())?;
-            let rows = stmt
-                .query_map([], |r| r.get::<_, String>(1))
-                .map_err(|e| e.to_string())?;
-            rows.filter_map(|r| r.ok()).collect()
-        };
-        if !cols.iter().any(|c| c == "api_key") {
-            conn.execute(
-                "ALTER TABLE request_log ADD COLUMN api_key TEXT NOT NULL DEFAULT ''",
-                [],
+        let tx = conn.transaction().map_err(|e| e.to_string())?;
+        let existing: Option<String> = tx
+            .query_row(
+                "SELECT id FROM accounts WHERE issuer=?1 AND user_id=?2 AND account_id=?3",
+                rusqlite::params![a.issuer, a.user_id, a.account_id],
+                |r| r.get(0),
             )
-            .map_err(|e| format!("migrate: {e}"))?;
-        }
-        if !cols.iter().any(|c| c == "account_id") {
-            conn.execute(
-                "ALTER TABLE request_log ADD COLUMN account_id TEXT NOT NULL DEFAULT ''",
-                [],
-            )
-            .map_err(|e| format!("migrate: {e}"))?;
-        }
-        // Never infer a tier for older requests: NULL means not recorded.
-        if !cols.iter().any(|c| c == "service_tier") {
-            conn.execute("ALTER TABLE request_log ADD COLUMN service_tier TEXT", [])
-                .map_err(|e| format!("migrate: {e}"))?;
-        }
-        if !cols.iter().any(|c| c == "diagnostics") {
-            conn.execute("ALTER TABLE request_log ADD COLUMN diagnostics TEXT", [])
-                .map_err(|e| format!("migrate: {e}"))?;
-        }
-        // v3: usage_probes gained a plan column (plan change resets accounting)
-        let probe_cols: Vec<String> = {
-            let mut stmt = conn
-                .prepare("PRAGMA table_info(usage_probes)")
-                .map_err(|e| e.to_string())?;
-            let rows = stmt
-                .query_map([], |r| r.get::<_, String>(1))
-                .map_err(|e| e.to_string())?;
-            rows.filter_map(|r| r.ok()).collect()
-        };
-        if !probe_cols.iter().any(|c| c == "plan") {
-            conn.execute(
-                "ALTER TABLE usage_probes ADD COLUMN plan TEXT NOT NULL DEFAULT ''",
-                [],
-            )
-            .map_err(|e| format!("migrate: {e}"))?;
-        }
-        // Same-second observations need distinct identities. Legacy samples
-        // retain NULL watermarks: their actual ordering relative to logs is
-        // unknowable and must not be invented during migration.
-        if !probe_cols.iter().any(|c| c == "seq") {
-            let tx = conn.transaction().map_err(|e| format!("migrate: {e}"))?;
-            tx.execute_batch(
-                "CREATE TABLE usage_probes_ordered (
-                     seq INTEGER PRIMARY KEY AUTOINCREMENT,
-                     account_id TEXT NOT NULL,
-                     ts INTEGER NOT NULL,
-                     used_pct REAL NOT NULL,
-                     reset_at INTEGER NOT NULL DEFAULT 0,
-                     plan TEXT NOT NULL DEFAULT '',
-                     log_seq INTEGER
-                 );
-                 INSERT INTO usage_probes_ordered(account_id,ts,used_pct,reset_at,plan)
-                     SELECT account_id,ts,used_pct,reset_at,plan FROM usage_probes
-                     ORDER BY ts,account_id;
-                 DROP TABLE usage_probes;
-                 ALTER TABLE usage_probes_ordered RENAME TO usage_probes;",
-            )
-            .map_err(|e| format!("migrate: {e}"))?;
-            tx.commit().map_err(|e| format!("migrate: {e}"))?;
-        }
-        conn.execute_batch(
-            "CREATE INDEX IF NOT EXISTS idx_usage_probes_account_seq ON usage_probes(account_id,seq);
-             CREATE INDEX IF NOT EXISTS idx_request_log_account_id_seq ON request_log(account_id,seq);",
-        )
-        .map_err(|e| format!("migrate: {e}"))?;
-        Ok(())
+            .optional()
+            .map_err(|e| e.to_string())?;
+        let updated = existing.is_some();
+        let id = existing.unwrap_or_else(|| uuid::Uuid::new_v4().to_string());
+        tx.execute(
+            "INSERT INTO accounts(id,issuer,user_id,email,plan_type,account_id,access_token,refresh_token,expires_at,created_at)
+             VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10)
+             ON CONFLICT(id) DO UPDATE SET email=excluded.email,plan_type=excluded.plan_type,
+                 access_token=excluded.access_token,refresh_token=excluded.refresh_token,
+                 expires_at=excluded.expires_at,last_error='',last_error_at=0",
+            rusqlite::params![id,a.issuer,a.user_id,a.email,a.plan_type,a.account_id,a.access_token,a.refresh_token,a.expires_at,now_secs()],
+        ).map_err(|e| e.to_string())?;
+        tx.commit().map_err(|e| e.to_string())?;
+        Ok((id, updated))
     }
 
     pub fn upsert_account(&self, a: &Account) -> Result<(), String> {
         let conn = self.conn.lock().unwrap_or_else(|e| e.into_inner());
         conn.execute(
             r#"INSERT INTO accounts
-                (id,email,plan_type,account_id,access_token,refresh_token,expires_at,disabled,last_error,last_error_at,created_at)
-                VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11)
+                (id,email,plan_type,account_id,access_token,refresh_token,expires_at,disabled,last_error,last_error_at,created_at,issuer,user_id)
+                VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13)
                 ON CONFLICT(id) DO UPDATE SET
                 email=excluded.email, plan_type=excluded.plan_type, account_id=excluded.account_id,
+                issuer=excluded.issuer,user_id=excluded.user_id,
                 access_token=excluded.access_token, refresh_token=excluded.refresh_token,
                 expires_at=excluded.expires_at, disabled=excluded.disabled,
                 last_error=excluded.last_error, last_error_at=excluded.last_error_at"#,
             rusqlite::params![
                 a.id, a.email, a.plan_type, a.account_id, a.access_token, a.refresh_token,
-                a.expires_at, a.disabled as i64, a.last_error, a.last_error_at, now_secs()
+                a.expires_at, a.disabled as i64, a.last_error, a.last_error_at, now_secs(),a.issuer,a.user_id
             ],
         )
         .map_err(|e| e.to_string())?;
@@ -432,11 +442,13 @@ impl Store {
             disabled: row.get::<_, i64>(7).map_err(|e| e.to_string())? != 0,
             last_error: row.get(8).map_err(|e| e.to_string())?,
             last_error_at: row.get(9).map_err(|e| e.to_string())?,
+            issuer: row.get(10).map_err(|e| e.to_string())?,
+            user_id: row.get(11).map_err(|e| e.to_string())?,
         })
     }
 
     const ACCOUNT_COLS: &str =
-        "id,email,plan_type,account_id,access_token,refresh_token,expires_at,disabled,last_error,last_error_at";
+        "id,email,plan_type,account_id,access_token,refresh_token,expires_at,disabled,last_error,last_error_at,issuer,user_id";
 
     pub fn get_account(&self, id: &str) -> Result<Account, String> {
         let conn = self.conn.lock().unwrap_or_else(|e| e.into_inner());
@@ -467,6 +479,7 @@ impl Store {
     }
 
     pub fn add_api_key(&self, key: &str, comment: &str) -> Result<(), String> {
+        validate_api_key(key)?;
         let conn = self.conn.lock().unwrap_or_else(|e| e.into_inner());
         conn.execute(
             "INSERT INTO api_keys(key,comment,created_at) VALUES (?1,?2,?3)",
@@ -482,7 +495,7 @@ impl Store {
             .execute("DELETE FROM api_keys WHERE key=?1", rusqlite::params![key])
             .map_err(|e| e.to_string())?;
         if n == 0 {
-            return Err(format!("api key {key}: not found"));
+            return Err("API key not found".into());
         }
         Ok(())
     }
@@ -496,7 +509,7 @@ impl Store {
             )
             .map_err(|e| e.to_string())?;
         if n == 0 {
-            return Err(format!("api key {key}: not found"));
+            return Err("API key not found".into());
         }
         Ok(())
     }
@@ -510,24 +523,33 @@ impl Store {
             )
             .map_err(|e| e.to_string())?;
         if n == 0 {
-            return Err(format!("api key {key}: not found"));
+            return Err("API key not found".into());
         }
         Ok(())
     }
 
     pub fn update_api_key(&self, old_key: &str, new_key: &str) -> Result<(), String> {
-        if old_key == new_key {
-            return Ok(());
+        self.patch_api_key(old_key, Some(new_key), None, None)
+    }
+
+    /// All fields are committed together; validation failures have no side effects.
+    pub fn patch_api_key(
+        &self,
+        key: &str,
+        new_key: Option<&str>,
+        comment: Option<&str>,
+        disabled: Option<bool>,
+    ) -> Result<(), String> {
+        if let Some(new_key) = new_key {
+            validate_api_key(new_key)?;
         }
         let conn = self.conn.lock().unwrap_or_else(|e| e.into_inner());
-        let n = conn
-            .execute(
-                "UPDATE api_keys SET key=?1 WHERE key=?2",
-                rusqlite::params![new_key, old_key],
-            )
-            .map_err(|e| e.to_string())?;
+        let n = conn.execute(
+            "UPDATE api_keys SET key=COALESCE(?1,key),comment=COALESCE(?2,comment),disabled=COALESCE(?3,disabled) WHERE key=?4",
+            rusqlite::params![new_key,comment,disabled,key],
+        ).map_err(|_| "API key update conflicts with an existing record".to_string())?;
         if n == 0 {
-            return Err(format!("api key {old_key}: not found"));
+            return Err("API key not found".into());
         }
         Ok(())
     }
@@ -613,13 +635,13 @@ impl Store {
     }
 
     /// Token usage aggregates for the panel. `col` must be a whitelisted
-    /// request_log column; buckets are VM-local days.
+    /// request_log column; buckets are Asia/Hong_Kong days.
     pub fn usage_daily(&self, days: i64) -> Result<Vec<UsageRow>, String> {
         let since = now_secs() - days * 86400;
         let conn = self.conn.lock().unwrap_or_else(|e| e.into_inner());
         let mut stmt = conn
             .prepare(
-                r#"SELECT date(ts,'unixepoch','localtime') d, COUNT(*),
+                r#"SELECT date(ts,'unixepoch','+8 hours') d, COUNT(*),
                           SUM(input_tokens), SUM(cached_tokens), SUM(output_tokens)
                    FROM request_log WHERE ts >= ?1 GROUP BY d ORDER BY d"#,
             )
@@ -674,7 +696,7 @@ impl Store {
         let conn = self.conn.lock().unwrap_or_else(|e| e.into_inner());
         let mut stmt = conn
             .prepare(
-                r#"SELECT date(ts,'unixepoch','localtime') d, model,
+                r#"SELECT date(ts,'unixepoch','+8 hours') d, model,
                           SUM(input_tokens), SUM(cached_tokens), SUM(output_tokens)
                    FROM request_log WHERE ts >= ?1 AND model != ''
                    GROUP BY d, model ORDER BY d, model"#,
@@ -1215,6 +1237,91 @@ impl Store {
         Ok(removed)
     }
 
+    pub fn query_logs(&self, query: &LogQuery) -> Result<LogPage, String> {
+        use rusqlite::types::Value;
+        let page = query.page.unwrap_or(1).clamp(1, 1_000_000);
+        let limit = query.limit.unwrap_or(50).clamp(1, 100);
+        let mut filter = String::from(" WHERE 1=1");
+        let mut values: Vec<Value> = Vec::new();
+        for (column, value) in [
+            ("account_id", &query.account_id),
+            ("model", &query.model),
+            ("api_key", &query.api_key),
+        ] {
+            if let Some(value) = value.as_ref().filter(|v| !v.is_empty()) {
+                filter.push_str(&format!(" AND {column}=?"));
+                values.push(Value::Text(value.clone()));
+            }
+        }
+        if let Some(tier) = &query.service_tier {
+            filter.push_str(" AND service_tier=?");
+            values.push(Value::Text(tier.clone()));
+        }
+        if query.errors_only.unwrap_or(false) {
+            filter.push_str(" AND (status=0 OR status>=400 OR error<>'')");
+        }
+        for (condition, value) in [("ts>=?", query.since), ("ts<=?", query.until)] {
+            if let Some(value) = value {
+                filter.push_str(&format!(" AND {condition}"));
+                values.push(Value::Integer(value));
+            }
+        }
+        if let Some(id) = query.request_id.as_ref().filter(|v| !v.is_empty()) {
+            filter.push_str(" AND json_extract(diagnostics,'$.request_id')=?");
+            values.push(Value::Text(id.clone()));
+        }
+        let conn = self.conn.lock().unwrap_or_else(|e| e.into_inner());
+        let total: i64 = conn
+            .query_row(
+                &format!("SELECT COUNT(*) FROM request_log{filter}"),
+                rusqlite::params_from_iter(&values),
+                |r| r.get(0),
+            )
+            .map_err(|e| e.to_string())?;
+        values.push(Value::Integer(limit));
+        values.push(Value::Integer((page - 1) * limit));
+        let mut statement = conn.prepare(&format!("SELECT ts,account_email,api_key,model,status,latency_ms,input_tokens,cached_tokens,output_tokens,error,account_id,service_tier,diagnostics,seq FROM request_log{filter} ORDER BY seq DESC LIMIT ? OFFSET ?")).map_err(|e| e.to_string())?;
+        let mut rows = statement
+            .query(rusqlite::params_from_iter(&values))
+            .map_err(|e| e.to_string())?;
+        let mut items = Vec::new();
+        while let Some(row) = rows.next().map_err(|e| e.to_string())? {
+            items.push(LogRecord {
+                seq: row.get(13).map_err(|e| e.to_string())?,
+                entry: Self::log_from_row(row)?,
+            });
+        }
+        Ok(LogPage {
+            items,
+            total,
+            page,
+            limit,
+        })
+    }
+
+    fn log_from_row(row: &rusqlite::Row) -> Result<LogEntry, String> {
+        Ok(LogEntry {
+            ts: row.get(0).map_err(|e| e.to_string())?,
+            account_email: row.get(1).map_err(|e| e.to_string())?,
+            api_key: row.get(2).map_err(|e| e.to_string())?,
+            model: row.get(3).map_err(|e| e.to_string())?,
+            status: row.get(4).map_err(|e| e.to_string())?,
+            latency_ms: row.get(5).map_err(|e| e.to_string())?,
+            input_tokens: row.get(6).map_err(|e| e.to_string())?,
+            cached_tokens: row.get(7).map_err(|e| e.to_string())?,
+            output_tokens: row.get(8).map_err(|e| e.to_string())?,
+            error: row.get(9).map_err(|e| e.to_string())?,
+            account_id: row.get(10).map_err(|e| e.to_string())?,
+            service_tier: row.get(11).map_err(|e| e.to_string())?,
+            diagnostics: row
+                .get::<_, Option<String>>(12)
+                .map_err(|e| e.to_string())?
+                .map(|raw| serde_json::from_str(&raw))
+                .transpose()
+                .map_err(|e| format!("request diagnostics: {e}"))?,
+        })
+    }
+
     pub fn recent_logs(&self, limit: i64) -> Result<Vec<LogEntry>, String> {
         let conn = self.conn.lock().unwrap_or_else(|e| e.into_inner());
         let mut stmt = conn
@@ -1228,26 +1335,7 @@ impl Store {
             .map_err(|e| e.to_string())?;
         let mut out = Vec::new();
         while let Some(row) = rows.next().map_err(|e| e.to_string())? {
-            out.push(LogEntry {
-                ts: row.get(0).map_err(|e| e.to_string())?,
-                account_email: row.get(1).map_err(|e| e.to_string())?,
-                api_key: row.get(2).map_err(|e| e.to_string())?,
-                model: row.get(3).map_err(|e| e.to_string())?,
-                status: row.get(4).map_err(|e| e.to_string())?,
-                latency_ms: row.get(5).map_err(|e| e.to_string())?,
-                input_tokens: row.get(6).map_err(|e| e.to_string())?,
-                cached_tokens: row.get(7).map_err(|e| e.to_string())?,
-                output_tokens: row.get(8).map_err(|e| e.to_string())?,
-                error: row.get(9).map_err(|e| e.to_string())?,
-                account_id: row.get(10).map_err(|e| e.to_string())?,
-                service_tier: row.get(11).map_err(|e| e.to_string())?,
-                diagnostics: row
-                    .get::<_, Option<String>>(12)
-                    .map_err(|e| e.to_string())?
-                    .map(|raw| serde_json::from_str(&raw))
-                    .transpose()
-                    .map_err(|e| format!("request diagnostics: {e}"))?,
-            });
+            out.push(Self::log_from_row(row)?);
         }
         Ok(out)
     }

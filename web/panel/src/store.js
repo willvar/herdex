@@ -1,69 +1,92 @@
-// Shared reactive store — one place for fetched state + loaders.
 import { reactive } from 'vue'
-import { api, getKey } from './api.js'
-
-export const store = reactive({
-  ready: false,
-  st: null,          // /state payload
-  usage7: null,      // /usage?days=7
-  usage30: null,     // /usage?days=30 (fetched on demand)
-  calibration: null,
-  history: null,
-  liveQuota: {},     // email -> live quota report
-  quotaErr: {},      // email -> error string
-  quotaOpen: {},     // email -> detail row expanded
-  quotaLoading: {},  // email -> live fetch in flight (查询中…)
+import { api, getKey, getKeyEpoch, onKeyChange } from './api.js'
+const initial = () => ({
+  ready: false, st: null, usage7: null, usage30: null, calibration: null, history: null,
+  liveQuota: {}, quotaErr: {}, quotaOpen: {}, quotaLoading: {}, status: {}, authError: '',
 })
-
+export const store = reactive(initial())
 let settingsRevision = 0
-
+let mutationRevision = 0
+const serials = {}
+onKeyChange(reason => {
+  mutationRevision++
+  settingsRevision++
+  Object.assign(store, initial(), { authError: reason })
+})
 export function commitSettings(settings) {
   settingsRevision++
   store.st = { ...store.st, settings }
 }
-
-export async function loadState() {
-  if (!getKey()) return
-  const revision = settingsRevision
-  const state = await api('GET', '/state')
-  // A poll started before a successful save may still contain old settings.
-  // Keep the saved settings while accepting the poll's other refreshed data.
-  store.st = revision === settingsRevision
-    ? state
-    : { ...state, settings: store.st.settings }
-  store.ready = true
+export async function mutate(method, path, body) {
+  mutationRevision++
+  try { return body === undefined ? await api(method, path) : await api(method, path, body) }
+  finally { mutationRevision++ }
 }
-
-export async function loadUsage(range) {
-  if (!getKey()) return
-  store.usage7 = await api('GET', '/usage?days=7')
-  // refresh 30d on demand AND whenever it's already loaded (keeps the
-  // month view fresh under the periodic reload instead of going stale)
-  if (range === 30 || store.usage30) store.usage30 = await api('GET', '/usage?days=30')
+export async function refreshAfterMutation({ capacity = false } = {}) {
+  const results = await Promise.allSettled([loadState(), ...(capacity ? [loadCalibration()] : [])])
+  return results.every(result => result.status === 'fulfilled' && result.value !== undefined)
 }
-
-export async function loadHistory() {
+async function load(name, path, commit) {
   if (!getKey()) return
-  store.history = await api('GET', '/history?days=30')
-}
-
-export async function loadCalibration() {
-  if (!getKey()) return
-  store.calibration = await api('GET', '/calibration')
-}
-
-export async function fetchQuota(id, email, silent) {
-  if (store.quotaLoading[email]) return
-  store.quotaLoading[email] = true
-  delete store.quotaErr[email]
+  const session = getKeyEpoch()
+  const serial = serials[name] = (serials[name] || 0) + 1
+  const revision = mutationRevision
+  const settings = settingsRevision
+  const valid = () => session === getKeyEpoch() && serials[name] === serial
+  store.status[name] = { ...store.status[name], loading: true, error: '' }
   try {
-    const r = await api('POST', `/accounts/${id}/quota`)
-    store.liveQuota[email] = r
-    delete store.quotaErr[email]
-  } catch (e) {
-    store.quotaErr[email] = e.message
-    if (!silent) alert(e.message)
+    const value = await api('GET', path)
+    if (valid() && (name !== 'state' || revision === mutationRevision)) {
+      commit(value, settings)
+      store.status[name] = { loading: false, error: '', updatedAt: Date.now() }
+      return value
+    }
+  } catch (error) {
+    if (valid()) { store.status[name].error = error.message; throw error }
   } finally {
-    delete store.quotaLoading[email]
+    if (valid()) store.status[name].loading = false
+  }
+}
+export function loadState() {
+  return load('state', '/state', (state, settings) => {
+    store.st = settings === settingsRevision ? state : { ...state, settings: store.st?.settings }
+    store.ready = true
+    const ids = new Set((state.accounts || []).map(a => a.id))
+    for (const id of Object.keys(store.liveQuota)) {
+      const live = store.liveQuota[id]
+      const cached = Object.values(state.quota?.[id] || {})
+      if (!ids.has(id) || cached.some(q =>
+        q.observed_at > live.observed_at || (q.observed_at === live.observed_at && q.observed_seq > live.observed_seq))) delete store.liveQuota[id]
+    }
+    for (const map of [store.quotaOpen, store.quotaErr, store.quotaLoading]) {
+      for (const id of Object.keys(map)) if (!ids.has(id)) delete map[id]
+    }
+  })
+}
+export async function loadUsage(range) {
+  const ranges = range ? [range] : store.usage30 ? [7, 30] : [7]
+  const results = await Promise.allSettled(ranges.map(days => load(`usage${days}`, `/usage?days=${days}`, value => { store[`usage${days}`] = value })))
+  const failed = results.find(r => r.status === 'rejected')
+  if (failed) throw failed.reason
+}
+export const loadHistory = () => load('history', '/history?days=30', value => { store.history = value })
+export const loadCalibration = () => load('calibration', '/calibration', value => { store.calibration = value })
+export async function fetchQuota(id, _email, _silent) {
+  if (!getKey() || store.quotaLoading[id]) return
+  const session = getKeyEpoch()
+  store.quotaLoading[id] = true
+  delete store.quotaErr[id]
+  try {
+    const value = await api('POST', `/accounts/${encodeURIComponent(id)}/quota`)
+    if (session === getKeyEpoch() && store.st?.accounts?.some(a => a.id === id)) {
+      const newer = Object.values(store.st.quota?.[id] || {}).some(q => q.observed_at > value.observed_at || (q.observed_at === value.observed_at && q.observed_seq > value.observed_seq))
+      if (newer) { delete store.liveQuota[id]; return }
+      store.liveQuota[id] = { ...value, fetched_at: Math.floor(Date.now() / 1000) }
+      delete store.quotaErr[id]
+    }
+  } catch (error) {
+    if (session === getKeyEpoch()) store.quotaErr[id] = error.message
+  } finally {
+    if (session === getKeyEpoch()) delete store.quotaLoading[id]
   }
 }

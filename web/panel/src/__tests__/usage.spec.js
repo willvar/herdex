@@ -24,13 +24,15 @@ vi.mock('naive-ui', async () => {
     NCard: { setup: (_props, { slots }) => () => h('div', slots.default?.()) },
     NButton: { setup: (_props, { slots }) => () => h('button', slots.default?.()) },
     NDataTable: { render: () => null },
+    NAlert: { render: () => null },
+    NButtonGroup: { setup: (_props, { slots }) => () => h('div', slots.default?.()) },
   }
 })
 
 enableAutoUnmount(afterEach)
 
 const options = { global: { stubs: { 'n-button-group': { template: '<div><slot/></div>' } } } }
-const forecastCard = wrapper => wrapper.findAll('.card').find(card => card.text().includes('池子预计触顶'))
+const forecastCard = wrapper => wrapper.findAll('.card').find(card => card.text().includes('静态余量折算'))
 const clickRange = async (wrapper, days) => {
   await wrapper.findAll('button').find(button => button.text() === `${days}天`).trigger('click')
   await flushPromises()

@@ -14,39 +14,10 @@ impl TestStore {
         Self { store, root }
     }
 
-    fn legacy(with_plan: bool) -> (Self, i64) {
-        let root = std::env::temp_dir().join(format!("herdex-store-{}", uuid::Uuid::new_v4()));
-        std::fs::create_dir_all(&root).unwrap();
-        let conn = rusqlite::Connection::open(root.join("herdex.db")).unwrap();
-        conn.execute_batch(
-            "CREATE TABLE request_log (
-                seq INTEGER PRIMARY KEY AUTOINCREMENT,
-                ts INTEGER NOT NULL,
-                account_email TEXT NOT NULL DEFAULT '',
-                model TEXT NOT NULL,
-                status INTEGER NOT NULL,
-                latency_ms INTEGER NOT NULL DEFAULT 0,
-                input_tokens INTEGER NOT NULL DEFAULT 0,
-                cached_tokens INTEGER NOT NULL DEFAULT 0,
-                output_tokens INTEGER NOT NULL DEFAULT 0,
-                error TEXT NOT NULL DEFAULT ''
-             );
-             CREATE TABLE usage_probes (
-                account_id TEXT NOT NULL,
-                ts INTEGER NOT NULL,
-                used_pct REAL NOT NULL,
-                reset_at INTEGER NOT NULL DEFAULT 0,
-                PRIMARY KEY (account_id, ts)
-             );",
-        )
-        .unwrap();
-        if with_plan {
-            conn.execute(
-                "ALTER TABLE usage_probes ADD COLUMN plan TEXT NOT NULL DEFAULT ''",
-                [],
-            )
-            .unwrap();
-        }
+    // Seed observations whose ordering is unknown, using the current schema.
+    fn unsequenced(with_plan: bool) -> (Self, i64) {
+        let db = Self::new();
+        let conn = rusqlite::Connection::open(db.root.join("herdex.db")).unwrap();
         let t = now_secs() - 60;
         for (offset, pct) in [(0, 0.0), (10, 1.0), (20, 2.0)] {
             conn.execute(
@@ -68,8 +39,7 @@ impl TestStore {
             .unwrap();
         }
         drop(conn);
-        let store = Store::open(root.to_str().unwrap()).unwrap();
-        (Self { store, root }, t)
+        (db, t)
     }
 
     fn account(&self, id: &str) {
@@ -180,8 +150,8 @@ fn request_tiers_roundtrip_without_changing_usage_or_calibration() {
 }
 
 #[test]
-fn tier_migration_keeps_legacy_requests_unknown_and_preserves_history() {
-    let (db, _) = TestStore::legacy(true);
+fn unrecorded_tiers_remain_unknown_after_reopening() {
+    let (db, _) = TestStore::unsequenced(true);
     db.account("a");
     let before = db.store.calibration("a").unwrap().unwrap();
     for _ in 0..2 {
@@ -210,7 +180,7 @@ fn tier_migration_keeps_legacy_requests_unknown_and_preserves_history() {
 
 #[test]
 fn request_diagnostics_survive_reopening_without_changing_existing_usage() {
-    let (db, _) = TestStore::legacy(true);
+    let (db, _) = TestStore::unsequenced(true);
     let before = db.store.usage_daily(1).unwrap();
     let diagnostics = RequestDiagnostics {
         request_id: "test-request".into(),
@@ -486,8 +456,8 @@ fn legacy_logs_require_a_nonempty_unique_email() {
 }
 
 #[test]
-fn old_database_migration_preserves_history_and_rebases_into_ordered_samples() {
-    let (db, t) = TestStore::legacy(true);
+fn unknown_order_observations_remain_distinct_from_ordered_samples() {
+    let (db, t) = TestStore::unsequenced(true);
     db.account("a");
     let history = db.store.probe_history(1).unwrap();
     assert_eq!(
@@ -503,7 +473,7 @@ fn old_database_migration_preserves_history_and_rebases_into_ordered_samples() {
         .iter()
         .all(|l| l.account_id.is_empty()));
 
-    // The migration cannot reconstruct this interval's exact ordering.
+    // Unknown ordering must not be reconstructed from timestamps.
     log(&db.store, t + 20, 10_000, 0, 0);
     db.store.add_probe("a", t + 20, 3.0, 100, "");
     log(&db.store, t + 20, 400, 0, 0);
@@ -534,8 +504,8 @@ fn old_database_migration_preserves_history_and_rebases_into_ordered_samples() {
 }
 
 #[test]
-fn migration_also_accepts_probe_history_without_a_plan_column() {
-    let (db, _) = TestStore::legacy(false);
+fn unknown_plan_observations_do_not_invent_a_plan() {
+    let (db, _) = TestStore::unsequenced(false);
     db.account("a");
     assert!(db
         .store
@@ -549,7 +519,7 @@ fn migration_also_accepts_probe_history_without_a_plan_column() {
 
 #[test]
 fn legacy_reset_discards_logs_even_when_completion_order_differs_from_timestamp_order() {
-    let (db, t) = TestStore::legacy(false);
+    let (db, t) = TestStore::unsequenced(false);
     db.account("a");
     let conn = rusqlite::Connection::open(db.root.join("herdex.db")).unwrap();
     conn.execute(

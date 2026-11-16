@@ -1,11 +1,13 @@
 <script setup>
-import { computed, h, reactive } from 'vue'
+import { computed, h, reactive, ref } from 'vue'
 import { NCard, NDataTable, NButton, NSwitch, NTag, NPopconfirm, useMessage } from 'naive-ui'
-import { api } from '../api.js'
 import { planLabel } from '../plans.js'
-import { store, loadState, fetchQuota } from '../store.js'
+import { store, mutate, refreshAfterMutation, fetchQuota } from '../store.js'
 
 const message = useMessage()
+const emit = defineEmits(['reauthorize'])
+const pending = reactive({})
+const refreshing = ref(false), progress = ref('')
 const accounts = computed(() => store.st?.accounts || [])
 const cachedQuota = computed(() => store.st?.quota || {})
 const resets = reactive({})
@@ -13,13 +15,13 @@ const resets = reactive({})
 function tsOf(v) { if (!v) return 0; return typeof v === 'number' ? (v < 1e12 ? v * 1000 : v) : Date.parse(v) }
 function remPct(w) { return Math.round(100 - w.used_pct) }
 function remColor(rem) { return rem < 10 ? '#e07070' : rem < 30 ? 'orange' : '#5fd0a0' }
-function normWin(pct, resetEpoch, secs) {
-  return { used_pct: pct, reset_at: resetEpoch ? resetEpoch * 1000 : null, window_seconds: secs || null }
+function normWin(pct, resetEpoch, secs, known) {
+  return { used_pct: known === false ? null : pct, reset_at: resetEpoch ? resetEpoch * 1000 : null, window_seconds: secs || null }
 }
 function cdRel(epochMs) {
   if (!epochMs || epochMs < 0) return '—'
   const diff = epochMs - Date.now()
-  if (diff <= 0) return '已重置'
+  if (diff <= 0) return '预计已到期，待确认'
   const h = Math.floor(diff / 36e5), m = Math.floor((diff % 36e5) / 6e4)
   if (h >= 24) return `${Math.floor(h / 24)}天${h % 24}时`
   if (h > 0) return `${h}时${m}分`
@@ -57,15 +59,15 @@ function hasData(w) {
     ((w.window_seconds && w.window_seconds > 0) || tsOf(w.reset_at) > 0)
 }
 function quotaRows(a) {
-  const live = store.liveQuota[a.email]
-  const cached = cachedQuota.value[a.email]
+  const live = store.liveQuota[a.id]
+  const cached = cachedQuota.value[a.id]
   const entries = []
   if (live) {
     entries.push(['主窗口', live.main?.primary, live.main?.secondary])
     for (const x of live.additional || []) entries.push([x.name, x.limit?.primary, x.limit?.secondary])
   } else if (cached) {
     for (const [m, q] of Object.entries(cached))
-      entries.push([m, normWin(q.primary_pct, q.primary_reset_at, q.primary_window_secs), normWin(q.secondary_pct, q.secondary_reset_at, q.secondary_window_secs)])
+      entries.push([m, normWin(q.primary_pct, q.primary_reset_at, q.primary_window_secs, q.primary_known), normWin(q.secondary_pct, q.secondary_reset_at, q.secondary_window_secs, q.secondary_known)])
   }
   const rows = []
   for (const [name, pri, sec] of entries) {
@@ -75,17 +77,28 @@ function quotaRows(a) {
   return rows
 }
 
-async function toggle(a, dis) {
-  try { await api('POST', `/accounts/${a.id}/disable`, { disabled: dis }); loadState() } catch (e) { message.error(e.message) }
+async function accountAction(a, method, path, body, label) {
+  if (pending[a.id] || resets[a.id]?.loading) return
+  pending[a.id] = true
+  try {
+    await mutate(method, path, body)
+    if (!await refreshAfterMutation({ capacity: true })) message.warning(`${label}，但列表刷新失败，请刷新核对，不要重复操作`)
+    else message.success(label)
+  } catch (error) { message.error(error.message) }
+  finally { delete pending[a.id] }
 }
-function delAcc(a) {
-  api('DELETE', `/accounts/${a.id}`).then(loadState).catch(e => message.error(e.message))
+const toggle = (a, dis) => accountAction(a, 'POST', `/accounts/${a.id}/disable`, { disabled: dis }, dis ? '账号已禁用' : '账号已启用')
+const delAcc = a => accountAction(a, 'DELETE', `/accounts/${a.id}`, undefined, '账号已删除')
+function freshQuota(a) {
+  const q = store.liveQuota[a.id]
+  const observed = q?.observed_at || q?.fetched_at
+  return !!observed && Date.now() / 1000 - observed < 180
 }
 async function consumeReset(a) {
   if (!canReset(a)) return false
   const result = resets[a.id] = reactive({ loading: true, type: 'info', text: '正在消耗 1 张最早过期券并重置…' })
   try {
-    const r = await api('POST', `/accounts/${a.id}/quota/consume`)
+    const r = await mutate('POST', `/accounts/${a.id}/quota/consume`)
     if (r?.consumed !== true) throw new Error('未收到有效的重置结果')
     result.type = 'success'
     result.text = '重置成功：已消耗 1 张最早过期券。'
@@ -99,16 +112,29 @@ async function consumeReset(a) {
   if (result.type === 'success') void fetchQuota(a.id, a.email, true)
 }
 function canReset(a) {
-  return !resets[a.id]?.loading && !store.quotaLoading[a.email] && !store.quotaErr[a.email] &&
-    (store.liveQuota[a.email]?.credits?.available ?? 0) > 0
+  return !resets[a.id]?.loading && !store.quotaLoading[a.id] && !store.quotaErr[a.id] &&
+    freshQuota(a) && (store.liveQuota[a.id]?.credits?.available ?? 0) > 0
 }
-async function toggleAll() {
-  const anyClosed = accounts.value.some(a => !store.quotaOpen[a.id])
-  for (const a of accounts.value) store.quotaOpen[a.id] = anyClosed
-  if (anyClosed) {
+function toggleAll() {
+  const open = accounts.value.some(a => !store.quotaOpen[a.id])
+  for (const a of accounts.value) store.quotaOpen[a.id] = open
+}
+async function refreshAll() {
+  if (refreshing.value) return
+  refreshing.value = true
+  try {
+    let done = 0
     for (const a of accounts.value) {
+      progress.value = `${++done}/${accounts.value.length}`
       if (!resets[a.id]?.loading) await fetchQuota(a.id, a.email, true)
     }
+  } finally { refreshing.value = false; progress.value = '' }
+}
+function expandRows(keys) {
+  for (const a of accounts.value) {
+    const newlyOpened = keys.includes(a.id) && !store.quotaOpen[a.id]
+    store.quotaOpen[a.id] = keys.includes(a.id)
+    if (newlyOpened && !resets[a.id]?.loading) void fetchQuota(a.id, a.email, true)
   }
 }
 
@@ -128,15 +154,16 @@ const resetCreditColumns = [
 ]
 
 function renderQuota(row) {
-  const loading = store.quotaLoading[row.email]
-  const error = store.quotaErr[row.email]
+  const loading = store.quotaLoading[row.id]
+  const error = store.quotaErr[row.id]
   const rows = quotaRows(row)
-  const live = store.liveQuota[row.email]
+  const live = store.liveQuota[row.id]
   const reset = resets[row.id]
   const resetDetails = live?.reset_credits
   const resetRows = resetCreditRows(resetDetails)
-  const stale = rows.length > 0 && (loading || error || !live)
+  const stale = rows.length > 0 && (loading || error || !live || !freshQuota(row))
   return h('div', { style: 'padding:8px 12px 4px' }, [
+    h('div', { class: 'muted' }, `工作区：${row.workspace_id || '未知'} · 额度观测时间：${live?.observed_at || live?.fetched_at ? new Date((live.observed_at || live.fetched_at) * 1000).toLocaleString('zh-CN', { timeZone: 'Asia/Hong_Kong' }) + ' HKT' : '见缓存 / 未知'}`),
     loading && h('div', { role: 'status', class: 'muted' }, '查询中…'),
     error && h('div', { role: 'alert', class: 'err' }, `查询失败：${error}`),
     stale && h('div', { class: 'muted' }, '以下为上次观测的额度，可能已过期。'),
@@ -180,20 +207,21 @@ function renderQuota(row) {
 
 const columns = [
   { type: 'expand', expandable: () => true, renderExpand: renderQuota },
-  { title: '邮箱', key: 'email', minWidth: 180 },
+  { title: '账号 / 工作区', key: 'email', minWidth: 180, render: r => `${r.email} · ${r.workspace_id?.slice(-6) || r.id.slice(-6)}` },
   { title: 'Plan', key: 'plan_type', minWidth: 140, render: r =>
     h('span', { title: r.plan_type }, planLabel(r.plan_type)) },
   { title: 'Token 过期', key: 'expires_at', width: 140 },
   { title: '状态', key: 'status', width: 170, render: (r) => {
     if (r.disabled) return h(NTag, { type: 'error', size: 'small' }, { default: () => '已禁用' })
     if (r.last_error) return h(NTag, { type: 'error', size: 'small' }, { default: () => r.last_error.slice(0, 40) })
-    return h(NTag, { type: 'success', size: 'small' }, { default: () => '正常' })
+    return h(NTag, { type: 'success', size: 'small' }, { default: () => '已启用 · 健康未确认' })
   } },
-  { title: '操作', key: 'actions', width: 170, render: (r) =>
+  { title: '操作', key: 'actions', width: 270, render: (r) =>
     h('span', { style: 'display:inline-flex;gap:8px;align-items:center', onClick: e => e.stopPropagation() }, [
-      h(NSwitch, { size: 'small', value: !r.disabled, 'onUpdateValue': v => toggle(r, !v) }),
+      h(NSwitch, { size: 'small', 'aria-label': '账号启用状态', loading: !!pending[r.id], disabled: !!pending[r.id] || !!resets[r.id]?.loading, value: !r.disabled, 'onUpdateValue': v => toggle(r, !v) }),
+      h(NButton, { size: 'tiny', disabled: !!pending[r.id] || !!resets[r.id]?.loading, onClick: () => emit('reauthorize', r.id) }, { default: () => '更新凭据' }),
       h(NPopconfirm, { onPositiveClick: () => delAcc(r) }, {
-        trigger: () => h(NButton, { size: 'tiny', type: 'error', ghost: true }, { default: () => '删除' }),
+        trigger: () => h(NButton, { size: 'tiny', type: 'error', ghost: true, disabled: !!pending[r.id] || !!resets[r.id]?.loading }, { default: () => '删除' }),
         default: () => '删除该账号？',
       }),
     ]) },
@@ -201,7 +229,8 @@ const columns = [
 
 const rowProps = (r) => ({
   style: 'cursor:pointer',
-  onClick: () => {
+  onClick: event => {
+    if (event.target?.closest?.('.n-data-table-expand-trigger')) return
     store.quotaOpen[r.id] = !store.quotaOpen[r.id]
     if (store.quotaOpen[r.id] && !resets[r.id]?.loading) fetchQuota(r.id, r.email, true)
   },
@@ -216,6 +245,13 @@ const rowProps = (r) => ({
     <template #header-extra>
       <n-button
         size="small"
+        :loading="refreshing"
+        @click="refreshAll"
+      >
+        刷新全部额度 {{ progress }}
+      </n-button>
+      <n-button
+        size="small"
         @click="toggleAll"
       >
         一键展开/收起
@@ -226,8 +262,10 @@ const rowProps = (r) => ({
       :data="accounts"
       :row-key="r => r.id"
       :row-props="rowProps"
+      :scroll-x="1000"
       :expanded-row-keys="accounts.filter(a => store.quotaOpen[a.id]).map(a => a.id)"
       size="small"
+      @update:expanded-row-keys="expandRows"
     >
       <template #empty>
         还没有账号，展开“添加账号”

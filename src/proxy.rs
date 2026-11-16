@@ -1275,6 +1275,9 @@ async fn attempt_once(
                     primary_window_secs: pri_secs.unwrap_or(0),
                     secondary_window_secs: sec_secs.unwrap_or(0),
                     observed_at: crate::store::now_secs(),
+                    observed_seq: 0,
+                    primary_known: Some(pri.is_some()),
+                    secondary_known: Some(sec.is_some()),
                 },
             );
             // every successful response carries the main window's live usage —

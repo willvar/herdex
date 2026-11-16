@@ -27,6 +27,11 @@ pub struct Quota {
     pub primary_window_secs: i64,
     pub secondary_window_secs: i64,
     pub observed_at: i64,
+    pub observed_seq: u64,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub primary_known: Option<bool>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub secondary_known: Option<bool>,
 }
 
 #[derive(Clone, Copy, Default)]
@@ -96,6 +101,7 @@ impl Drop for PoolLease {
 
 #[derive(Default)]
 struct PoolInner {
+    observation_seq: u64,
     quota: HashMap<(String, String), Quota>,
     failures: HashMap<(String, String), Failure>,
     last_used: HashMap<String, i64>,
@@ -148,6 +154,8 @@ impl Pool {
         let mut inner = self.shared.state.lock().unwrap_or_else(|e| e.into_inner());
         let mut q = q;
         q.observed_at = (self.shared.now)();
+        inner.observation_seq = inner.observation_seq.saturating_add(1);
+        q.observed_seq = inner.observation_seq;
         inner
             .quota
             .insert((acc_id.to_string(), model.to_string()), q);
@@ -691,6 +699,9 @@ impl Pool {
                     primary_window_secs: 0,
                     secondary_window_secs: 0,
                     observed_at: ts,
+                    observed_seq: 0,
+                    primary_known: None,
+                    secondary_known: None,
                 },
             );
         }
@@ -1260,6 +1271,9 @@ mod tests {
                 primary_window_secs: 0,
                 secondary_window_secs: 0,
                 observed_at: 0,
+                observed_seq: 0,
+                primary_known: None,
+                secondary_known: None,
             },
         );
         p.observe(

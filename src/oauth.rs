@@ -24,11 +24,17 @@ pub struct OpenAIAuth {
     #[serde(default)]
     pub chatgpt_account_id: String,
     #[serde(default)]
+    pub chatgpt_user_id: String,
+    #[serde(default)]
+    pub user_id: String,
+    #[serde(default)]
     pub chatgpt_plan_type: String,
 }
 
 #[derive(Deserialize, Clone, Default)]
 pub struct Claims {
+    #[serde(default)]
+    pub sub: String,
     #[serde(default)]
     pub email: String,
     #[serde(default)]
@@ -36,12 +42,32 @@ pub struct Claims {
     #[serde(default)]
     pub chatgpt_account_id: String,
     #[serde(default)]
+    pub chatgpt_user_id: String,
+    #[serde(default)]
+    pub user_id: String,
+    #[serde(default)]
     pub chatgpt_plan_type: String,
     #[serde(default, rename = "https://api.openai.com/auth")]
     pub openai_auth: OpenAIAuth,
 }
 
 impl Claims {
+    pub fn user_id(&self) -> Option<String> {
+        [
+            &self.chatgpt_user_id,
+            &self.user_id,
+            &self.openai_auth.chatgpt_user_id,
+            &self.openai_auth.user_id,
+        ]
+        .into_iter()
+        .find(|id| !id.is_empty() && id.trim() == id.as_str())
+        .map(|id| format!("chatgpt:{id}"))
+        .or_else(|| {
+            (!self.sub.is_empty() && self.sub.trim() == self.sub)
+                .then(|| format!("oidc:{}", self.sub))
+        })
+    }
+
     pub fn account_id(&self) -> String {
         if !self.chatgpt_account_id.is_empty() {
             self.chatgpt_account_id.clone()
@@ -61,6 +87,7 @@ impl Claims {
 
 #[derive(Clone)]
 pub struct PKCE {
+    pub created_at: i64,
     pub verifier: String,
     pub challenge: String,
     pub state: String,
@@ -72,6 +99,7 @@ pub fn new_pkce() -> Result<PKCE, String> {
     let challenge = URL_SAFE_NO_PAD.encode(digest);
     let state = random_b64(16)?;
     Ok(PKCE {
+        created_at: crate::store::now_secs(),
         verifier,
         challenge,
         state,

@@ -4,7 +4,7 @@ import { api } from '../api.js'
 import { store } from '../store.js'
 import Accounts from '../components/Accounts.vue'
 
-vi.mock('../api.js', () => ({ api: vi.fn(), getKey: () => 'test-manage-key' }))
+vi.mock('../api.js', async importOriginal => ({ ...await importOriginal(), api: vi.fn(), getKey: () => 'test-manage-key' }))
 const messages = vi.hoisted(() => ({ success: vi.fn(), error: vi.fn() }))
 // Exercise the real confirmation, buttons and expanded table row.
 vi.mock('naive-ui', async importOriginal => ({
@@ -14,6 +14,7 @@ vi.mock('naive-ui', async importOriginal => ({
 
 const account = { id: 'a', email: 'a@example.test' }
 const quota = (used = 95, available = 2) => ({
+  observed_at: Math.floor(Date.now() / 1000),
   main: { primary: { used_pct: used, window_seconds: 18000 }, secondary: {} },
   credits: { available, applicable: available },
 })
@@ -39,7 +40,7 @@ beforeEach(() => {
   vi.clearAllMocks()
   api.mockReset().mockResolvedValue(state())
   Object.assign(store, {
-    st: state(), liveQuota: { [account.email]: quota() }, quotaErr: {},
+    st: state(), liveQuota: { [account.id]: quota() }, quotaErr: {},
     quotaOpen: { a: true }, quotaLoading: {},
   })
   wrapper = mount(Accounts, { attachTo: document.body })
@@ -66,7 +67,7 @@ describe('Reset-credit confirmation and outcome', () => {
   })
 
   it('shows reset credit grant and expiry timestamps when the upstream provides details', async () => {
-    store.liveQuota[account.email] = {
+    store.liveQuota[account.id] = {
       ...quota(),
       reset_credits: {
         available_count: 2,
@@ -117,9 +118,9 @@ describe('Reset-credit confirmation and outcome', () => {
   })
 
   it.each(['empty', 'refreshing', 'stale'])('blocks redemption when quota is %s', async condition => {
-    if (condition === 'empty') store.liveQuota[account.email].credits.available = 0
-    if (condition === 'refreshing') store.quotaLoading[account.email] = true
-    if (condition === 'stale') store.quotaErr[account.email] = 'usage unavailable'
+    if (condition === 'empty') store.liveQuota[account.id].credits.available = 0
+    if (condition === 'refreshing') store.quotaLoading[account.id] = true
+    if (condition === 'stale') store.quotaErr[account.id] = 'usage unavailable'
     await flushPromises()
     expect(button(triggerText).element.disabled).toBe(true)
     await button(triggerText).trigger('click')
@@ -130,7 +131,7 @@ describe('Reset-credit confirmation and outcome', () => {
     api.mockRejectedValueOnce(new Error('upstream timeout'))
     await confirmReset()
     expect(wrapper.get('[role="alert"]').text()).toBe('重置请求失败：upstream timeout')
-    expect(store.liveQuota[account.email].credits.available).toBe(2)
+    expect(store.liveQuota[account.id].credits.available).toBe(2)
     expect(messages.error).toHaveBeenCalledOnce()
     expect(messages.success).not.toHaveBeenCalled()
     expect(api).toHaveBeenCalledTimes(1)

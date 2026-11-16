@@ -1,6 +1,6 @@
 <script setup>
 import { computed, ref, onMounted, onUnmounted, watch, nextTick } from 'vue'
-import { NCard, NButton, NDataTable } from 'naive-ui'
+import { NCard, NButton, NButtonGroup, NDataTable, NAlert } from 'naive-ui'
 import Chart from 'chart.js/auto'
 import { fmtTok } from '../api.js'
 import { store, loadUsage } from '../store.js'
@@ -11,11 +11,12 @@ const view = ref('tokens')  // tokens | capacity | models
 const canvasEl = ref(null)
 let chart = null
 
+const usageReady = computed(() => !!(range.value === 30 ? store.usage30 : store.usage7))
 const usage = computed(() => (range.value === 30 ? store.usage30 : store.usage7) || { daily: [] })
 const history = computed(() => store.history || { probes: [], model_daily: [] })
 
 const today = computed(() => {
-  const lb = new Date().toLocaleDateString('sv')
+  const lb = new Date().toLocaleDateString('sv', { timeZone: 'Asia/Hong_Kong' })
   const d = ((usage.value || {}).daily || []).find(x => x.label === lb) || {}
   return {
     requests: d.requests || 0,
@@ -32,7 +33,7 @@ const week = computed(() => {
   }
 })
 
-const calAccounts = computed(() => store.calibration?.accounts || [])
+const calAccounts = computed(() => (store.calibration?.accounts || []).filter(a => !a.disabled))
 
 const fc = computed(() => {
   const daily = (usage.value || {}).daily || []
@@ -56,7 +57,7 @@ function chartData() {
     const labels = dl.labels
     const datasets = series.value.map(k => ({
       label: seriesMeta[k].label,
-      data: labels.map(lb => seriesMeta[k].get(dl.map[new Date(Date.now() - (range.value - 1 - labels.indexOf(lb)) * 864e5).toLocaleDateString('sv')] || {})),
+      data: labels.map(lb => seriesMeta[k].get(dl.map[new Date(Date.now() - (range.value - 1 - labels.indexOf(lb)) * 864e5).toLocaleDateString('sv', { timeZone: 'Asia/Hong_Kong' })] || {})),
       backgroundColor: seriesMeta[k].color,
       stack: 't',
     }))
@@ -127,13 +128,11 @@ onMounted(async () => { await nextTick(); render() })
 onUnmounted(() => { chart?.destroy(); chart = null })
 watch([() => store.usage7, () => store.usage30, () => store.history, () => store.calibration, view, range, series], () => render())
 
-function setRange(r) { range.value = r; if (r === 30) loadUsage(30) }
+function setRange(r) { range.value = r; if (!(r === 30 ? store.usage30 : store.usage7)) void loadUsage(r).catch(() => {}) }
 
-const usage7rows = computed(() => (store.usage7 || {}).by_account || [])
-const usage7rows2 = computed(() => (store.usage7 || {}).by_model || [])
-const keyRange = ref(7)
-watch(keyRange, r => { if (r === 30 && !store.usage30) loadUsage(30) })
-const byKey = computed(() => keyRange.value === 30 ? (store.usage30?.by_key || []) : (store.usage7?.by_key || []))
+const usage7rows = computed(() => (usage.value || {}).by_account || [])
+const usage7rows2 = computed(() => (usage.value || {}).by_model || [])
+const byKey = computed(() => usage.value.by_key || [])
 const keyMap = computed(() => Object.fromEntries((store.st?.api_keys || []).map(k => [k.key, k.comment || k.key])))
 
 function usageCol(title, key, fmt) {
@@ -168,10 +167,19 @@ const modelColumns = [
     title="用量"
     size="small"
   >
-    <div class="cards">
+    <n-alert
+      v-if="!usageReady"
+      type="info"
+    >
+      {{ store.status[`usage${range}`]?.error ? '用量加载失败，请使用上方重试；尚未取得的数据不代表零用量。' : '正在加载用量…' }}
+    </n-alert>
+    <div
+      v-if="usageReady"
+      class="cards"
+    >
       <div class="card">
         <div class="l">
-          今日请求
+          今日请求尝试
         </div><div class="v">
           {{ today.requests }}
         </div>
@@ -195,7 +203,7 @@ const modelColumns = [
       </div>
       <div class="card">
         <div class="l">
-          近{{ range }}天请求
+          近{{ range }}天请求尝试
         </div><div class="v">
           {{ week.requests }}
         </div>
@@ -213,16 +221,19 @@ const modelColumns = [
         :style="fc.daysLeft < 3 ? 'border:1px solid var(--err)' : ''"
       >
         <div class="l">
-          池子预计触顶
+          静态余量折算
         </div>
         <div class="v">
           {{ fc.daysLeft }} 天后
         </div>
         <div class="l">
-          约 {{ fc.reachedAt }} · 日均 {{ fmtTok(fc.dailyTokens) }}
+          日均 {{ fmtTok(fc.dailyTokens) }} · 不含未来重置
         </div>
       </div>
     </div>
+    <p class="muted">
+      统计按 HKT 日界线计算，计数包含上游重试。余量仅覆盖可估算的启用账号，不考虑未来重置和模型组合变化。
+    </p>
     <div class="row">
       <n-button-group size="tiny">
         <n-button
@@ -251,7 +262,7 @@ const modelColumns = [
       <n-button
         size="tiny"
         :type="range === 7 ? 'primary' : 'default'"
-        @click="range = 7"
+        @click="setRange(7)"
       >
         7天
       </n-button>
@@ -289,7 +300,7 @@ const modelColumns = [
           class="muted"
           style="font-size:12px"
         >
-          按账号（7天）
+          按账号（近{{ range }}天）
         </h3>
         <n-data-table
           :data="usage7rows"
@@ -300,21 +311,7 @@ const modelColumns = [
       </div>
       <div>
         <h3 style="font-size:12px;color:var(--dim);margin:0 0 6px">
-          按 Key
-          <n-button
-            size="tiny"
-            :type="keyRange === 7 ? 'primary' : 'default'"
-            @click="keyRange = 7"
-          >
-            周
-          </n-button>
-          <n-button
-            size="tiny"
-            :type="keyRange === 30 ? 'primary' : 'default'"
-            @click="keyRange = 30"
-          >
-            月
-          </n-button>
+          按 Key（近{{ range }}天）
         </h3>
         <n-data-table
           :data="byKey"
@@ -325,7 +322,7 @@ const modelColumns = [
       </div>
       <div>
         <h3 style="font-size:12px;color:var(--dim);margin:0 0 6px">
-          按模型（7天）
+          按模型（近{{ range }}天）
         </h3>
         <n-data-table
           :data="usage7rows2"

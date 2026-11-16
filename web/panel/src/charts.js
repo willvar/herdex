@@ -3,7 +3,7 @@
 export function dailyLabels(days, daily) {
   const labels = [], map = {}
   for (let i = days - 1; i >= 0; i--) {
-    const lb = new Date(Date.now() - i * 864e5).toLocaleDateString('sv')
+    const lb = new Date(Date.now() - i * 864e5).toLocaleDateString('sv', { timeZone: 'Asia/Hong_Kong' })
     labels.push(lb.slice(5))
     map[lb] = (daily || []).find(y => y.label === lb) || {}
   }
@@ -19,7 +19,7 @@ export const seriesMeta = {
 // Per-model daily burn: {labels, datasets:[{model, data:[totalTokPerDay]}]}
 export function modelSeries(modelDaily, days) {
   const labels = []
-  for (let i = days - 1; i >= 0; i--) labels.push(new Date(Date.now() - i * 864e5).toLocaleDateString('sv').slice(5))
+  for (let i = days - 1; i >= 0; i--) labels.push(new Date(Date.now() - i * 864e5).toLocaleDateString('sv', { timeZone: 'Asia/Hong_Kong' }).slice(5))
   const models = [...new Set((modelDaily || []).map(r => r.model))]
   const palette = ['#7c6cf0', '#5fd0a0', '#e0a070', '#70b0e0', '#e07070', '#b0b0c0']
   const byKey = {}
@@ -27,7 +27,7 @@ export function modelSeries(modelDaily, days) {
   const datasets = models.map((m, i) => ({
     label: m,
     data: labels.map(lb => {
-      const dayFull = new Date(Date.now() - (days - 1 - labels.indexOf(lb)) * 864e5).toLocaleDateString('sv')
+      const dayFull = new Date(Date.now() - (days - 1 - labels.indexOf(lb)) * 864e5).toLocaleDateString('sv', { timeZone: 'Asia/Hong_Kong' })
       const r = byKey[dayFull + '|' + m]
       return r ? (r.input + r.output) : 0
     }),
@@ -123,7 +123,7 @@ export function capacitySeries(probeHistory, calAccounts, days) {
 // Burn projection: days until the pool window bottom, given remaining tokens
 // (calibration) and daily burn (request_log). Also % slope for chart overlay.
 export function forecast(poolRemainingTokens, dailyTokens, poolTokensPerPct, currentPoolPct) {
-  if (!dailyTokens || !poolRemainingTokens) return null
+  if (!dailyTokens || poolRemainingTokens == null) return null
   const daysLeft = poolRemainingTokens / dailyTokens
   const daysFull = daysLeft + 10  // pools never hit literally 100%: pad a little
   // % slope: pool-weighted pct per day

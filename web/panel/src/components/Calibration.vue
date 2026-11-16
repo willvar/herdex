@@ -34,6 +34,7 @@ const columns = [
   { title: '账号', key: 'email', minWidth: 170 },
   { title: 'Plan', key: 'plan_type', minWidth: 140, render: a =>
     h('span', { title: a.plan_type }, planLabel(a.plan_type)) },
+  { title: '状态', key: 'disabled', width: 70, render: a => a.disabled ? '禁用' : '启用' },
   { title: '已用', key: 'used_pct', width: 70, render: a => a.used_pct != null ? `${a.used_pct}%` : '—' },
   { title: '实测容量', key: 'cap', width: 120, render: a => a.tokens_per_pct != null ? `${fmtTokens(a.tokens_per_pct)} tok/%` : '—' },
   { title: '剩余', key: 'rem', width: 90, render: a => a.remaining_tokens != null ? fmtTokens(a.remaining_tokens) : '—' },
@@ -59,19 +60,22 @@ const columns = [
     >
       <div class="card">
         <div class="l">
-          池子剩余总容量
+          启用账号的已知余量估算
         </div><div class="v">
           {{ fmtTokens(cal.pool_remaining_tokens) }}
         </div>
       </div>
       <div class="card">
         <div class="l">
-          已校准账号
+          启用账号估算覆盖
         </div><div class="v">
-          {{ cal.calibrated_accounts || 0 }}/{{ (cal.accounts || []).length }}
+          {{ cal.active_known_accounts ?? 0 }}/{{ cal.active_accounts ?? 0 }}
         </div>
       </div>
     </div>
+    <p class="muted">
+      禁用账号不计入可用余量；未知额度不当作 0。仅按已校准、已有观测的启用账号估算，不承诺实际可用量。
+    </p>
     <n-data-table
       :data="cal.accounts || []"
       :columns="columns"

@@ -5,7 +5,7 @@ import { api } from '../api.js'
 import { store, fetchQuota } from '../store.js'
 import Accounts from '../components/Accounts.vue'
 
-vi.mock('../api.js', () => ({ api: vi.fn(), getKey: () => 'test-manage-key' }))
+vi.mock('../api.js', async importOriginal => ({ ...await importOriginal(), api: vi.fn(), getKey: () => 'test-manage-key' }))
 vi.mock('naive-ui', async () => {
   const { h } = await import('vue')
   return {
@@ -73,9 +73,9 @@ describe('Account quota states', () => {
 
   it.each(['cached', 'live'])('retains %s quota with a stale-data warning after a query failure', async source => {
     if (source === 'cached') {
-      store.st.quota[account.email] = { default: { primary_pct: 40, primary_window_secs: 18000 } }
+      store.st.quota[account.id] = { default: { primary_pct: 40, primary_window_secs: 18000 } }
     } else {
-      store.liveQuota[account.email] = report(40)
+      store.liveQuota[account.id] = report(40)
     }
     const wrapper = mount(Accounts)
     let fail
@@ -94,4 +94,11 @@ describe('Account quota states', () => {
     expect(wrapper.get('[role="alert"]').text()).toContain('query rejected')
     expect(wrapper.get('button').text()).toBe('重试')
   })
+  it('does not display an unknown cached percentage as 100 percent remaining', () => {
+    store.st.quota[account.id] = { default: { primary_pct: 0, primary_known: false, primary_reset_at: 1893456000 } }
+    const wrapper = mount(Accounts)
+    expect(wrapper.text()).not.toContain('100%')
+    expect(wrapper.text()).toContain('尚无观测')
+  })
+
 })

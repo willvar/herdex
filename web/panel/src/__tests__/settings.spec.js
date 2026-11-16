@@ -3,7 +3,7 @@ import { enableAutoUnmount, flushPromises, mount } from '@vue/test-utils'
 import { nextTick } from 'vue'
 
 // mock the api module so the save() PUT never touches the network
-vi.mock('../api.js', () => ({ api: vi.fn(), getKey: () => 'test-manage-key' }))
+vi.mock('../api.js', async importOriginal => ({ ...await importOriginal(), api: vi.fn(), getKey: () => 'test-manage-key' }))
 // Keep the real Settings component and its events, without depending on
 // Naive UI's internal markup or its message provider.
 vi.mock('naive-ui', async () => {
@@ -11,7 +11,7 @@ vi.mock('naive-ui', async () => {
   return {
     NCard: { setup: (_props, { slots }) => () => h('div', slots.default?.()) },
     NInputNumber: {
-      props: ['value'],
+      props: ['value', 'size'],
       emits: ['update:value'],
       setup: (props, { emit }) => () => h('input', {
         'data-testid': 'number',
@@ -21,7 +21,7 @@ vi.mock('naive-ui', async () => {
     },
     NSelect: { render: () => h('div') },
     NSwitch: {
-      props: ['value'],
+      props: ['value', 'size'],
       emits: ['update:value'],
       setup: (props, { emit }) => () => h('input', {
         'data-testid': 'switch',
